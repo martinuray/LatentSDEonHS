@@ -5,34 +5,39 @@ import numpy as np
 
 
 def get_data_min_max(records):
-	data_min, data_max = None, None
-	inf = torch.Tensor([float("Inf")])[0]
+    data_min, data_max = None, None
+    inf = torch.Tensor([float("Inf")])[0]
 
-	for b, (record_id, tt, vals, mask, labels) in enumerate(records):
-		n_features = vals.size(-1)
+    for b, rc_ in enumerate(records):
+        if len(rc_) == 4:
+            record_id, tt, vals, mask = rc_
+        else:
+            record_id, tt, vals, mask, _ = rc_
 
-		batch_min = []
-		batch_max = []
-		for i in range(n_features):
-			non_missing_vals = vals[:,i][mask[:,i] == 1]
-			if len(non_missing_vals) == 0:
-				batch_min.append(inf)
-				batch_max.append(-inf)
-			else:
-				batch_min.append(torch.min(non_missing_vals))
-				batch_max.append(torch.max(non_missing_vals))
+        n_features = vals.size(-1)
 
-		batch_min = torch.stack(batch_min)
-		batch_max = torch.stack(batch_max)
+        batch_min = []
+        batch_max = []
+        for i in range(n_features):
+            non_missing_vals = vals[:,i][mask[:,i] == 1]
+            if len(non_missing_vals) == 0:
+                batch_min.append(inf)
+                batch_max.append(-inf)
+            else:
+                batch_min.append(torch.min(non_missing_vals))
+                batch_max.append(torch.max(non_missing_vals))
 
-		if (data_min is None) and (data_max is None):
-			data_min = batch_min
-			data_max = batch_max
-		else:
-			data_min = torch.min(data_min, batch_min)
-			data_max = torch.max(data_max, batch_max)
+        batch_min = torch.stack(batch_min)
+        batch_max = torch.stack(batch_max)
 
-	return data_min, data_max
+        if (data_min is None) and (data_max is None):
+            data_min = batch_min
+            data_max = batch_max
+        else:
+            data_min = torch.min(data_min, batch_min)
+            data_max = torch.max(data_max, batch_max)
+
+    return data_min, data_max
 
 
 def normalize_masked_data(data, mask, att_min, att_max):
