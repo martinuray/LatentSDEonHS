@@ -1,3 +1,15 @@
+# Anomaly Detection with SDE
+
+```bash
+python generate_very_simple_data.py
+python basic_data_interpolation.py --enable-file-logging --log-dir logs \
+  --enable-checkpointing --checkpoint-dir checkpoints --checkpoint-at 90 390 990 2190 3990 \
+  --lr 0.05 --n-epochs 3990 --kl0-weight 0.001 --klp-weight 0.01 \
+  --pxz-weight 1.0 --seed -1 --restart 30 --device cuda:0 --z-dim 3 --h-dim 3 \
+  --n-deg 6 --no-learnable-prior --freeze-sigma --mc-eval-samples 10 \
+  --mc-train-samples 10 --loglevel debug
+```
+
 # Latent SDEs on Homogeneous Spaces
 
 <p align="center">
