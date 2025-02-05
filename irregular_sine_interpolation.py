@@ -79,8 +79,8 @@ def main():
         z_dim=args.z_dim,
         n_deg=args.n_deg,
         learnable_prior=args.learnable_prior,
-        time_min=0.0,
-        time_max=2.0 * desired_t[-1].item(),
+        time_min=0.0,                         # cheb
+        time_max=2.0 * desired_t[-1].item(),  # cheb
     )
     if args.freeze_sigma:
         logging.debug("Froze sigma when computing PathToGaussianDecoder")

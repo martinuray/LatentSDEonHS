@@ -767,12 +767,14 @@ class PathToGaussianDecoder(nn.Module):
         n_samples, batch_size, time_steps, _ = x.shape
         target_shape = [1 for i in range(len(x.shape))]
 
+        # flatten auf n_samples x batch_size x time_steps, ?
         mu = self.mu_map(x.flatten(0, 2))
         mu = mu.unflatten(0, (n_samples, batch_size, time_steps))
         
         if self.sigma_map is not None:
             sigma = self.sigma_map(x)
         else:
+            # sigma broght to the same shape as mu, but sigma same for all
             sigma = self.sigma.view(target_shape).expand_as(mu)            
         return Normal(mu, sigma.square())
 
@@ -1249,6 +1251,7 @@ class GenericMLP(nn.Module):
 class ToyRecogNet(nn.Module):
     def __init__(self, h_dim:int=3):
         super().__init__()
+        # h are <h_dim> parameters that are differentiable
         self.h = nn.Parameter(torch.rand(1,h_dim))
         
     def forward(self, x):
