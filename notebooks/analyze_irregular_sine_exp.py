@@ -14,12 +14,16 @@ from data.irregular_sine_provider import IrregularSineProvider
 
 #%%
 dataset = "irregular_sine_interpolation"
-experiment_id = 9800   # mine
-experiment_id = 39413
+experiment_id = 82171
+
+#%%
+dataset = "basic_data_interpolation_num-ft_1"
+experiment_id = 24394   # mine
+
+#%%
 log_file = f"logs/{dataset}_{experiment_id}.json"
 
-
-#%% load logfile
+# load logfile
 import json
 with open(log_file,'r') as f:
     logs = json.load(f)
@@ -48,10 +52,8 @@ def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
     ax.grid()
     return fig, ax
 
-plt.savefig("out/learning_curve.png")
 
-#%%
-plot_stat(logs, 'loss');
+plot_stat(logs, 'loss')
 plt.show()
 
 
@@ -60,7 +62,13 @@ plt.show()
 
 args = Namespace(**logs['args'])
 
-provider = IrregularSineProvider() #data_dir='data_dir')
+if 'sine' in dataset:
+    provider = IrregularSineProvider() #data_dir='data_dir')
+elif 'basic' in dataset:
+    provider = BasicDataProvider(data_dir='data_dir', num_features=1)
+else:
+    print("Error. Something else.")
+
 dl_trn = provider.get_train_loader(batch_size=1)
 batch = next(iter(dl_trn))
 
@@ -99,7 +107,7 @@ modules = modules.to(args.device)
 
 
 # load_model
-epoch = 3990
+epoch = 4500
 checkpoint = f"checkpoints/checkpoint_{experiment_id}_{epoch}.h5"
 checkpoint = torch.load(checkpoint)
 modules.load_state_dict(checkpoint['modules'])
@@ -147,7 +155,12 @@ for i in range(3):
 plt.show()
 
 # In[15]:
+import imageio
+import os
+sphere_dir = './out/sphere/'
+os.makedirs(sphere_dir, exist_ok=True)
 
+images = []
 
 endat = 101
 for current_at in range(endat):
@@ -172,9 +185,17 @@ for current_at in range(endat):
     ax.set_ylim(-1,1)
     ax.set_zlim(-1,1)
     ax.set_aspect("equal")
-    ax.axis('off');
-    fig.savefig(f'./out/sphere/sphere_{current_at:04d}.png', dpi=150)
-    plt.close();
+    ax.axis('off')
+    file_name = os.path.join(sphere_dir, f'sphere_{current_at:04d}.png')
+    images.append(file_name)
 
+    fig.savefig(file_name, dpi=150)
+    plt.close()
+
+#%%
+with imageio.get_writer(os.path.join(sphere_dir, f'sphere.gif'), mode='I') as writer:
+    for fn in images:
+        image = imageio.imread(fn)
+        writer.append_data(image)
 
 #%%
