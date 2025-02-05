@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import os
 import torch
 
+# paths
+data_dir = 'data_dir/BasicData/processed'
+
 # stuff for signals
 base_frequency = 1.0   # Hz
 fs = 1 / (10*10**-3)   # Hz; every 10ms; as the idea with the testbed
@@ -84,6 +87,8 @@ for per in range(num_periods):
 for _, tt_, vals_, m_ in periods_to_store:
     assert tt_.shape[0] == vals_.shape[0]
     assert m_.shape == vals_.shape
+
+os.makedirs(data_dir, exist_ok=True)
 
 torch.save(
     periods_to_store,
