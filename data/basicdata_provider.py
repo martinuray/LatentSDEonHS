@@ -24,20 +24,23 @@ from .dataset_provider import DatasetProvider
 
 class BasicData(object):
 
-    params = np.arange(0,4)
+    params = None
+    labels = None
+    params_dict, labels_dict = None, None
 
-    params_dict = {k: i for i, k in enumerate(params)}
-
-    labels = [ ]
-    labels_dict = {k: i for i, k in enumerate(labels)}
-
-    def __init__(self, root, train=True, n_samples = None):
+    def __init__(self, root, train=True, n_samples = None, num_features = 1):
 
         self.root = root
         self.train = train
-        self.reduce = "average"
+        self.num_features = num_features
 
-        self.download()
+        self.params = np.arange(0, self.num_features)
+        self.params_dict = {k: i for i, k in enumerate(self.params)}
+
+        self.labels = []
+        self.labels_dict = {k: i for i, k in enumerate(self.labels)}
+
+        #self.download()
 
         if not self._check_exists():
             raise RuntimeError('Dataset not found. You can use download=True to download it')
@@ -63,6 +66,9 @@ class BasicData(object):
             if (self.train and 'train' in csvfile) or (not self.train and 'test' in csvfile):
                 pass  # for readability
             else:
+                continue
+
+            if f'_num-ft_{self.num_features}' not in csvfile:
                 continue
 
             record_id = int(csvfile.split('.')[0].split('_')[-1])
@@ -116,11 +122,12 @@ class BasicData(object):
 
     @property
     def training_file(self):
-        return 'basic_data_train.pt'
+        return f'basic_data_num-ft_{self.num_features}.pt'
 
     @property
     def test_file(self):
-        return 'basic_data_test.pt'
+        # TODO
+        return self.training_file
 
     @property
     def destination_file(self):
@@ -146,42 +153,45 @@ class BasicDataDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train', quantization: float=0.01, random_state: int=42):
+    def __init__(self, data_dir: str, mode: str='train', quantization: float=0.01, num_features=1, random_state: int=42):
         self._quantization = quantization
-        
-        trn_obj = BasicData(data_dir, train=True, n_samples=8000)
-        tst_obj = BasicData(data_dir, train=False, n_samples=8000)
+
+        trn_obj = BasicData(data_dir, train=True, n_samples=8000, num_features=num_features)
+        tst_obj = BasicData(data_dir, train=False, n_samples=8000, num_features=num_features)
         all_obj = trn_obj[:] + tst_obj[:]
-        
+
         #trn_data, tst_data = train_test_split(all_obj, train_size=0.8, random_state=random_state, shuffle=True)
-        data_min, data_max = get_data_min_max(trn_obj)
+        # TODO
+        data_min, data_max = get_data_min_max(trn_obj[:])
         _, _, vals, _ = trn_obj[0]
         BasicDataDataset.input_dim = vals.size(-1)
 
-        len_tt = [ex[1].size(0) for ex in trn_obj]
-        maxlen = np.max(len_tt) # max. nr. of available timepoints at given quantization
-        
         if mode=='train':
             data = trn_obj[:]
         elif mode=='test':
             data = tst_obj[:]
-            
-        obs = torch.zeros([len(data), maxlen, BasicDataDataset.input_dim])
-        msk = torch.zeros([len(data), maxlen, BasicDataDataset.input_dim])
-        tps = torch.zeros([len(data), maxlen])
+
+        # max. nr. of available timepoints at given quantization
+        max_len = np.max([ex[1].size(0) for ex in trn_obj])
+        num_series = len(data)
+
+        obs = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
+        msk = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
+        tps = torch.zeros([num_series, max_len])
 
         for b, (_, record_tps, record_obs, record_msk) in enumerate(data):
             currlen = record_tps.size(0)
             obs[b, :currlen] = record_obs
             msk[b, :currlen] = record_msk
             tps[b, :currlen] = record_tps
-        
+
+        # TODO
         obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
-        
+
         tid = (tps/self._quantization).round().long()
         if torch.max(tps) != 0.:
             tps = tps / torch.max(tps)
-        
+
         self.evd_obs = obs
         self.evd_msk = msk.long()
         self.evd_tid = tid.long()
@@ -189,7 +199,7 @@ class BasicDataDataset(Dataset):
         self.data_min = data_min
         self.data_max = data_max
         self.feature_names = BasicData.params
-        
+
         self.num_timepoints = int(np.round(48./self._quantization))+1
 
     @property    
@@ -210,13 +220,13 @@ class BasicDataDataset(Dataset):
 
 
 class BasicDataProvider(DatasetProvider):
-    def __init__(self, data_dir=None, quantization=0.1, sample_tp=0.5, random_state=42):
+    def __init__(self, data_dir=None, quantization=0.1, sample_tp=0.5, random_state=42, num_features=1):
         DatasetProvider.__init__(self)
     
         self._sample_tp = sample_tp
         self._quantization = quantization
-        self._ds_trn = BasicDataDataset(data_dir, 'train', quantization=quantization, random_state=random_state)
-        self._ds_tst = BasicDataDataset(data_dir, 'test', quantization=quantization, random_state=random_state)
+        self._ds_trn = BasicDataDataset(data_dir, 'train', quantization=quantization, num_features=num_features, random_state=random_state)
+        self._ds_tst = BasicDataDataset(data_dir, 'test', quantization=quantization, num_features=num_features, random_state=random_state)
         
         assert self._ds_trn.num_timepoints == self._ds_tst.num_timepoints
         assert torch.all(self._ds_trn.data_min == self._ds_tst.data_min)

@@ -47,13 +47,15 @@ def main():
     remove_argument(parser, "--batch-size")
     args = parser.parse_args()
     print(args)
+
+    num_data_features = 1
     
     check_logging_and_checkpointing(args)
 
     set_up_logging(
         console_log_level=args.loglevel,
         console_log_color=True,
-        logfile_file=os.path.join(args.log_dir, f"basic_data_interpolation_{experiment_id}.txt")
+        logfile_file=os.path.join(args.log_dir, f"basic_data_interpolation_num-ft_{num_data_features}_{experiment_id}.txt")
         if args.log_dir is not None
         else None,
         logfile_log_level=args.loglevel,
@@ -66,7 +68,7 @@ def main():
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
 
-    provider = BasicDataProvider(data_dir='data_dir')
+    provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features)
     dl_trn = provider.get_train_loader(batch_size=1)
 
     desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
@@ -112,6 +114,8 @@ def main():
 
     for epoch in range(1, args.n_epochs + 1):
         _ = generic_train(args, dl_trn, modules, elbo_loss, None, optimizer, desired_t, args.device)
+
+        # TODO: replace with dl_test
         trn_stats = evaluate(args, dl_trn, modules, elbo_loss, desired_t)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
