@@ -43,18 +43,20 @@ class PendulumBase(Dataset):
                     generate_pendulums(data_path, task=task)
             data = dict(np.load(data_path))
             logging.debug(f'Loaded {mode:5s} data from {data_path}!')
-            subsampled_data = subsample(
-            data, sample_rate=sample_rate, random_state=random_state)
+            subsampled_data = subsample(data, sample_rate=sample_rate, random_state=random_state)
             train_obs, train_targets, test_obs, test_targets, validation_obs, validation_targets, train_time_points, test_time_points, validation_time_points = [torch.from_numpy(x) for x in subsampled_data]
 
         if task == 'interpolation':
+            # load (or generate if not exists) data
             data_path = os.path.join(data_dir, f'pendulum_{task}_ir{impute_rate}.npz')
             if not os.path.exists(data_path):
                     logging.debug(f'Generating pendulum {mode} trajectories and saving to {data_path} ...')
                     generate_pendulums(data_path, task=task)
             data = dict(np.load(data_path))
             logging.debug(f'Loaded {mode:5s} data from {data_path}!')
+            # subsample into train/test/val
             subsampled_data = subsample(data, sample_rate=sample_rate, imagepred=True, random_state=random_state)
+            # data conversion
             train_obs, train_targets, train_time_points, train_obs_valid, \
             test_obs, test_targets, test_time_points, test_obs_valid, \
             validation_obs, validation_targets, validation_time_points, validation_obs_valid = [torch.from_numpy(x) for x in subsampled_data]
@@ -75,14 +77,15 @@ class PendulumBase(Dataset):
             self.tps = validation_time_points
             self.msk = validation_obs_valid.squeeze() if task == 'interpolation' else torch.ones_like(self.tps, dtype=bool)
 
+
         self.obs = torch.permute(self.obs, [0, 1, 4, 2, 3])/255.0
-        self.obs = self.obs.contiguous()  
+        self.obs = self.obs.contiguous()    # contiguous() ... copy
         self.tps = self.tps.long()  
         self.tgt = self.tgt.float()    
 
         if task == 'interpolation':
             self.tgt = torch.permute(self.tgt, [0, 1, 4, 2, 3])/255.0
-            self.tgt = self.tgt.contiguous()
+            self.tgt = self.tgt.contiguous()  # contiguous() ... copy
 
     def __len__(self):
         return self.obs.shape[0]
@@ -103,7 +106,7 @@ class PendulumDataset(PendulumBase):
         tps_new = torch.zeros_like(self.tps)
         for i in range(self.tps.shape[0]):    
             valid_tps = self.tps[i][self.msk[i]]
-            tps_new[i,0:len(valid_tps)] = valid_tps
+            tps_new[i, 0:len(valid_tps)] = valid_tps
 
         # rewrite observations
         obs_new = torch.zeros_like(self.obs)
@@ -194,6 +197,7 @@ class PendulumProvider(DatasetProvider):
     
 
 def subsample(data, sample_rate, imagepred=False, random_state=0):
+    "split into train/test/val with random subsampling."
     train_obs, train_targets, test_obs, test_targets, validation_obs, validation_targets = data["train_obs"], \
         data["train_targets"], data["test_obs"], data["test_targets"], data["validation_obs"], data["validation_targets"]
     seq_length = train_obs.shape[1]
