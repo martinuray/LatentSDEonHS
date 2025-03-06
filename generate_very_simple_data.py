@@ -16,11 +16,11 @@ end_s = 1/base_frequency
 
 # stuff for the dataset
 num_periods = 1
-num_features = 2
+num_features = 1
 
 #%%
-x = np.arange(0, end_s, step_size)
-Y = np.zeros((num_periods, len(x), num_features))
+tps = np.arange(0, end_s, step_size)
+Y = np.zeros((num_periods, tps.shape[0], num_features))
 
 
 def norm_data(y_):
@@ -34,51 +34,59 @@ def norm_data(y_):
 Y[:, :, 0] = 1.00 * np.sin(2*np.pi*base_frequency*1.*x) #+ 0.21 * np.sin(2*np.pi*base_frequency*2*x)
 
 if num_features > 1:
-    Y[:, :, 1] = 0.30 * np.cos(2*np.pi*base_frequency*4.*x) + 0.21 * np.sin(2*np.pi*base_frequency*2*x)
+    Y[:, :, 1] = 0.30 * np.cos(2 * np.pi * base_frequency * 2. * tps) #+ 0.21 * np.sin(2 * np.pi * base_frequency * 2 * tps)
 if num_features > 2:
-    Y[:, :, 2] = 0.45 * np.cos(2*np.pi*base_frequency*16/4*x) + 0.21 * np.sin(2*np.pi*base_frequency*4/4*x)
+    Y[:, :, 2] = 0.45 * np.cos(2 * np.pi * base_frequency * 16 / 4 * tps) + 0.21 * np.sin(2 * np.pi * base_frequency * 4 / 4 * tps)
 if num_features > 3:
-    Y[:, :, 3] = 0.40 * np.cos(2*np.pi*base_frequency*18/4*x) + 0.21 * np.sin(2*np.pi*base_frequency*8/4*x)
+    Y[:, :, 3] = 0.40 * np.cos(2 * np.pi * base_frequency * 18 / 4 * tps) + 0.21 * np.sin(2 * np.pi * base_frequency * 8 / 4 * tps)
 
 # normalize Y, but over the second axis only
 Y = norm_data(Y)
 Y_masked = Y.copy()
+tps_masked = tps.copy()
 
 # roughly 30 % of the samples are non-nan
 ratio_of_not_sampling = 1 - 30/100 # as with the sine example
-number_of_samples = int(x.shape[0] * ratio_of_not_sampling)
+number_of_samples = int(tps.shape[0] * ratio_of_not_sampling)
+mask = np.random.rand(num_periods, tps.shape[0], num_features) < ratio_of_not_sampling
+#Y_masked[mask] = 0.
 
-mask = np.random.rand(num_periods, x.shape[0], num_features) < ratio_of_not_sampling
-Y_masked[mask] = 0.
 
-#%%
-plt.figure()
+#%
+fig, axs = plt.subplots(num_features,1, sharex=True)
 for idx in range(num_features):
+    axs[idx].plot(tps, Y[0, :, idx], '.', label=f"GT Ft. {idx}")
+
     y_m = Y_masked[0, :, idx][~mask[0, :, idx]]
-    x_m = x[~mask[0, :, idx]]
-    plt.plot(x, Y[0, :, idx], '.', label=f"GT Ft. {idx}")
-    plt.plot(x_m, y_m, '.', label=f"Subsampled Ft. {idx}")
-plt.grid()
-plt.legend()
+    x_m = tps[~mask[0, :, idx]]
+    axs[idx].plot(x_m, y_m, '.', label=f"Subsampled Ft. {idx}")
+
+    axs[idx].grid()
+    axs[idx].legend()
 plt.show()
 
 #%% convert to tensor structure
 periods_to_store = []
 
 for per in range(num_periods):
-    vals = Y[per]
-    m = ~mask[per]
-    tt = x[m.any(axis=1)]
-    vals = vals[m.any(axis=1)]
-    m = m[m.any(axis=1)] * 1
+    # selecting only this period / messreihe
+    vals, m = Y[per], ~mask[per]
 
-    if tt[0] != 0.0:
-        tt = np.insert(tt, 0, 0.0)
-        vals = np.insert(vals, 0, np.zeros(vals.shape[1]), axis=0)
-        m = np.insert(m, 0, np.zeros(m.shape[1]), axis=0)
+    # selecting only the non-masked
+    #tt = tps[m.any(axis=1)]
+    #vals = vals[m.any(axis=1)]
+    #m = m[m.any(axis=1)]
+    m = m * 1
 
+    # in case the first one is not 0, insert a zero value
+    #if tt[0] != 0.0:
+    #    tt = np.insert(tt, 0, 0.0)
+    #    vals = np.insert(vals, 0, np.zeros(vals.shape[1]), axis=0)
+    #    m = np.insert(m, 0, np.zeros(m.shape[1]), axis=0)
+
+    # cast everything to a tensor
     vals = torch.tensor(vals)
-    tt = torch.tensor(tt)
+    tt = torch.tensor(tps)
     m = torch.tensor(m)
 
     periods_to_store.append((per, tt, vals, m))
@@ -92,5 +100,5 @@ os.makedirs(data_dir, exist_ok=True)
 
 torch.save(
     periods_to_store,
-    os.path.join(f'data_dir/BasicData/processed/basic_data_num-ft_{num_features}.pt')
+    os.path.join(data_dir, f'basic_data_num-ft_{num_features}.pt')
 )

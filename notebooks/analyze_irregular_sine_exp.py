@@ -10,6 +10,7 @@ import torch.nn as nn
 import numpy as np
 from argparse import Namespace
 from data.irregular_sine_provider import IrregularSineProvider
+import matplotlib.pyplot as plt
 
 
 #%%
@@ -18,7 +19,7 @@ experiment_id = 82171
 
 #%%
 dataset = "basic_data_interpolation_num-ft_1"
-experiment_id = 24394   # mine
+experiment_id = 34330   # mine
 
 #%%
 log_file = f"logs/{dataset}_{experiment_id}.json"
@@ -29,17 +30,17 @@ with open(log_file,'r') as f:
     logs = json.load(f)
 
 
-#%% print experiment settings
+#% print experiment settings
 from pprint import pprint
 pprint(logs['args'])
 
 
-#%% print final values
+#% print final values
 from pprint import pprint
 pprint(logs['final'])
 
 
-#%% plot loss curves
+#% plot loss curves
 import matplotlib.pyplot as plt
 def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
     fig, ax = plt.subplots(figsize=(8,3))
@@ -58,14 +59,12 @@ plt.show()
 
 
 # In[8]:
-
-
 args = Namespace(**logs['args'])
 
 if 'sine' in dataset:
     provider = IrregularSineProvider() #data_dir='data_dir')
 elif 'basic' in dataset:
-    provider = BasicDataProvider(data_dir='data_dir', num_features=1)
+    provider = BasicDataProvider(data_dir='data_dir', num_features=1, sample_tp=1.)
 else:
     print("Error. Something else.")
 
@@ -74,10 +73,9 @@ batch = next(iter(dl_trn))
 
 
 # In[9]:
-
-
 from core.models import ToyRecogNet, ToyReconNet, PathToGaussianDecoder, default_SOnPathDistributionEncoder
 
+# TODO: where do the num_timepoints come from?
 desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
 
 recog_net = ToyRecogNet(args.h_dim)
@@ -102,11 +100,7 @@ modules = nn.ModuleDict(
 )
 modules = modules.to(args.device)
 
-
-# In[10]:
-
-
-# load_model
+#%% load_model
 epoch = 4500
 checkpoint = f"checkpoints/checkpoint_{experiment_id}_{epoch}.h5"
 checkpoint = torch.load(checkpoint)
@@ -127,34 +121,26 @@ for _, batch in enumerate(dl):
     break
 
 
-# In[12]:
-
-
+#%
 plt.figure(figsize=(8,3))
 for i in range(500):
     pxz_mean = pxz.mean[i].flatten().detach().cpu()
-    plt.plot(torch.arange(pxz_mean.shape[0])/100,
+    plt.plot(torch.linspace(0,1,pxz_mean.shape[0]),
              pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
-plt.plot(batch['evd_tid'].flatten()/101,batch['evd_obs'].flatten(),'+', color='tab:red')
+plt.plot(batch['evd_tps'].flatten(), batch['evd_obs'].flatten(),'+', color='tab:red')
 #plt.ylim(-1.5,1.5);
 plt.show()
 
-# In[13]:
-
-
+#%%
 t = qzx.t.cpu().detach()
 latents = qzx.sample((500,)).cpu().detach()
-
-
-# In[14]:
-
 
 fig, ax = plt.subplots(3)
 for i in range(3):
     ax[i].plot(t, latents[:,0,:,i].permute(1,0), color='tab:blue', alpha=0.1)
 plt.show()
 
-# In[15]:
+#%%
 import imageio
 import os
 sphere_dir = './out/sphere/'
@@ -192,10 +178,7 @@ for current_at in range(endat):
     fig.savefig(file_name, dpi=150)
     plt.close()
 
-#%%
 with imageio.get_writer(os.path.join(sphere_dir, f'sphere.gif'), mode='I') as writer:
     for fn in images:
         image = imageio.imread(fn)
         writer.append_data(image)
-
-#%%

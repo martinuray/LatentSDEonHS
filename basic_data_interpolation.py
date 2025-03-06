@@ -68,7 +68,7 @@ def main():
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
 
-    provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features)
+    provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features, sample_tp=1.)
     dl_trn = provider.get_train_loader(batch_size=1)
 
     desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
@@ -135,7 +135,7 @@ def main():
         logging.debug(msg)
 
         if args.enable_file_logging:
-            fname = os.path.join(args.log_dir, f"basic_data_interpolation_{experiment_id}.json")
+            fname = os.path.join(args.log_dir, f"basic_data_interpolation_num-ft_{num_data_features}_{experiment_id}.json")
             save_stats(args, stats, fname)
 
 

@@ -28,10 +28,10 @@ class BasicData(object):
     labels = None
     params_dict, labels_dict = None, None
 
-    def __init__(self, root, train=True, n_samples = None, num_features = 1):
+    def __init__(self, root, mode='train', n_samples = None, num_features = 1):
 
         self.root = root
-        self.train = train
+        self.mode = mode
         self.num_features = num_features
 
         self.params = np.arange(0, self.num_features)
@@ -45,6 +45,7 @@ class BasicData(object):
         if not self._check_exists():
             raise RuntimeError('Dataset not found. You can use download=True to download it')
 
+        # TODO: differentiate somehow on train/test/val data
         self.data = torch.load(os.path.join(self.processed_folder, self.destination_file), weights_only=False)
         #self.labels = torch.load(os.path.join(self.processed_folder, self.label_file))
 
@@ -59,55 +60,6 @@ class BasicData(object):
 
         os.makedirs(self.raw_folder, exist_ok=True)
         os.makedirs(self.processed_folder, exist_ok=True)
-
-        experiment_runs = []
-
-        for csvfile in os.listdir(self.raw_folder):
-            if (self.train and 'train' in csvfile) or (not self.train and 'test' in csvfile):
-                pass  # for readability
-            else:
-                continue
-
-            if f'_num-ft_{self.num_features}' not in csvfile:
-                continue
-
-            record_id = int(csvfile.split('.')[0].split('_')[-1])
-
-            df_ = pd.read_csv(os.path.join(self.raw_folder, csvfile),
-                              index_col=0)
-
-            # drop all rows in df_, where the columns are all nan
-
-            # remove all lines in df_, where there are all columns nan
-            df_ = df_.loc[~df_.isnull().apply(lambda x: all(x), axis=1)]
-            #df_.drop(, inplace=True)
-
-            tt = [0.]
-            vals = [torch.zeros(len(self.params))]
-            mask = [torch.zeros(len(self.params))]
-
-            for row in df_.iterrows():
-                if row[0] != 0.: # to make sure, that there exists something for time point 0
-                    tt.append(row[0])
-                    vals.append(torch.zeros(len(self.params)))
-                    mask.append(torch.zeros(len(self.params)))
-
-                data = row[1]  # helper
-                for param in self.params_dict.keys():
-                    if not np.isnan(data.iloc[param]):
-                        vals[-1][self.params_dict[param]] = float(data.iloc[param])
-                        mask[-1][self.params_dict[param]] = 1
-
-            tt = torch.tensor(tt)
-            vals = torch.stack(vals)
-            mask = torch.stack(mask)
-
-            experiment_runs.append((record_id, tt, vals, mask))
-
-        torch.save(
-            experiment_runs,
-            os.path.join(self.processed_folder, self.destination_file),
-        )
                 
     def _check_exists(self):
         return os.path.isfile(os.path.join(self.processed_folder, self.destination_file))
@@ -130,10 +82,17 @@ class BasicData(object):
         return self.training_file
 
     @property
+    def val_file(self):
+        # TODO
+        return self.training_file
+
+    @property
     def destination_file(self):
-        if self.train:
+        if self.mode == 'train':
             return self.training_file
-        return self.test_file
+        if self.mode == 'test':
+            return self.test_file
+        return self.val_file
 
     @property
     def label_file(self):
@@ -154,53 +113,98 @@ class BasicDataDataset(Dataset):
     input_dim = None  # nr. of different measurements per time point
     
     def __init__(self, data_dir: str, mode: str='train', quantization: float=0.01, num_features=1, random_state: int=42):
-        self._quantization = quantization
 
-        trn_obj = BasicData(data_dir, train=True, n_samples=8000, num_features=num_features)
-        tst_obj = BasicData(data_dir, train=False, n_samples=8000, num_features=num_features)
-        all_obj = trn_obj[:] + tst_obj[:]
-
-        #trn_data, tst_data = train_test_split(all_obj, train_size=0.8, random_state=random_state, shuffle=True)
-        # TODO
-        data_min, data_max = get_data_min_max(trn_obj[:])
-        _, _, vals, _ = trn_obj[0]
-        BasicDataDataset.input_dim = vals.size(-1)
-
-        if mode=='train':
-            data = trn_obj[:]
-        elif mode=='test':
-            data = tst_obj[:]
-
-        # max. nr. of available timepoints at given quantization
-        max_len = np.max([ex[1].size(0) for ex in trn_obj])
-        num_series = len(data)
-
-        obs = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
-        msk = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
-        tps = torch.zeros([num_series, max_len])
-
-        for b, (_, record_tps, record_obs, record_msk) in enumerate(data):
-            currlen = record_tps.size(0)
-            obs[b, :currlen] = record_obs
-            msk[b, :currlen] = record_msk
-            tps[b, :currlen] = record_tps
+        objs = {
+            'train': BasicData(data_dir, mode='train', n_samples=8000, num_features=num_features),
+            'test': BasicData(data_dir, mode='test', n_samples=8000, num_features=num_features),
+            'validation': BasicData(data_dir, mode='validation', n_samples=8000, num_features=num_features),
+        }
+        data = objs[mode]
 
         # TODO
-        obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
-
-        tid = (tps/self._quantization).round().long()
-        if torch.max(tps) != 0.:
-            tps = tps / torch.max(tps)
-
-        self.evd_obs = obs
-        self.evd_msk = msk.long()
-        self.evd_tid = tid.long()
-        self.evd_tps = tps
+        data_min, data_max = get_data_min_max(data[:])
         self.data_min = data_min
         self.data_max = data_max
+
         self.feature_names = BasicData.params
 
-        self.num_timepoints = int(np.round(48./self._quantization))+1
+        _, _, vals, _ = data[0]
+        BasicDataDataset.input_dim = vals.size(-1)
+
+        self.tps = torch.stack([tps for _, tps, _, _ in data], dim=0)
+        self.obs = torch.stack([obs for _, _, obs, _ in data], dim=0)
+        self.msk = torch.stack([msk for _, _, _, msk in data], dim=0)
+        self.num_timepoints = self.tps.shape[1]
+
+        #self.tps = self.tps.long()
+
+        # rewrite time points
+        tps_new = torch.zeros_like(self.tps)
+        tid_new = torch.zeros_like(self.tps)
+        obs_new = torch.zeros_like(self.obs)
+        obs_msk = torch.zeros_like(self.obs) #[:, :, 0:1, 0, 0], dtype=torch.long)
+        all_idx = torch.arange(0, self.num_timepoints)
+
+        for i in range(self.tps.shape[0]):
+            msk_indexer = self.msk[i].bool().any(dim=1)
+            valid_tps = self.tps[i][msk_indexer]
+
+            tps_new[i, 0:len(valid_tps)] = valid_tps
+
+            # rewrite observations
+            #valid_tps = self.tps[i][self.msk[i].bool().any(dim=1)]
+            obs_new[i, 0:len(valid_tps)] = self.obs[i, msk_indexer]
+
+            # rewrite mask
+            #valid_tps = self.tps[i][self.msk[i]]
+            obs_msk[i, 0:len(valid_tps)] = self.msk[i, msk_indexer]
+            tid_new[i, 0:len(valid_tps)] = all_idx[msk_indexer]
+
+        # obs_msk = obs_msk.unflatten(-1,(1,1,1)).expand_as(self.obs)
+
+        self.inp_obs = obs_new
+        self.inp_msk = obs_msk
+        self.inp_tps = tps_new
+        self.inp_tid = tid_new.long()
+
+        self.evd_msk = torch.ones_like(self.inp_msk)
+        self.evd_tid = all_idx.repeat(self.tps.shape[0], 1).long()
+        self.evd_tps = self.tps
+        self.evd_obs = self.obs
+
+        # max. nr. of available timepoints
+        # max_len = np.max([record_msk.sum().item() for _, _, _, record_msk in data])
+        #        num_series = len(data)
+        #        obs = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
+        #        msk = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
+        #        tps = torch.zeros([num_series, max_len])
+
+        #        for b, (_, record_tps, record_obs, record_msk) in enumerate(data):
+        #            record_tps = record_tps[record_msk.any(axis=1)]
+        #            record_obs = record_obs[record_msk.any(axis=1)]
+        #            record_msk = record_msk[record_msk.any(axis=1)]
+
+        #            currlen = record_tps.size(0)
+        #            tps[b, :currlen] = record_tps
+        #            obs[b, :currlen] = record_obs
+        #            msk[b, :currlen] = record_msk
+
+
+        # TODO: necessary?
+        #obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
+
+        # self.inp_tid = tps
+        # self.inp_obs = obs
+        # self.inp_msk = msk
+
+        # self.evd_msk = torch.ones_like(all_obs)
+        # self.evd_tid = all_tps   # TODO: ALL time points, not just the unmasked ones
+        # self.evd_obs = self.inp_obs
+
+        #if torch.max(tps) != 0.:
+        #    tps = tps / torch.max(tps)
+        #self.evd_tps = tps
+
 
     @property    
     def has_aux(self):
@@ -211,6 +215,10 @@ class BasicDataDataset(Dataset):
 
     def __getitem__(self, idx):
         inp_and_evd = {
+            'inp_obs' : self.inp_obs[idx],
+            'inp_msk' : self.inp_msk[idx],
+            'inp_tid' : self.inp_tid[idx],
+            'inp_tps' : self.inp_tps[idx],
             'evd_obs' : self.evd_obs[idx],
             'evd_msk' : self.evd_msk[idx],
             'evd_tid' : self.evd_tid[idx],
@@ -220,18 +228,20 @@ class BasicDataDataset(Dataset):
 
 
 class BasicDataProvider(DatasetProvider):
-    def __init__(self, data_dir=None, quantization=0.1, sample_tp=0.5, random_state=42, num_features=1):
+    def __init__(self, data_dir=None, quantization=0.01, sample_tp=0.5, random_state=42, num_features=1):
         DatasetProvider.__init__(self)
     
         self._sample_tp = sample_tp
-        self._quantization = quantization
-        self._ds_trn = BasicDataDataset(data_dir, 'train', quantization=quantization, num_features=num_features, random_state=random_state)
-        self._ds_tst = BasicDataDataset(data_dir, 'test', quantization=quantization, num_features=num_features, random_state=random_state)
-        
+        self._ds_trn = BasicDataDataset(data_dir, 'train', num_features=num_features, random_state=random_state)
+        self._ds_tst = BasicDataDataset(data_dir, 'test', num_features=num_features, random_state=random_state)
+        self._ds_val = BasicDataDataset(data_dir, 'validation', num_features=num_features, random_state=random_state)
+
+        # TODO: necessary?
         assert self._ds_trn.num_timepoints == self._ds_tst.num_timepoints
         assert torch.all(self._ds_trn.data_min == self._ds_tst.data_min)
         assert torch.all(self._ds_trn.data_max == self._ds_tst.data_max)
-        
+        assert torch.all(self._ds_trn.data_max == self._ds_val.data_max)
+
     @property 
     def input_dim(self):
         return BasicDataDataset.input_dim
@@ -257,44 +267,22 @@ class BasicDataProvider(DatasetProvider):
         return self._ds_trn.num_timepoints
     
     @property
-    def num_train_samples(self):
+    def num_train_samples(self) -> int:
         return len(self._ds_trn)
     
     @property 
-    def num_test_samples(self):
+    def num_test_samples(self) -> int:
         return len(self._ds_tst)
-    
-    @property 
-    def num_val_samples(self):
-        raise NotImplementedError
-    
-    def _collate(self, data):
-        batch = default_collate(data)
-        inp_obs, inp_msk, inp_tid = subsample_timepoints(
-            batch['evd_obs'].clone(), 
-            batch['evd_msk'].clone(),
-            batch['evd_tid'].clone(), self.sample_tp)
-        batch['inp_obs'] = inp_obs
-        batch['inp_tps'] = inp_tid/(self.num_timepoints-1)
-        batch['inp_msk'] = inp_msk
-        batch['inp_tid'] = inp_tid 
-        return batch
-        
-    def get_train_loader(self, **kwargs):
-        return DataLoader(self._ds_trn, collate_fn=self._collate, **kwargs)
-    
-    def get_test_loader(self, **kwargs):
-        return DataLoader(self._ds_tst, collate_fn=self._collate, **kwargs)
-    
-    
-def subsample_timepoints(data, mask, tid, p=1.):
-    assert 0. <= p <= 1.
-    if p == 1.:
-        sub_data, sub_mask, sub_tid = data, mask, tid
-    else:
-        tp_msk = torch.rand(tid.shape, device=tid.device) <= p # -> [batch_size, num_time_points] 
-        sub_tid = tid * tp_msk
-        tp_msk = tp_msk.unsqueeze(-1).expand_as(data)
-        sub_data, sub_mask = (x * tp_msk for x in [data, mask])
-    return sub_data, sub_mask, sub_tid
 
+    @property
+    def num_val_samples(self) -> int:
+        return len(self._ds_val)
+
+    def get_train_loader(self, **kwargs) -> DataLoader:
+        return DataLoader(self._ds_trn, **kwargs)
+
+    def get_test_loader(self, **kwargs) -> DataLoader:
+        return DataLoader(self._ds_tst, **kwargs)
+
+    def get_val_loader(self, **kwargs) -> DataLoader:
+        return DataLoader(self._ds_val, **kwargs)
