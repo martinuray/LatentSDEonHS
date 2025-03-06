@@ -139,74 +139,35 @@ class BasicDataDataset(Dataset):
         #self.tps = self.tps.long()
 
         # rewrite time points
-        tps_new = torch.zeros_like(self.tps)
-        tid_new = torch.zeros_like(self.tps)
-        obs_new = torch.zeros_like(self.obs)
-        obs_msk = torch.zeros_like(self.obs) #[:, :, 0:1, 0, 0], dtype=torch.long)
-        all_idx = torch.arange(0, self.num_timepoints)
+#        tps_new = torch.zeros_like(self.tps)
+#        tid_new = torch.zeros_like(self.tps)
+#        obs_new = torch.zeros_like(self.obs)
+#        obs_msk = torch.zeros_like(self.obs) #[:, :, 0:1, 0, 0], dtype=torch.long)
+#        all_idx = torch.arange(0, self.num_timepoints)
 
-        for i in range(self.tps.shape[0]):
-            msk_indexer = self.msk[i].bool().any(dim=1)
-            valid_tps = self.tps[i][msk_indexer]
+#        for i in range(self.tps.shape[0]):
+#            msk_indexer = self.msk[i].bool().any(dim=1)
+#            valid_tps = self.tps[i][msk_indexer]#
 
-            tps_new[i, 0:len(valid_tps)] = valid_tps
+#            tps_new[i, 0:len(valid_tps)] = valid_tps
+#            obs_new[i, 0:len(valid_tps)] = self.obs[i, msk_indexer]#
 
-            # rewrite observations
-            #valid_tps = self.tps[i][self.msk[i].bool().any(dim=1)]
-            obs_new[i, 0:len(valid_tps)] = self.obs[i, msk_indexer]
+#            obs_new[i, self.msk[i] == 0] = 0
+#            obs_msk[i, 0:len(valid_tps)] = self.msk[i, msk_indexer]
+#            tid_new[i, 0:len(valid_tps)] = all_idx[msk_indexer]
 
-            # rewrite mask
-            #valid_tps = self.tps[i][self.msk[i]]
-            obs_msk[i, 0:len(valid_tps)] = self.msk[i, msk_indexer]
-            tid_new[i, 0:len(valid_tps)] = all_idx[msk_indexer]
-
-        # obs_msk = obs_msk.unflatten(-1,(1,1,1)).expand_as(self.obs)
-
-        self.inp_obs = obs_new
-        self.inp_msk = obs_msk
-        self.inp_tps = tps_new
-        self.inp_tid = tid_new.long()
+        self.inp_obs = self.obs # obs_new
+        self.inp_obs = self.obs * self.msk# obs_new
+        self.inp_msk = self.msk #obs_msk
+        self.inp_tps = self.tps #tps_new
+        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(self.tps.shape[0], 1).long() #tid_new.long()
 
         self.evd_msk = torch.ones_like(self.inp_msk)
-        self.evd_tid = all_idx.repeat(self.tps.shape[0], 1).long()
+        self.evd_tid = self.inp_tid #all_idx.repeat(self.tps.shape[0], 1).long()
         self.evd_tps = self.tps
         self.evd_obs = self.obs
 
-        # max. nr. of available timepoints
-        # max_len = np.max([record_msk.sum().item() for _, _, _, record_msk in data])
-        #        num_series = len(data)
-        #        obs = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
-        #        msk = torch.zeros([num_series, max_len, BasicDataDataset.input_dim])
-        #        tps = torch.zeros([num_series, max_len])
-
-        #        for b, (_, record_tps, record_obs, record_msk) in enumerate(data):
-        #            record_tps = record_tps[record_msk.any(axis=1)]
-        #            record_obs = record_obs[record_msk.any(axis=1)]
-        #            record_msk = record_msk[record_msk.any(axis=1)]
-
-        #            currlen = record_tps.size(0)
-        #            tps[b, :currlen] = record_tps
-        #            obs[b, :currlen] = record_obs
-        #            msk[b, :currlen] = record_msk
-
-
-        # TODO: necessary?
-        #obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
-
-        # self.inp_tid = tps
-        # self.inp_obs = obs
-        # self.inp_msk = msk
-
-        # self.evd_msk = torch.ones_like(all_obs)
-        # self.evd_tid = all_tps   # TODO: ALL time points, not just the unmasked ones
-        # self.evd_obs = self.inp_obs
-
-        #if torch.max(tps) != 0.:
-        #    tps = tps / torch.max(tps)
-        #self.evd_tps = tps
-
-
-    @property    
+    @property
     def has_aux(self):
         return False
 

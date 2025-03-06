@@ -48,7 +48,7 @@ def main():
     args = parser.parse_args()
     print(args)
 
-    num_data_features = 1
+    num_data_features = 2
     
     check_logging_and_checkpointing(args)
 
@@ -70,11 +70,12 @@ def main():
 
     provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features, sample_tp=1.)
     dl_trn = provider.get_train_loader(batch_size=1)
+    dl_test = provider.get_test_loader(batch_size=1)
 
     desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
 
     recog_net = ToyRecogNet(args.h_dim)
-    recon_net = ToyReconNet(z_dim=args.z_dim)
+    recon_net = ToyReconNet(z_dim=args.z_dim, out_features=num_data_features)
     pxz_net = PathToGaussianDecoder(mu_map=recon_net, sigma_map=None, initial_sigma=np.sqrt(0.05))
     qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,
@@ -113,10 +114,10 @@ def main():
     pm = ProgressMessage(stats_mask)
 
     for epoch in range(1, args.n_epochs + 1):
-        _ = generic_train(args, dl_trn, modules, elbo_loss, None, optimizer, desired_t, args.device)
+        _ = generic_train(args, dl_trn, modules, elbo_loss, None,
+                          optimizer, desired_t, args.device)
 
-        # TODO: replace with dl_test
-        trn_stats = evaluate(args, dl_trn, modules, elbo_loss, desired_t)
+        trn_stats = evaluate(args, dl_test, modules, elbo_loss, desired_t)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()

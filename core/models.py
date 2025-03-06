@@ -1260,9 +1260,9 @@ class ToyRecogNet(nn.Module):
 
 
 class ToyReconNet(nn.Module):
-    def __init__(self, z_dim:int=3):
+    def __init__(self, z_dim:int=3, out_features:int=1):
         super().__init__()
-        self.map = nn.Linear(z_dim, 1)
+        self.map = nn.Linear(z_dim, out_features)
     
     def forward(self, x):
         out = self.map(x)    

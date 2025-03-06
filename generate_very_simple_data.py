@@ -15,8 +15,8 @@ start_s = 0
 end_s = 1/base_frequency
 
 # stuff for the dataset
-num_periods = 1
-num_features = 1
+num_periods = 2
+num_features = 2
 
 #%%
 tps = np.arange(0, end_s, step_size)
@@ -31,7 +31,7 @@ def norm_data(y_):
     return n_arr * 0.8
 
 
-Y[:, :, 0] = 1.00 * np.sin(2*np.pi*base_frequency*1.*x) #+ 0.21 * np.sin(2*np.pi*base_frequency*2*x)
+Y[:, :, 0] = 1.00 * np.sin(2*np.pi*base_frequency*1.*tps) #+ 0.21 * np.sin(2*np.pi*base_frequency*2*x)
 
 if num_features > 1:
     Y[:, :, 1] = 0.30 * np.cos(2 * np.pi * base_frequency * 2. * tps) #+ 0.21 * np.sin(2 * np.pi * base_frequency * 2 * tps)
@@ -46,7 +46,7 @@ Y_masked = Y.copy()
 tps_masked = tps.copy()
 
 # roughly 30 % of the samples are non-nan
-ratio_of_not_sampling = 1 - 30/100 # as with the sine example
+ratio_of_not_sampling = 1 - 20/100 # as with the sine example
 number_of_samples = int(tps.shape[0] * ratio_of_not_sampling)
 mask = np.random.rand(num_periods, tps.shape[0], num_features) < ratio_of_not_sampling
 #Y_masked[mask] = 0.

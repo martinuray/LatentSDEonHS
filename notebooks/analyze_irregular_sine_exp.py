@@ -12,6 +12,7 @@ from argparse import Namespace
 from data.irregular_sine_provider import IrregularSineProvider
 import matplotlib.pyplot as plt
 
+num_features = 2
 
 #%%
 dataset = "irregular_sine_interpolation"
@@ -20,6 +21,10 @@ experiment_id = 82171
 #%%
 dataset = "basic_data_interpolation_num-ft_1"
 experiment_id = 34330   # mine
+
+#%%
+dataset = "basic_data_interpolation_num-ft_2"
+experiment_id = 725   # mine
 
 #%%
 log_file = f"logs/{dataset}_{experiment_id}.json"
@@ -64,7 +69,7 @@ args = Namespace(**logs['args'])
 if 'sine' in dataset:
     provider = IrregularSineProvider() #data_dir='data_dir')
 elif 'basic' in dataset:
-    provider = BasicDataProvider(data_dir='data_dir', num_features=1, sample_tp=1.)
+    provider = BasicDataProvider(data_dir='data_dir', num_features=num_features, sample_tp=1.)
 else:
     print("Error. Something else.")
 
@@ -79,7 +84,7 @@ from core.models import ToyRecogNet, ToyReconNet, PathToGaussianDecoder, default
 desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
 
 recog_net = ToyRecogNet(args.h_dim)
-recon_net = ToyReconNet(args.z_dim)
+recon_net = ToyReconNet(args.z_dim, out_features=num_features)
 qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,
         z_dim=args.z_dim,
@@ -112,7 +117,7 @@ dl = dl_trn
 device = args.device
 modules = modules.to(device)
 for _, batch in enumerate(dl):
-    parts = {key: val.to(device) for key, val in batch.items()}
+    parts = {key: val.to(device) for key, val in batch.items() if "inp_" in key}
     inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
     h = modules["recog_net"](inp)
     qzx, pz = modules["qzx_net"](h, desired_t)
@@ -121,13 +126,15 @@ for _, batch in enumerate(dl):
     break
 
 
-#%
-plt.figure(figsize=(8,3))
-for i in range(500):
-    pxz_mean = pxz.mean[i].flatten().detach().cpu()
-    plt.plot(torch.linspace(0,1,pxz_mean.shape[0]),
-             pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
-plt.plot(batch['evd_tps'].flatten(), batch['evd_obs'].flatten(),'+', color='tab:red')
+#%%
+fig, axs = plt.subplots(nrows=num_features, figsize=(16,9))
+for ft in range(num_features):
+    for i in range(500):
+        pxz_mean = pxz.mean[i, :, :, ft].flatten().detach().cpu()
+        axs[ft].plot(torch.linspace(0,1,pxz_mean.shape[0]),
+                     pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
+    axs[ft].plot(batch['evd_tps'].flatten(), batch['evd_obs'][:,:,ft].flatten(),
+             '+', color='tab:red')
 #plt.ylim(-1.5,1.5);
 plt.show()
 
