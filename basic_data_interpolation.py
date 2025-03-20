@@ -48,8 +48,9 @@ def main():
     args = parser.parse_args()
     print(args)
 
-    num_data_features = 2
-    
+    data_kind, num_data_features = "_Oscillator", 4
+    data_kind, num_data_features = None, 4
+
     check_logging_and_checkpointing(args)
 
     set_up_logging(
@@ -68,7 +69,7 @@ def main():
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
 
-    provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features, sample_tp=1.)
+    provider = BasicDataProvider(data_dir='data_dir', num_features=num_data_features, sample_tp=1., data_kind=data_kind)
     dl_trn = provider.get_train_loader(batch_size=1)
     dl_test = provider.get_test_loader(batch_size=1)
 
@@ -76,7 +77,11 @@ def main():
 
     recog_net = ToyRecogNet(args.h_dim)
     recon_net = ToyReconNet(z_dim=args.z_dim, out_features=num_data_features)
-    pxz_net = PathToGaussianDecoder(mu_map=recon_net, sigma_map=None, initial_sigma=np.sqrt(0.05))
+    pxz_net = PathToGaussianDecoder(
+        mu_map=recon_net,
+        sigma_map=None,
+        initial_sigma=np.sqrt(0.05)
+    )
     qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,
         z_dim=args.z_dim,

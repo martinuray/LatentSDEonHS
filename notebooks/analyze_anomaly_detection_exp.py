@@ -2,6 +2,8 @@
 # Toy Experiment with Irregular Sine Data
 import sys
 
+from sklearn.metrics import f1_score
+
 from data.basicdata_provider import BasicDataProvider
 
 sys.path.append('../')
@@ -9,26 +11,18 @@ sys.path.append('../')
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from argparse import Namespace
 from data.irregular_sine_provider import IrregularSineProvider
 import matplotlib.pyplot as plt
 
-data_kind, num_data_features = "_Oscillator", 4
-
-#%%
-dataset = "irregular_sine_interpolation"
-experiment_id = 82171
-
-#%%
-data_kind, num_data_features = None, 1
-dataset = "basic_data_interpolation_num-ft_1"
-experiment_id = 34330   # mine
-
-#%%
-data_kind, num_data_features = "_Oscillator", 4
 data_kind, num_data_features = None, 4
-dataset = "basic_data_interpolation_num-ft_4"
-experiment_id = 53255   # mine
+dataset = "anomaly_detection"
+experiment_id = 60625   # mine
+checkpoint_epoch = 4500
+# 108826 bis 2190
+experiment_id = 87634   # mine
+checkpoint_epoch = 2190
 
 #%%
 log_file = f"logs/{dataset}_{experiment_id}.json"
@@ -48,8 +42,7 @@ pprint(logs['args'])
 from pprint import pprint
 pprint(logs['final'])
 
-
-#%% plot loss curves
+#% plot loss curves
 import matplotlib.pyplot as plt
 def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
     fig, ax = plt.subplots(figsize=(8,3))
@@ -64,40 +57,52 @@ def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
 
 
 plot_stat(logs, 'loss')
+plt.tight_layout()
 plt.show()
 
 
 # In[8]:
 args = Namespace(**logs['args'])
 
-if 'sine' in dataset:
-    provider = IrregularSineProvider() #data_dir='data_dir')
-elif 'basic' in dataset:
-    provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
-else:
-    print("Error. Something else.")
+provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
 
 dl_trn = provider.get_train_loader(batch_size=1)
+dl_val = provider.get_val_loader(batch_size=1)
+dl_test = provider.get_test_loader(batch_size=1)
 batch = next(iter(dl_trn))
 
 
 # In[9]:
-from core.models import ToyRecogNet, ToyReconNet, PathToGaussianDecoder, default_SOnPathDistributionEncoder
+from core.models import ToyRecogNet, ToyReconNet, PathToGaussianDecoder, \
+    default_SOnPathDistributionEncoder, PhysioNetRecogNetwork, GenericMLP
 
 # TODO: where do the num_timepoints come from?
-desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device)
+desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device).float()
 
-recog_net = ToyRecogNet(args.h_dim)
-recon_net = ToyReconNet(args.z_dim, out_features=num_data_features)
+recog_net = PhysioNetRecogNetwork(
+    mtan_input_dim=provider.input_dim,
+    mtan_hidden_dim=args.h_dim,
+    use_atanh=args.use_atanh
+)
+recon_net = GenericMLP(
+    inp_dim=args.z_dim,
+    out_dim=provider.input_dim,
+    n_hidden=args.dec_hidden_dim,
+    n_layers=args.n_dec_layers,
+)
 qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,
-        z_dim=args.z_dim,
+            z_dim=args.z_dim,
         n_deg=args.n_deg,
         learnable_prior=args.learnable_prior,
         time_min=0.0,
         time_max=2.0 * desired_t[-1].item(),
     )
-pxz_net = PathToGaussianDecoder(mu_map=recon_net, sigma_map=None, initial_sigma=np.sqrt(0.05))
+pxz_net = PathToGaussianDecoder(
+    mu_map=recon_net,
+    sigma_map=None,
+    initial_sigma=0.1) # TODO: is this initial sigma ok so?
+    #initial_sigma=np.sqrt(0.05))
 
 modules = nn.ModuleDict(
     {
@@ -110,38 +115,64 @@ modules = nn.ModuleDict(
 modules = modules.to(args.device)
 
 #%% load_model
-epoch = 4500
-checkpoint = f"checkpoints/checkpoint_{experiment_id}_{epoch}.h5"
+checkpoint = f"checkpoints/checkpoint_{experiment_id}_{checkpoint_epoch}.h5"
 checkpoint = torch.load(checkpoint)
 modules.load_state_dict(checkpoint['modules'])
 
 
-#%%  generate reconstructions
-dl = dl_trn
-device = args.device
-modules = modules.to(device)
-for _, batch in enumerate(dl):
-    parts = {key: val.to(device) for key, val in batch.items() if "inp_" in key}
-    inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
+def batch_get_log_prob(batch_):
+    parts = batch_to_device(batch_, args.device)
+    inp = (parts["evd_obs"], parts["evd_msk"], parts["evd_tps"])
     h = modules["recog_net"](inp)
     qzx, pz = modules["qzx_net"](h, desired_t)
     zis = qzx.rsample((500,))
     pxz = modules["pxz_net"](zis)
-    break
+    lg_prb = -pxz.log_prob(parts["evd_obs"]).mean(dim=0)
+    return lg_prb
 
+def batch_to_device(batch_, device_):
+    return {key: val.to(device_) for key, val in batch_.items()}
 
-#%%
-fig, axs = plt.subplots(nrows=num_data_features, figsize=(16,9))
-for ft in range(num_data_features):
-    for i in range(500):
-        pxz_mean = pxz.mean[i, :, :, ft].flatten().detach().cpu()
-        axs[ft].plot(torch.linspace(0,1,pxz_mean.shape[0]),
-                     pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
-        evd = batch['evd_tps'].flatten()
-    axs[ft].plot(evd/evd.max(), batch['evd_obs'][:,:,ft].flatten(),
-             '+', color='tab:red')
-#plt.ylim(-1.5,1.5);
-plt.show()
+#%% identify anomaly threshold
+log_probs_test = [batch_get_log_prob(batch).squeeze() for _, batch in enumerate(dl_test)]
+log_probs_test = torch.vstack(log_probs_test)
+test_mean = log_probs_test.mean(dim=0)
+test_std = log_probs_test.std(dim=0)
+
+anomaly_threshold = test_mean + 3 * test_std
+
+#%%  generate reconstructions
+for idx, batch in enumerate(dl_val):
+    parts = batch_to_device(batch, args.device)
+    inp = (parts["evd_obs"], parts["evd_msk"], parts["evd_tps"])
+    h = modules["recog_net"](inp)
+    qzx, pz = modules["qzx_net"](h, desired_t)
+    zis = qzx.rsample((500,))
+    pxz = modules["pxz_net"](zis)
+    lg_prb = -pxz.log_prob(parts["evd_obs"]).mean(dim=0)
+    pred_tgt = torch.zeros_like(parts["aux_tgt"])
+    pred_tgt[0, lg_prb.squeeze() > anomaly_threshold] = 1
+
+    f1 = f1_score(pred_tgt.flatten().detach().cpu(), parts["aux_tgt"].flatten().detach().cpu())
+
+    fig, axs = plt.subplots(nrows=num_data_features, figsize=(16,9))
+    for ft in range(num_data_features):
+        for i in range(500):
+            pxz_mean = pxz.mean[i, :, :, ft].flatten().detach().cpu()
+            axs[ft].plot(torch.linspace(0,1,pxz_mean.shape[0]),
+                         pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
+            evd = batch['evd_tps'].flatten()
+        axs[ft].set_ylabel('Signal Amplitude')
+        axs[ft].plot(evd/evd.max(), batch['evd_obs'][:,:,ft].flatten(),
+                 '+', color='black')
+        ac = axs[ft].twinx()
+        ac.plot(torch.linspace(0, 1, pxz_mean.shape[0]), lg_prb[:,:, ft].flatten().detach().cpu(), color='tab:red')
+        ac.axhline(y=anomaly_threshold[ft].item())
+        ac.set_ylabel("Log Prob")
+        axs[ft].set_xlabel('Time t / s')
+    #plt.ylim(-1.5,1.5);
+    plt.suptitle(f'F1-Score: {f1}')
+    plt.show()
 
 #%%
 t = qzx.t.cpu().detach()
