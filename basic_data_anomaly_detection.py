@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from data.ad_provider import ADProvider
 from data.basicdata_provider import BasicDataProvider
 from data.pendulum_provider import PendulumProvider
 from core.models import (
@@ -92,8 +93,13 @@ def evaluate(
 
             aux_log_prob = -pxz.log_prob(parts["evd_obs"])
             aux_log_prob = aux_log_prob.mean(dim=0)
+            try:
+                if dl.dataset.tgt.dim() == 2:
+                    aux_log_prob, _ = aux_log_prob.max(dim=2)
+            except:
+                pass
 
-            aux_tgt = (aux_log_prob < -np.log(0.75)) * 1
+            aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
             aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
 
             batch_len = parts["evd_obs"].shape[0]
@@ -134,7 +140,8 @@ def main():
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
 
-    provider = BasicDataProvider(data_dir='data_dir', num_features=args.num_features, sample_tp=1., data_kind=None)
+    #provider = BasicDataProvider(data_dir='data_dir', num_features=args.num_features, sample_tp=1., data_kind=None)
+    provider = ADProvider(data_dir='data_dir', data_kind='SWaT')
     dl_trn = provider.get_train_loader(
         batch_size=args.batch_size,
         shuffle=True,
@@ -150,29 +157,34 @@ def main():
         num_workers=8,
         pin_memory=True,
     )
-    dl_val = provider.get_val_loader(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-    )
+
+    use_validation = True
+    try:
+        dl_val = provider.get_val_loader(
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+        )
+    except NotImplementedError:
+        use_validation = False
 
     desired_t = torch.linspace(0, 1.00, provider.num_timepoints, device=args.device).float()
 
-    recog_net = ToyRecogNet(args.h_dim)    # TODO: when we get high-dimensional, this probably needs to be something with more capacity
     recog_net = PhysioNetRecogNetwork(
         mtan_input_dim=provider.input_dim,
         mtan_hidden_dim=args.h_dim,
         use_atanh=args.use_atanh
     )
-    recon_net = ToyReconNet(z_dim=args.z_dim, out_features=args.num_features)  # TODO
+
     recon_net = GenericMLP(
         inp_dim=args.z_dim,
         out_dim=provider.input_dim,
         n_hidden=args.dec_hidden_dim,
         n_layers=args.n_dec_layers,
     )
+
     pxz_net = PathToGaussianDecoder(
         mu_map=recon_net, 
         sigma_map=None, 
@@ -212,9 +224,11 @@ def main():
     stats_mask = {
         "trn": ["log_pxz", "loss"],
         "tst": ["loss"],
-        "val": ["loss", "aux_val", "aux_log_prob"],
         "oth": ["lr"],
     }
+    if use_validation:
+        stats_mask["val"] = ["loss", "aux_val", "aux_log_prob"]
+
     pm = ProgressMessage(stats_mask)
 
     best_epoch_val_aux = np.inf
@@ -233,7 +247,8 @@ def main():
             args.device
         )
         tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device)
-        val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device)
+        if use_validation:
+            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
@@ -252,7 +267,8 @@ def main():
 
         stats["trn"].append(trn_stats)
         stats["tst"].append(tst_stats)
-        stats["val"].append(val_stats)
+        if use_validation:
+            stats["val"].append(val_stats)
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
             save_checkpoint(
