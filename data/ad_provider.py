@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 import torch
+from numpy.lib._stride_tricks_impl import sliding_window_view
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets.utils import download_url
 from torch.distributions import Categorical
@@ -33,6 +34,8 @@ class ADData(object):
         self.root = root
         self.data_kind = data_kind
         self.mode = mode
+        self.max_signal_length = 150
+        overlapping_windows = 0.5
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -44,20 +47,23 @@ class ADData(object):
         # TODO: differentiate somehow on train/test/val data
         raw_data_df = pd.read_csv(os.path.join(self.processed_folder, self.destination_file))
         raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 2)] # TODO: bc of memory issues
-        added_ = np.zeros(((3000 - raw_data_df.shape[0]) % 3000, raw_data_df.shape[1]))
-        raw_data = np.vstack((raw_data_df, added_))
 
-        raw_data = raw_data.reshape(-1, 3000, raw_data.shape[1])
 
         if self.mode == 'test':
+            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
+                0]) % self.max_signal_length, raw_data_df.shape[1]))
+            raw_data = np.vstack((raw_data_df, added_)).copy()
+            raw_data = raw_data.reshape(-1, self.max_signal_length, raw_data.shape[1])
+            # TODO take care that no overlapping windows are taken
             self.targets = pd.read_csv(os.path.join(self.processed_folder, self.label_file))
             self.targets = np.array(self.targets)
             self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
-
+            self.targets = self.targets.reshape(-1, self.max_signal_length)
         else:
+            raw_data = raw_data_df.to_numpy().copy()
+            raw_data = create_win_periods(raw_data, self.max_signal_length,
+                                          int(self.max_signal_length * overlapping_windows))
             self.targets = np.zeros(raw_data.shape[0:2])
-
-        self.targets = self.targets.reshape(-1, 3000)
 
         self.params = list(raw_data_df.columns)
         self.params_dict = {k: i for i, k in enumerate(self.params)}
@@ -65,10 +71,11 @@ class ADData(object):
         indcs = torch.arange(0, raw_data.shape[1])
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
-        mask[-1,-added_.shape[0]:, :] = 0
+        if self.mode == 'test':
+            mask[-1,-added_.shape[0]:, :] = 0
 
-        if subsample is not None:
-            mask = (torch.rand(data_tensor.shape) < subsample) * 1
+        #if subsample is not None:
+        #    mask = (torch.rand(data_tensor.shape) < subsample) * 1
             #sum = mask.sum(dim=-1)
             #inc_ignore = sum != 0
 
@@ -148,44 +155,44 @@ class ADDataset(Dataset):
     def __init__(self, data_dir: str, mode: str='train', data_kind: str=None):
 
         objs = {
-            'train': ADData(data_dir, mode='train', data_kind=data_kind, subsample=0.1, n_samples=6000),
+            'train': ADData(data_dir, mode='train', data_kind=data_kind, subsample=None, n_samples=6000),
             'test': ADData(data_dir, mode='test', data_kind=data_kind, n_samples=6000),
         }
         data = objs[mode]
 
         # TODO
-        data_min, data_max = get_data_min_max(data[:])
-        self.data_min = data_min
-        self.data_max = data_max
+        data_min, data_max = get_data_min_max(objs['train'][:])
 
         self.feature_names = ADData.params
         ADDataset.input_dim = data[0][2].shape[1]
 
-        self.tps = data.data[0][1]
-        self.tps = torch.Tensor(self.tps / self.tps.max())
-        self.obs = torch.vstack([data.data[part_idx][2][None, :, :] for part_idx in
+        tps = data.data[0][1]
+        tps = torch.Tensor(tps / tps.max())
+        obs = torch.vstack([data.data[part_idx][2][None, :, :] for part_idx in
                                  range(len(data.data))]).float()
 
-        self.msk = torch.vstack([data.data[part_idx][3][None, :, :] for part_idx in
+        msk = torch.vstack([data.data[part_idx][3][None, :, :] for part_idx in
                                  range(len(data.data))]).float()
-        self.tps = self.tps[None, :].repeat(self.obs.shape[0], 1).float()
+        tps = tps[None, :].repeat(obs.shape[0], 1).float()
 
-        #self.msk = self.msk[None, :, :]
-        self.tgt = torch.Tensor(data.targets)
-        #self.tgt = self.tgt[None, :]
-        self.num_timepoints = self.tps.shape[1]
 
-        self.inp_obs = self.obs.float() # obs_new
-        self.inp_obs = (self.obs * self.msk).float()# obs_new
-        self.inp_msk = self.msk.long() #obs_msk
-        self.inp_tps = self.tps
-        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(self.obs.shape[0], 1).long() #tid_new.long()
+        tgt = torch.Tensor(data.targets)
+
+        obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
+
+        self.num_timepoints = tps.shape[1]
+
+        self.inp_obs = obs.float() # obs_new
+        self.inp_obs = (obs * msk).float()# obs_new
+        self.inp_msk = msk.long() #obs_msk
+        self.inp_tps = tps
+        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long() #tid_new.long()
 
         self.evd_msk = torch.ones_like(self.inp_msk).long()
         self.evd_tid = self.inp_tid.long() #all_idx.repeat(self.tps.shape[0], 1).long()
-        self.evd_tps = self.tps
-        self.evd_obs = self.obs.float()
-        self.aux_tgt = self.tgt.long()
+        self.evd_tps = tps
+        self.evd_obs = obs.float()
+        self.aux_tgt = tgt.long()
 
     @property
     def has_aux(self):
@@ -258,5 +265,9 @@ class ADProvider(DatasetProvider):
         return DataLoader(self._ds_tst, **kwargs)
 
 
-#%%
-ad = ADProvider(data_dir='data_dir', data_kind="SWaT")
+def create_win_periods(data_, win_size_, win_stride_):
+    """ returns the rolling windows of the given flattened data """
+    windows = sliding_window_view(data_, (
+        win_size_, data_.shape[1]))
+    return windows.squeeze()[::win_stride_, :]
+

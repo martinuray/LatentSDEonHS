@@ -16,18 +16,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 
 from data.ad_provider import ADProvider
-from data.basicdata_provider import BasicDataProvider
-from data.pendulum_provider import PendulumProvider
 from core.models import (
-    PendulumRecogNetwork,
-    PendulumReconNetwork,
     PathToGaussianDecoder,
-    PathToSinCosDecoder,
-    SinCosLoss,
     ELBO,
-    default_SOnPathDistributionEncoder, ToyRecogNet, ToyReconNet,
+    default_SOnPathDistributionEncoder,
     PhysioNetRecogNetwork, GenericMLP,
 )
 
@@ -54,66 +49,9 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
-def evaluate(
-    args,
-    dl: torch.utils.data.DataLoader,
-    modules: nn.ModuleDict,
-    elbo_loss: nn.Module,
-    desired_t: torch.Tensor,
-    device: str
-):
-    stats = defaultdict(list)
-
-    modules.eval()
-    with (torch.no_grad()):
-        for _, batch in enumerate(dl):
-            parts = {key: val.to(device) for key, val in batch.items()}
-
-            inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
-
-            h = modules["recog_net"](inp)
-            qzx, pz = modules["qzx_net"](h, desired_t)
-            zis = qzx.rsample((args.mc_eval_samples,))
-            pxz = modules["pxz_net"](zis)
-
-            elbo_val, elbo_parts = elbo_loss(
-                qzx,
-                pz,
-                pxz,
-                parts["evd_obs"],
-                parts["evd_tid"],
-                parts["evd_msk"],
-                {
-                    "kl0_weight": args.kl0_weight,
-                    "klp_weight": args.klp_weight,
-                    "pxz_weight": args.pxz_weight,
-                },
-            )
-            loss = elbo_val
-
-            aux_log_prob = -pxz.log_prob(parts["evd_obs"])
-            aux_log_prob = aux_log_prob.mean(dim=0)
-            try:
-                if dl.dataset.tgt.dim() == 2:
-                    aux_log_prob, _ = aux_log_prob.max(dim=2)
-            except:
-                pass
-
-            aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
-            aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
-
-            batch_len = parts["evd_obs"].shape[0]
-            stats["loss"].append(loss.item() * batch_len)
-            stats["aux_val"].append(aux_performance.item())
-            stats["aux_log_prob"].append(aux_log_prob.mean().item())
-
-            stats["elbo"].append(elbo_val.item() * batch_len)
-            stats["kl0"].append(elbo_parts["kl0"].item() * batch_len)
-            stats["klp"].append(elbo_parts["klp"].item() * batch_len)
-            stats["log_pxz"].append(elbo_parts["log_pxz"].item() * batch_len)
-
-    stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
-    return stats
+def stats2tensorboard(stats_, writer_, epoch_, prefix_=''):
+    for key_, value_ in stats_.items():
+        writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
 
 
 def main():
@@ -121,6 +59,10 @@ def main():
     parser = extend_argparse(generic_parser)
     args = parser.parse_args()
     print(args)
+
+    writer = SummaryWriter()
+    #writer.add_scalars('params' ,{pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},)
+    #writer.add_text('params',{pkey_: pvalue_ for pkey_, pvalue_ in vars(args) if type(pvalue_) in [float, int]},)
 
     experiment_log_file_string = 'anomaly_detection'
 
@@ -186,8 +128,8 @@ def main():
     )
 
     pxz_net = PathToGaussianDecoder(
-        mu_map=recon_net, 
-        sigma_map=None, 
+        mu_map=recon_net,
+        sigma_map=None,
         initial_sigma=0.1) # TODO: is this initial sigma ok so?
 
     qzx_net = default_SOnPathDistributionEncoder(
@@ -213,8 +155,8 @@ def main():
     modules = modules.to(args.device)
 
     optimizer = optim.Adam(modules.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1, verbose=False
-    )
+    #optimizer = optim.SGD(modules.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
 
     logging.debug(f"Number of model parameters={count_parameters(modules)}")
 
@@ -222,7 +164,7 @@ def main():
 
     stats = defaultdict(list)
     stats_mask = {
-        "trn": ["log_pxz", "loss"],
+        "trn": ["log_pxz", "kl0", "klp", "loss"],
         "tst": ["loss"],
         "oth": ["lr"],
     }
@@ -266,16 +208,21 @@ def main():
         # tst_stats["aux_val*"] = best_epoch_tst_aux
 
         stats["trn"].append(trn_stats)
+        stats2tensorboard(trn_stats, writer, epoch, prefix_='trn')
+
         stats["tst"].append(tst_stats)
+        stats2tensorboard(tst_stats, writer, epoch, prefix_='tst')
+
         if use_validation:
             stats["val"].append(val_stats)
+            stats2tensorboard(val_stats, writer, epoch, prefix_='val')
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
             save_checkpoint(
-                args, 
-                epoch, 
-                experiment_id, 
-                modules, 
+                args,
+                epoch,
+                experiment_id,
+                modules,
                 desired_t)
 
         msg = pm.build_progress_message(stats, epoch)
@@ -286,6 +233,69 @@ def main():
                 args.log_dir, f"{experiment_log_file_string}_{experiment_id}.json"
             )
             save_stats(args, stats, fname)
+
+    writer.flush()
+
+
+def evaluate(
+    args,
+    dl: torch.utils.data.DataLoader,
+    modules: nn.ModuleDict,
+    elbo_loss: nn.Module,
+    desired_t: torch.Tensor,
+    device: str,
+    aux_perf: bool = False
+):
+    stats = defaultdict(list)
+
+    modules.eval()
+    with (torch.no_grad()):
+        for _, batch in enumerate(dl):
+            parts = {key: val.to(device) for key, val in batch.items()}
+
+            inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
+
+            h = modules["recog_net"](inp)
+            qzx, pz = modules["qzx_net"](h, desired_t)
+            zis = qzx.rsample((args.mc_eval_samples,))
+            pxz = modules["pxz_net"](zis)
+
+            elbo_val, elbo_parts = elbo_loss(
+                qzx,
+                pz,
+                pxz,
+                parts["evd_obs"],
+                parts["evd_tid"],
+                parts["evd_msk"],
+                {
+                    "kl0_weight": args.kl0_weight,
+                    "klp_weight": args.klp_weight,
+                    "pxz_weight": args.pxz_weight,
+                },
+            )
+            loss = elbo_val
+
+            aux_log_prob = -pxz.log_prob(parts["evd_obs"])
+            aux_log_prob = aux_log_prob.mean(dim=0)
+            if parts["aux_tgt"].dim() == 2:
+                aux_log_prob, _ = aux_log_prob.max(dim=2)
+
+            if aux_perf:
+                aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
+                aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
+                stats["aux_val"].append(aux_performance.item())
+                stats["aux_log_prob"].append(aux_log_prob.mean().item())
+
+            batch_len = parts["evd_obs"].shape[0]
+            stats["loss"].append(loss.item() * batch_len)
+
+            stats["elbo"].append(elbo_val.item() * batch_len)
+            stats["kl0"].append(elbo_parts["kl0"].item() * batch_len)
+            stats["klp"].append(elbo_parts["klp"].item() * batch_len)
+            stats["log_pxz"].append(elbo_parts["log_pxz"].item() * batch_len)
+
+    stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
+    return stats
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 #%%
 # Toy Experiment with Irregular Sine Data
 import sys
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, accuracy_score
 
+from data.ad_provider import ADProvider
 from data.basicdata_provider import BasicDataProvider
 
 sys.path.append('../')
@@ -21,7 +24,7 @@ dataset = "anomaly_detection"
 experiment_id = 60625   # mine
 checkpoint_epoch = 4500
 # 108826 bis 2190
-experiment_id = 87634   # mine
+experiment_id = 82435   # mine
 checkpoint_epoch = 2190
 
 #%%
@@ -44,7 +47,7 @@ pprint(logs['final'])
 
 #% plot loss curves
 import matplotlib.pyplot as plt
-def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
+def plot_stat(logs: dict, stat:str, modes:list = ['trn', 'tst']):
     fig, ax = plt.subplots(figsize=(8,3))
     for mode in modes:
         key = f"{mode}_{stat}"
@@ -52,6 +55,8 @@ def plot_stat(logs: dict, stat:str, modes:list = ['trn']):
         ax.plot(val, label = mode)
     ax.set_xlabel('training epochs')
     ax.set_ylabel(stat)
+    ax.set_yscale('log')
+    ax.legend()
     ax.grid()
     return fig, ax
 
@@ -63,11 +68,13 @@ plt.show()
 
 # In[8]:
 args = Namespace(**logs['args'])
+args.device = 'cuda:1'
 
-provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
+#provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
+provider = ADProvider(data_dir='data_dir', data_kind="SWaT")
 
 dl_trn = provider.get_train_loader(batch_size=1)
-dl_val = provider.get_val_loader(batch_size=1)
+#dl_val = provider.get_val_loader(batch_size=1)
 dl_test = provider.get_test_loader(batch_size=1)
 batch = next(iter(dl_trn))
 
@@ -124,55 +131,84 @@ def batch_get_log_prob(batch_):
     parts = batch_to_device(batch_, args.device)
     inp = (parts["evd_obs"], parts["evd_msk"], parts["evd_tps"])
     h = modules["recog_net"](inp)
-    qzx, pz = modules["qzx_net"](h, desired_t)
+    for a in inp:
+        del a
+    qzx, _ = modules["qzx_net"](h, desired_t)
+    del h
     zis = qzx.rsample((500,))
+    del qzx
     pxz = modules["pxz_net"](zis)
+    del zis
     lg_prb = -pxz.log_prob(parts["evd_obs"]).mean(dim=0)
     return lg_prb
+
 
 def batch_to_device(batch_, device_):
     return {key: val.to(device_) for key, val in batch_.items()}
 
-#%% identify anomaly threshold
-log_probs_test = [batch_get_log_prob(batch).squeeze() for _, batch in enumerate(dl_test)]
-log_probs_test = torch.vstack(log_probs_test)
-test_mean = log_probs_test.mean(dim=0)
-test_std = log_probs_test.std(dim=0)
 
-anomaly_threshold = test_mean + 3 * test_std
+#%% identify anomaly threshold
+log_probs_test = []
+for idx, batch_ in enumerate(dl_trn):
+    log_probs_test.append(batch_get_log_prob(batch_).detach().cpu().squeeze().numpy())
+
+log_probs_test = np.vstack(log_probs_test)
+test_mean = log_probs_test.mean(axis=0)
+test_std = log_probs_test.std(axis=0)
+
+anomaly_threshold = test_mean + 1.5 * test_std
 
 #%%  generate reconstructions
-for idx, batch in enumerate(dl_val):
+
+accs, f1s = [], []
+for idx, batch in enumerate(dl_test):
     parts = batch_to_device(batch, args.device)
     inp = (parts["evd_obs"], parts["evd_msk"], parts["evd_tps"])
+    for a in inp:
+        del a
     h = modules["recog_net"](inp)
-    qzx, pz = modules["qzx_net"](h, desired_t)
-    zis = qzx.rsample((500,))
+    qzx, _ = modules["qzx_net"](h, desired_t)
+    del h
+    zis = qzx.rsample((250,))
+    del qzx
     pxz = modules["pxz_net"](zis)
+    del zis
     lg_prb = -pxz.log_prob(parts["evd_obs"]).mean(dim=0)
-    pred_tgt = torch.zeros_like(parts["aux_tgt"])
-    pred_tgt[0, lg_prb.squeeze() > anomaly_threshold] = 1
+    lg_prb = lg_prb.detach().cpu().squeeze().numpy()
+    anomaly_selector = lg_prb.squeeze() > anomaly_threshold
+    pred_tgt = np.zeros(batch["aux_tgt"].squeeze().shape)
+    if pred_tgt.ndim == 1:
+        pass
+        #anomaly_selector = anomaly_selector.any(axis=1)
+    pred_tgt[anomaly_selector] = 1
 
-    f1 = f1_score(pred_tgt.flatten().detach().cpu(), parts["aux_tgt"].flatten().detach().cpu())
+    acc = accuracy_score(pred_tgt.flatten(), batch["aux_tgt"].flatten().detach().cpu())
+    f1 = f1_score(pred_tgt.flatten(), batch["aux_tgt"].flatten().detach().cpu())
+    f1s.append(f1)
+    accs.append(acc)
 
-    fig, axs = plt.subplots(nrows=num_data_features, figsize=(16,9))
-    for ft in range(num_data_features):
-        for i in range(500):
-            pxz_mean = pxz.mean[i, :, :, ft].flatten().detach().cpu()
-            axs[ft].plot(torch.linspace(0,1,pxz_mean.shape[0]),
-                         pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
-            evd = batch['evd_tps'].flatten()
-        axs[ft].set_ylabel('Signal Amplitude')
-        axs[ft].plot(evd/evd.max(), batch['evd_obs'][:,:,ft].flatten(),
-                 '+', color='black')
-        ac = axs[ft].twinx()
-        ac.plot(torch.linspace(0, 1, pxz_mean.shape[0]), lg_prb[:,:, ft].flatten().detach().cpu(), color='tab:red')
-        ac.axhline(y=anomaly_threshold[ft].item())
-        ac.set_ylabel("Log Prob")
-        axs[ft].set_xlabel('Time t / s')
-    #plt.ylim(-1.5,1.5);
-    plt.suptitle(f'F1-Score: {f1}')
-    plt.show()
+print("F1:", np.mean(f1s))
+print("Acc:", np.mean(accs))
+
+#%%
+fig, axs = plt.subplots(nrows=num_data_features, figsize=(16,9))
+for ft in range(num_data_features):
+    for i in range(500):
+        pxz_mean = pxz.mean[i, :, :, ft].flatten().detach().cpu()
+        axs[ft].plot(torch.linspace(0,1,pxz_mean.shape[0]),
+                     pxz_mean,color='tab:blue', alpha=0.01, linewidth=3)
+        evd = batch['evd_tps'].flatten()
+    axs[ft].set_ylabel('Signal Amplitude')
+    axs[ft].plot(evd/evd.max(), batch['evd_obs'][:,:,ft].flatten(),
+             '+', color='black')
+    ac = axs[ft].twinx()
+    ac.plot(torch.linspace(0, 1, pxz_mean.shape[0]), lg_prb[:,:, ft].flatten().detach().cpu(), color='tab:red')
+    ac.axhline(y=anomaly_threshold[ft].item())
+    ac.set_ylabel("Log Prob")
+    axs[ft].set_xlabel('Time t / s')
+#plt.ylim(-1.5,1.5);
+plt.suptitle(f'F1-Score: {f1}')
+plt.show()
 
 #%%
 t = qzx.t.cpu().detach()
