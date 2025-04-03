@@ -1202,7 +1202,8 @@ class GenericMLP(nn.Module):
             inp_dim: int,
             out_dim: int,
             n_hidden: int = 32,
-            n_layers: int = 1
+            n_layers: int = 1,
+            non_linear: bool = True
     )-> None:
         """_summary_
 
@@ -1217,16 +1218,19 @@ class GenericMLP(nn.Module):
         self.out_dim = out_dim
         self.n_hidden = n_hidden
         self.n_layers = n_layers
+        self.non_linear = non_linear
 
         assert n_layers > 0, "Number of layers needs to be > 0"
         if n_layers == 1:
             self.map = nn.Linear(inp_dim, out_dim)
         else:
             layers = [nn.Linear(inp_dim, n_hidden)]
-            layers.append(nn.ReLU())
+            if self.non_linear:
+                layers.append(nn.ReLU())
             for _ in range(n_layers - 2):
                 layers.append(nn.Linear(n_hidden, n_hidden))
-                layers.append(nn.ReLU())
+                if self.non_linear:
+                    layers.append(nn.ReLU())
             layers.append(nn.Linear(n_hidden, out_dim))
             self.map = nn.Sequential(*layers)
 

@@ -5,6 +5,7 @@
     NeurIPS 2023
 """
 
+import datetime
 import os
 import logging
 import argparse
@@ -45,6 +46,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
+    group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     #group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
@@ -54,22 +56,18 @@ def stats2tensorboard(stats_, writer_, epoch_, prefix_=''):
         writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
 
 
-def main():
-    experiment_id = int(SystemRandom().random() * 100000)
-    parser = extend_argparse(generic_parser)
-    args = parser.parse_args()
-    print(args)
-
-    writer = SummaryWriter()
+def start_experiment(args):
+    experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
+    experiment_log_file_string = 'anomaly_detection'
+    experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
+    writer = SummaryWriter(f'runs/{experiment_id_str}')
     #writer.add_scalars('params' ,{pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},)
     #writer.add_text('params',{pkey_: pvalue_ for pkey_, pvalue_ in vars(args) if type(pvalue_) in [float, int]},)
-
-    experiment_log_file_string = 'anomaly_detection'
 
     set_up_logging(
         console_log_level=args.loglevel,
         console_log_color=True,
-        logfile_file=os.path.join(args.log_dir, f"{experiment_log_file_string}_{experiment_id}.txt")
+        logfile_file=os.path.join(args.log_dir, f"{experiment_id_str}.txt")
         if args.log_dir is not None
         else None,
         logfile_log_level=args.loglevel,
@@ -81,6 +79,7 @@ def main():
     if args.seed > 0:
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
+    logging.debug(f'Parameters set: {vars(args)}')
 
     #provider = BasicDataProvider(data_dir='data_dir', num_features=args.num_features, sample_tp=1., data_kind=None)
     provider = ADProvider(data_dir='data_dir', data_kind='SWaT')
@@ -125,6 +124,7 @@ def main():
         out_dim=provider.input_dim,
         n_hidden=args.dec_hidden_dim,
         n_layers=args.n_dec_layers,
+        non_linear=args.non_linear_decoder
     )
 
     pxz_net = PathToGaussianDecoder(
@@ -221,7 +221,7 @@ def main():
             save_checkpoint(
                 args,
                 epoch,
-                experiment_id,
+                experiment_id_str,
                 modules,
                 desired_t)
 
@@ -230,10 +230,11 @@ def main():
 
         if args.enable_file_logging:
             fname = os.path.join(
-                args.log_dir, f"{experiment_log_file_string}_{experiment_id}.json"
+                args.log_dir, f"{experiment_id_str}.json"
             )
             save_stats(args, stats, fname)
 
+    logging.shutdown()
     writer.flush()
 
 
@@ -244,7 +245,6 @@ def evaluate(
     elbo_loss: nn.Module,
     desired_t: torch.Tensor,
     device: str,
-    aux_perf: bool = False
 ):
     stats = defaultdict(list)
 
@@ -280,11 +280,10 @@ def evaluate(
             if parts["aux_tgt"].dim() == 2:
                 aux_log_prob, _ = aux_log_prob.max(dim=2)
 
-            if aux_perf:
-                aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
-                aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
-                stats["aux_val"].append(aux_performance.item())
-                stats["aux_log_prob"].append(aux_log_prob.mean().item())
+            aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
+            aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
+            stats["aux_f1"].append(aux_performance.item())
+            stats["aux_log_prob"].append(aux_log_prob.mean().item())
 
             batch_len = parts["evd_obs"].shape[0]
             stats["loss"].append(loss.item() * batch_len)
@@ -296,6 +295,13 @@ def evaluate(
 
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
     return stats
+
+
+def main():
+    parser = extend_argparse(generic_parser)
+    args_ = parser.parse_args()
+    print(args_)
+    start_experiment(args_)
 
 
 if __name__ == "__main__":
