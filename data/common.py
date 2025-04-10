@@ -9,11 +9,7 @@ def get_data_min_max(records):
     inf = torch.Tensor([float("Inf")])[0]
 
     for b, rc_ in enumerate(records):
-        if len(rc_) == 4:
-            record_id, tt, vals, mask = rc_
-        else:
-            record_id, tt, vals, mask, _ = rc_
-
+        vals, mask = rc_[2], rc_[3]
         n_features = vals.size(-1)
 
         batch_min = []
