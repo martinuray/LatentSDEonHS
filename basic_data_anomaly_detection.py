@@ -275,15 +275,18 @@ def evaluate(
             )
             loss = elbo_val
 
-            aux_log_prob = -pxz.log_prob(parts["evd_obs"])
-            aux_log_prob = aux_log_prob.mean(dim=0)
-            if parts["aux_tgt"].dim() == 2:
-                aux_log_prob, _ = aux_log_prob.max(dim=2)
+            do_anomaly_score_eval = "aux_tgt" in parts.keys()
 
-            aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
-            aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
-            stats["aux_f1"].append(aux_performance.item())
-            stats["aux_log_prob"].append(aux_log_prob.mean().item())
+            if do_anomaly_score_eval:
+                aux_log_prob = -pxz.log_prob(parts["evd_obs"])
+                aux_log_prob = aux_log_prob.mean(dim=0)
+                if parts["aux_tgt"].dim() == 2:
+                    aux_log_prob, _ = aux_log_prob.max(dim=2)
+
+                aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
+                aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
+                stats["aux_f1"].append(aux_performance.item())
+                stats["aux_log_prob"].append(aux_log_prob.mean().item())
 
             batch_len = parts["evd_obs"].shape[0]
             stats["loss"].append(loss.item() * batch_len)
