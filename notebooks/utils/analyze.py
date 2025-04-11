@@ -2,7 +2,8 @@ import numpy as np
 import torch
 import tqdm
 from matplotlib import pyplot as plt
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, \
+    recall_score
 from torch import nn as nn
 
 from core.models import PhysioNetRecogNetwork, GenericMLP, \
@@ -64,7 +65,7 @@ def reconstruct_batch(batch_, args_, modules_, desired_t_, n_samples_=500):
 def batch_get_log_prob(batch_, args_, modules_, desired_t_):
     pxz_ = reconstruct_batch(batch_, args_, modules_, desired_t_)
     lg_prb_ = -pxz_.log_prob(batch_["evd_obs"].to(args_.device)).mean(dim=0)
-    return lg_prb_
+    return lg_prb_.to('cpu').detach().numpy()
 
 
 def batch_to_device(batch_, device_):
@@ -90,6 +91,11 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, num_data_features
 
         my_pxz = reconstruct_batch(batch_i, args_, modules_, desired_t_)
 
+        evd = batch_i['evd_tps'][0, :]
+        evd = evd / evd.max()
+        anomaly_indicator = batch_i['aux_tgt'][0, :]
+        obs = batch_i['evd_obs'][0, :]
+
         fig, axs = plt.subplots(nrows=num_data_features_, figsize=(16, 9))
         for ft in range(num_data_features_):
             for i in range(500):
@@ -97,10 +103,10 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, num_data_features
                 axs[ft].plot(torch.linspace(0, 1, pxz_mean.shape[0]),
                              pxz_mean, color='tab:blue', alpha=0.01,
                              linewidth=3)
-            evd = batch_i['evd_tps'][0, :]
+
             axs[ft].set_ylabel('Signal Amplitude')
-            axs[ft].plot(evd / evd.max(), batch_i['evd_obs'][0, :, ft], '+',
-                         color='black')
+            axs[ft].plot(evd[anomaly_indicator==0], obs[anomaly_indicator==0, ft], '+', color='black')
+            axs[ft].plot(evd[anomaly_indicator==1], obs[anomaly_indicator==1, ft], '+', color='red')
             #ac = axs[ft].twinx()
             # ac.plot(torch.linspace(0, 1, pxz_mean.shape[0]), lg_prb[:,:, ft].flatten().detach().cpu(), color='tab:red')
             # ac.axhline(y=anomaly_threshold[ft].item())
@@ -114,27 +120,30 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, num_data_features
             break
 
 
-def get_anomaly_performance(dl_test, args, modules, desired_t, anomaly_threshold):
-    accs, f1s = [], []
+def get_anomaly_performance(dl_test, args, modules, desired_t, anomaly_threshold):  #, n_over_threshold_threshold):
+    print("Evaluation...")
+    true_label, pred = [], []
     for _, batch_it in tqdm.tqdm(enumerate(dl_test)):
-        parts = batch_to_device(batch_it, args.device)
-        pxz = reconstruct_batch(batch_it, args, modules, desired_t)
-
-        lg_prb = -pxz.log_prob(parts["evd_obs"]).mean(dim=0)
-        lg_prb = lg_prb.detach().cpu().squeeze().numpy()
+        lg_prb = batch_get_log_prob(batch_it, args, modules, desired_t)
 
         pred_tgt = np.zeros(batch_it["aux_tgt"].squeeze().shape)
         anomaly_selector = lg_prb.squeeze() > anomaly_threshold
         if pred_tgt.ndim == 1:
-            anomaly_selector = anomaly_selector.any(axis=1)
+            #anomaly_selector = anomaly_selector.any(axis=1)
+            anomaly_selector = (anomaly_selector * 1).any() #.sum(axis=1) >  n_over_threshold_threshold
 
         pred_tgt[anomaly_selector] = 1
 
         true_tgt = batch_it["aux_tgt"].flatten().detach().cpu()
+        true_label.append(true_tgt)
+        pred.append(pred_tgt)
 
-        acc = accuracy_score(pred_tgt.flatten(), true_tgt)
-        f1 = f1_score(pred_tgt.flatten(), true_tgt)
-        f1s.append(f1)
-        accs.append(acc)
-    print("F1:", np.mean(f1s))
-    print("Acc:", np.mean(accs))
+    predicted = np.concatenate(pred)
+    ture_values = np.concatenate(true_label)
+    prec = precision_score(ture_values, predicted)
+    rec = recall_score(ture_values, predicted)
+    f1 = f1_score(ture_values, predicted)
+
+    print(f"F1:{f1:.4f}" )
+    print(f"Prec: {prec:.4f}%")
+    print(f"Rec: {rec:.4f}%")
