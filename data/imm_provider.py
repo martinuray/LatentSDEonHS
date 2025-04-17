@@ -312,6 +312,3 @@ def pad_list_and_stack(lo, max_signal_length):
     lo = [F.pad(ob, (0, 0, 0, max_signal_length - ob.size(0))) for ob in lo]
     lo = torch.stack(lo, dim=0).float()
     return lo
-
-#%%
-a = IMMProvider('/scratch1/muray/LatentSDEonHS/data_dir/')
