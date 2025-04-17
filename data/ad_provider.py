@@ -5,8 +5,11 @@ Data loading code is taken and dadpated (in parts) from
 
 Authors: Sebastian Zeng, Florian Graf, Roland Kwitt (2023)
 """
-
+import glob
+import logging
 import os
+from typing import DefaultDict
+
 import numpy as np
 import pandas as pd
 
@@ -44,54 +47,16 @@ class ADData(object):
             print((os.path.join(self.processed_folder, self.destination_file)))
             raise RuntimeError('Dataset not found. You can use download=True to download it')
 
-        # TODO: differentiate somehow on train/test/val data
-        raw_data_df = pd.read_csv(os.path.join(self.processed_folder, self.destination_file), delimiter=',')
-        if columns is None:
-            raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)] # TODO: otherwise issue when normalizing
-            self.params = list(raw_data_df.columns)
+        if self.data_kind in ["SWaT", "WaDi"]:
+            self._load_water_treatment_data(
+                columns=columns, overlapping_windows=overlapping_windows,
+                n_samples=n_samples)
+        elif self.data_kind in ["SMD"]:
+            self._load_server_machine_data(
+                columns=columns, overlapping_windows=overlapping_windows,
+                n_samples=n_samples)
         else:
-            self.params = columns
-            raw_data_df = raw_data_df.loc[:, self.params]
-
-        self.params_dict = {k: i for i, k in enumerate(self.params)}
-
-        if self.mode == 'test':
-            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
-                0]) % self.max_signal_length, raw_data_df.shape[1]))
-            raw_data = np.vstack((raw_data_df, added_)).copy()
-            raw_data = raw_data.reshape(-1, self.max_signal_length, raw_data.shape[1])
-            # TODO take care that no overlapping windows are taken
-            self.targets = pd.read_csv(os.path.join(self.processed_folder, self.label_file))
-            self.targets = np.array(self.targets)
-            self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
-            self.targets = self.targets.reshape(-1, self.max_signal_length)
-        else:
-            raw_data = raw_data_df.to_numpy().copy()
-            raw_data = create_win_periods(raw_data, self.max_signal_length,
-                                          int(self.max_signal_length * overlapping_windows))
-            self.targets = np.zeros(raw_data.shape[0:2])
-
-        indcs = torch.arange(0, raw_data.shape[1])
-        data_tensor = torch.Tensor(raw_data)
-        mask = torch.ones_like(data_tensor)
-
-        # handle nan values in the dataset
-        mask[data_tensor.isnan()] = 0
-        data_tensor[data_tensor.isnan()] = 0
-
-        if self.mode == 'test':
-            mask[-1,-added_.shape[0]:, :] = 0
-
-        if n_samples is not None:
-            data_tensor = data_tensor[:n_samples]
-            mask = mask[:n_samples]
-            indcs = indcs[:n_samples]
-            if self.mode == 'test':
-                self.targets = self.targets[:n_samples]
-
-        assert data_tensor.shape[0] == mask.shape[0]
-
-        self.data = [(part_idx, indcs, data_tensor[part_idx,:,:], mask[part_idx,:,:]) for part_idx in range(mask.shape[0])]
+            raise NotImplementedError
 
 
     def download(self):
@@ -102,6 +67,8 @@ class ADData(object):
         os.makedirs(self.processed_folder, exist_ok=True)
                 
     def _check_exists(self):
+        if self.data_kind == "SMD":
+            return os.path.isdir(os.path.join(self.processed_folder, self.mode))
         return os.path.isfile(os.path.join(self.processed_folder, self.destination_file))
 
     @property
@@ -144,6 +111,158 @@ class ADData(object):
 
     def get_label(self, record_id):
         return self.labels[record_id]
+
+    def _load_water_treatment_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+        raw_data_df = pd.read_csv(
+            os.path.join(self.processed_folder, self.destination_file),
+            delimiter=',')
+        if columns is None:
+            raw_data_df = raw_data_df.loc[:, (
+                                                         raw_data_df.nunique() > 1)]  # TODO: otherwise issue when normalizing
+            self.params = list(raw_data_df.columns)
+        else:
+            self.params = columns
+            raw_data_df = raw_data_df.loc[:, self.params]
+
+        if self.mode == 'test':
+            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
+                0]) % self.max_signal_length, raw_data_df.shape[1]))
+            raw_data = np.vstack((raw_data_df, added_)).copy()
+            raw_data = raw_data.reshape(-1, self.max_signal_length,
+                                        raw_data.shape[1])
+            # TODO take care that no overlapping windows are taken
+            self.targets = pd.read_csv(
+                os.path.join(self.processed_folder, self.label_file))
+            self.targets = np.array(self.targets)
+            self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
+            self.targets = self.targets.reshape(-1, self.max_signal_length)
+        else:
+            raw_data = raw_data_df.to_numpy().copy()
+            raw_data = create_win_periods(raw_data, self.max_signal_length,
+                                          int(self.max_signal_length * overlapping_windows))
+
+            self.targets = np.zeros(raw_data.shape[0:2])
+
+        self.params_dict = {k: i for i, k in enumerate(self.params)}
+        indcs = torch.arange(0, raw_data.shape[1])
+        data_tensor = torch.Tensor(raw_data)
+        mask = torch.ones_like(data_tensor)
+
+        # handle nan values in the dataset
+        mask[data_tensor.isnan()] = 0
+        data_tensor[data_tensor.isnan()] = 0
+
+        if self.mode == 'test':
+            mask[-1, -added_.shape[0]:, :] = 0
+
+        if n_samples is not None:
+            logging.warning(f"Limiting dataset to {n_samples} samples")
+            data_tensor = data_tensor[:n_samples]
+            mask = mask[:n_samples]
+            indcs = indcs[:n_samples]
+            if self.mode == 'test':
+                self.targets = self.targets[:n_samples]
+        else:
+            logging.debug("No limit on the dataset size")
+
+        assert data_tensor.shape[0] == mask.shape[0]
+
+        self.data = [(part_idx, indcs, data_tensor[part_idx, :, :],
+                      mask[part_idx, :, :]) for part_idx in
+                     range(mask.shape[0])]
+
+    def _load_server_machine_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+
+        all_dfs = self.get_all_dfs()
+
+        if columns is None:
+            self.params = next(iter(all_dfs.values()))[self.mode].columns
+        else:
+            self.params = columns
+
+        if self.mode == 'test':
+            raw_data_list, raw_targets_list, masks_list = [], [], []
+            for _, values in all_dfs.items():
+                test_data = values['test']
+                added_ = np.zeros(((self.max_signal_length - test_data.shape[
+                    0]) % self.max_signal_length, test_data.shape[1]))
+                raw_data = np.vstack((test_data, added_)).copy()
+                raw_data = raw_data.reshape(-1, self.max_signal_length,
+                                            raw_data.shape[1])
+                raw_data_list.append(raw_data)
+                msk = np.ones_like(raw_data)
+                msk[-1, -added_.shape[0]:, :] = 0
+                masks_list.append(msk)
+
+                # TODO take care that no overlapping windows are taken
+                targets = values['labels']
+                targets = np.array(targets)
+                targets = np.hstack((targets.squeeze(), added_[:, 0]))
+                targets = targets.reshape(-1, self.max_signal_length)
+                raw_targets_list.append(targets)
+
+            raw_data = np.vstack(raw_data_list)
+            self.targets = np.vstack(raw_targets_list)
+            data_tensor = torch.Tensor(raw_data)
+
+            # TODO
+            mask = torch.Tensor(np.vstack(masks_list))
+
+        else:
+            raw_dfs = []
+            for _, values in all_dfs.items():
+                rd = values['train'].to_numpy().copy()
+                raw_dfs.append(create_win_periods(rd, self.max_signal_length,
+                                                  int(self.max_signal_length * overlapping_windows)))
+
+            raw_data = np.vstack(raw_dfs)
+            self.targets = np.zeros(raw_data.shape[0:2])
+            data_tensor = torch.Tensor(raw_data)
+            mask = torch.ones_like(data_tensor)
+
+        self.params_dict = {k: i for i, k in enumerate(self.params)}
+        indcs = torch.arange(0, raw_data.shape[1])
+
+        # handle nan values in the dataset
+        mask[data_tensor.isnan()] = 0
+        data_tensor[data_tensor.isnan()] = 0
+
+        if n_samples is not None:
+            logging.warning(f"Limiting dataset to {n_samples} samples")
+            data_tensor = data_tensor[:n_samples]
+            mask = mask[:n_samples]
+            indcs = indcs[:n_samples]
+            if self.mode == 'test':
+                self.targets = self.targets[:n_samples]
+        else:
+            logging.debug("No limit on the dataset size")
+
+        #assert data_tensor.shape[0] == mask.shape[0]
+
+        self.data = [(part_idx, indcs, data_tensor[part_idx, :, :],
+                      mask[part_idx, :, :]) for part_idx in
+                     range(mask.shape[0])]
+
+    def get_all_dfs(self):
+        all_files = glob.glob(os.path.join(self.processed_folder, self.mode, '*.txt'))
+
+        data = {}
+
+        for file_ in all_files:
+            machine = file_.split('/')[-1].replace('.txt', '')
+            data[machine] = {}
+            data[machine]['train'] = None
+            data[machine]['test'] = None
+            data[machine]['labels'] = None
+            if self.mode == 'train':
+                data[machine]['train'] = pd.read_csv(file_, delimiter=',', header=None)
+            elif self.mode == 'test':
+                data[machine]['test'] = pd.read_csv(file_, delimiter=',', header=None)
+                label_file = file_.replace('test', 'test_label')
+                data[machine]['labels'] = pd.read_csv(label_file, delimiter=',', header=None)
+
+        assert all(df[self.mode].shape[1] == next(iter(data.values()))[self.mode].shape[1] for df in data.values()), "Not all DataFrames have the same number of columns"
+        return data
 
 
 class ADDataset(Dataset):
@@ -217,7 +336,7 @@ class ADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset=None, sample_tp=0.5, n_samples:int=None):
         DatasetProvider.__init__(self)
 
-        if dataset not in ["SWaT", "WaDi"]:
+        if dataset not in ["SWaT", "WaDi", "SMD"]:
             raise NotImplementedError
 
         self._dataset = dataset
@@ -225,12 +344,6 @@ class ADProvider(DatasetProvider):
         self._sample_tp = sample_tp
         self._ds_trn = ADDataset(data_dir, 'train', data_kind=dataset, n_samples=n_samples)
         self._ds_tst = ADDataset(data_dir, 'test', data_kind=dataset, n_samples=n_samples)
-
-        # TODO: necessary?
-        #assert self._ds_trn.num_timepoints == self._ds_tst.num_timepoints
-        #assert torch.all(self._ds_trn.data_min == self._ds_tst.data_min)
-        #assert torch.all(self._ds_trn.data_max == self._ds_tst.data_max)
-        #assert torch.all(self._ds_trn.data_max == self._ds_val.data_max)
 
     @property 
     def input_dim(self):
@@ -273,3 +386,4 @@ def create_win_periods(data_, win_size_, win_stride_):
         win_size_, data_.shape[1]))
     return windows.squeeze()[::win_stride_, :]
 
+t = ADProvider(data_dir='data_dir', dataset='SMD', n_samples=100)

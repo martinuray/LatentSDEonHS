@@ -65,7 +65,8 @@ def reconstruct_batch(batch_, args_, modules_, desired_t_, n_samples_=500):
 def batch_get_log_prob(batch_, args_, modules_, desired_t_):
     pxz_ = reconstruct_batch(batch_, args_, modules_, desired_t_)
     lg_prb_ = -pxz_.log_prob(batch_["evd_obs"].to(args_.device)).mean(dim=0)
-    return lg_prb_.to('cpu').detach().numpy()
+    lg_prb_ = lg_prb_.to(torch.float64)
+    return lg_prb_
 
 
 def batch_to_device(batch_, device_):
