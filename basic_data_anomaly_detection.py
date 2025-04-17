@@ -28,6 +28,8 @@ from core.models import (
 )
 
 from core.training import generic_train
+from data.imm_provider import IMMProvider
+from notebooks.utils.analyze import batch_get_log_prob
 from utils.anomaly_detection import anomaly_detection_performances
 from utils.logger import set_up_logging
 from utils.misc import (
@@ -37,6 +39,7 @@ from utils.misc import (
     save_checkpoint,
     save_stats)
 from utils.parser import generic_parser
+from utils.scoring_functions import Evaluator
 
 
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -44,16 +47,40 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     #group.add_argument("--aux-weight", type=float, default=10.0)
     group.add_argument("--num-features", type=int, default=4)
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    #group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD"], default="SWaT")
     return parser
 
 
 def stats2tensorboard(stats_, writer_, epoch_, prefix_=''):
     for key_, value_ in stats_.items():
-        writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
+        if value_ is not None:
+            writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
+
+
+def logprob2f1s(scores, true_labels, clip_value=100):
+    eval = Evaluator()
+
+    scores = torch.cat(scores, dim=0)
+    true_labels = torch.cat(true_labels, dim=0)
+
+    # TODO: to speed shit up
+    scores = scores.round(decimals=2)
+    scores[scores > clip_value] = clip_value
+
+    scores = scores.flatten().detach().cpu().numpy()
+    true_labels = true_labels.flatten().detach().cpu().numpy()
+
+    f1, f1_ts = 0, 0
+    unique_values, counts = np.unique(true_labels, return_counts=True)
+    if  unique_values.shape[0] > 1:
+        f1 = eval.best_f1_score(true_labels, scores)
+        f1_ts = eval.best_ts_f1_score(true_labels, scores)
+
+    return f1, f1_ts
 
 
 def start_experiment(args):
@@ -82,7 +109,8 @@ def start_experiment(args):
     logging.debug(f'Parameters set: {vars(args)}')
 
     #provider = BasicDataProvider(data_dir='data_dir', num_features=args.num_features, sample_tp=1., data_kind=None)
-    provider = ADProvider(data_dir='data_dir', data_kind='SWaT')
+    provider = ADProvider(data_dir='data_dir', dataset=args.dataset, n_samples=1000 if args.debug else None)
+    #provider = IMMProvider(data_dir='data_dir')
     dl_trn = provider.get_train_loader(
         batch_size=args.batch_size,
         shuffle=True,
@@ -188,9 +216,9 @@ def start_experiment(args):
             desired_t,
             args.device
         )
-        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device)
+        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device, epoch=epoch)
         if use_validation:
-            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device)
+            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device, epoch=epoch)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
@@ -245,11 +273,13 @@ def evaluate(
     elbo_loss: nn.Module,
     desired_t: torch.Tensor,
     device: str,
+    epoch: int = 1,
 ):
     stats = defaultdict(list)
 
     modules.eval()
     with (torch.no_grad()):
+        all_labels, all_scores = [], []
         for _, batch in enumerate(dl):
             parts = {key: val.to(device) for key, val in batch.items()}
 
@@ -275,18 +305,20 @@ def evaluate(
             )
             loss = elbo_val
 
-            do_anomaly_score_eval = "aux_tgt" in parts.keys()
+            aux_log_prob = -pxz.log_prob(parts["evd_obs"])
 
-            if do_anomaly_score_eval:
-                aux_log_prob = -pxz.log_prob(parts["evd_obs"])
-                aux_log_prob = aux_log_prob.mean(dim=0)
-                if parts["aux_tgt"].dim() == 2:
-                    aux_log_prob, _ = aux_log_prob.max(dim=2)
+            # make sure that log_prob is in the right shape
+            if aux_log_prob.dim() >= 4:
+                aux_log_prob = aux_log_prob.squeeze()
+            if aux_log_prob.dim() == 2:
+                aux_log_prob = aux_log_prob[None, :, :]
 
-                aux_tgt = (aux_log_prob < -torch.log(torch.Tensor([0.75]).to(device))) * 1
-                aux_performance = anomaly_detection_performances(aux_tgt.to(device), parts["aux_tgt"].to(device))
-                stats["aux_f1"].append(aux_performance.item())
-                stats["aux_log_prob"].append(aux_log_prob.mean().item())
+            #aux_log_prob = aux_log_prob.mean(dim=0)
+            if parts["aux_tgt"].dim() == 2:
+                aux_log_prob = aux_log_prob.mean(dim=2) # TODO: mean, but very basic
+
+            all_labels.append(parts["aux_tgt"])
+            all_scores.append(aux_log_prob)
 
             batch_len = parts["evd_obs"].shape[0]
             stats["loss"].append(loss.item() * batch_len)
@@ -297,6 +329,14 @@ def evaluate(
             stats["log_pxz"].append(elbo_parts["log_pxz"].item() * batch_len)
 
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
+
+    f1, f1_ts = {}, {}
+    if epoch % 10 == 0:
+        f1, f1_ts = logprob2f1s(all_scores, all_labels)
+    for key, value in f1.items():
+        stats[key] = value
+    for key, values in f1_ts.items():
+        stats[f"ts_{key}"] = values
     return stats
 
 

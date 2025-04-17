@@ -29,7 +29,7 @@ class ADData(object):
     labels = None
     params_dict, labels_dict = None, None
 
-    def __init__(self, root, data_kind="SWaT", mode='train', n_samples = None, subsample = None):
+    def __init__(self, root, data_kind="SWaT", mode='train', n_samples = None, columns = None):
 
         self.root = root
         self.data_kind = data_kind
@@ -45,9 +45,15 @@ class ADData(object):
             raise RuntimeError('Dataset not found. You can use download=True to download it')
 
         # TODO: differentiate somehow on train/test/val data
-        raw_data_df = pd.read_csv(os.path.join(self.processed_folder, self.destination_file))
-        raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 2)] # TODO: bc of memory issues
+        raw_data_df = pd.read_csv(os.path.join(self.processed_folder, self.destination_file), delimiter=',')
+        if columns is None:
+            raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)] # TODO: otherwise issue when normalizing
+            self.params = list(raw_data_df.columns)
+        else:
+            self.params = columns
+            raw_data_df = raw_data_df.loc[:, self.params]
 
+        self.params_dict = {k: i for i, k in enumerate(self.params)}
 
         if self.mode == 'test':
             added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
@@ -65,24 +71,16 @@ class ADData(object):
                                           int(self.max_signal_length * overlapping_windows))
             self.targets = np.zeros(raw_data.shape[0:2])
 
-        self.params = list(raw_data_df.columns)
-        self.params_dict = {k: i for i, k in enumerate(self.params)}
-
         indcs = torch.arange(0, raw_data.shape[1])
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
+
+        # handle nan values in the dataset
+        mask[data_tensor.isnan()] = 0
+        data_tensor[data_tensor.isnan()] = 0
+
         if self.mode == 'test':
             mask[-1,-added_.shape[0]:, :] = 0
-
-        #if subsample is not None:
-        #    mask = (torch.rand(data_tensor.shape) < subsample) * 1
-            #sum = mask.sum(dim=-1)
-            #inc_ignore = sum != 0
-
-            #indcs = indcs[inc_ignore]
-            #data_tensor = data_tensor[inc_ignore, :]
-            #mask = mask[inc_ignore, :]
-
 
         if n_samples is not None:
             data_tensor = data_tensor[:n_samples]
@@ -152,15 +150,14 @@ class ADDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None):
+    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None, n_samples: int=None):
 
-        objs = {
-            'train': ADData(data_dir, mode='train', data_kind=data_kind, subsample=None, n_samples=6000),
-            'test': ADData(data_dir, mode='test', data_kind=data_kind, n_samples=6000),
-        }
+        objs = dict()
+        objs['train'] = ADData(data_dir, mode='train', data_kind=data_kind, n_samples=n_samples)
+        objs['test'] = ADData(data_dir, mode='test', data_kind=data_kind, columns=objs['train'].params, n_samples=n_samples)
+
         data = objs[mode]
 
-        # TODO
         data_min, data_max = get_data_min_max(objs['train'][:])
 
         self.feature_names = ADData.params
@@ -217,12 +214,17 @@ class ADDataset(Dataset):
 
 
 class ADProvider(DatasetProvider):
-    def __init__(self, data_dir=None, data_kind=None, sample_tp=0.5):
+    def __init__(self, data_dir=None, dataset=None, sample_tp=0.5, n_samples:int=None):
         DatasetProvider.__init__(self)
-    
+
+        if dataset not in ["SWaT", "WaDi"]:
+            raise NotImplementedError
+
+        self._dataset = dataset
+
         self._sample_tp = sample_tp
-        self._ds_trn = ADDataset(data_dir, 'train', data_kind=data_kind)
-        self._ds_tst = ADDataset(data_dir, 'test', data_kind=data_kind)
+        self._ds_trn = ADDataset(data_dir, 'train', data_kind=dataset, n_samples=n_samples)
+        self._ds_tst = ADDataset(data_dir, 'test', data_kind=dataset, n_samples=n_samples)
 
         # TODO: necessary?
         #assert self._ds_trn.num_timepoints == self._ds_tst.num_timepoints

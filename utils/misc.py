@@ -46,9 +46,9 @@ def save_stats(args, stats: dict, file: str) -> None:
             epochs = len(epoch_stats)
             if mode != "oth":
                 all[f"{mode}_{key}"] = [
-                    epoch_stats[epoch][key] for epoch in range(epochs)
+                    str(epoch_stats[epoch][key]) for epoch in range(epochs)
                 ]
-    last = {key: val[-1] for key, val in all.items()}
+    last = {key: str(val[-1]) for key, val in all.items()}
     last["epoch"] = epochs
     out = {"args": args.__dict__, "final": last, "all": all}
     with open(file, "w") as f:
