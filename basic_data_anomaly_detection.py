@@ -331,7 +331,7 @@ def evaluate(
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
 
     f1, f1_ts = {}, {}
-    if epoch % 10 == 0:
+    if epoch % 30 == 0:
         f1, f1_ts = logprob2f1s(all_scores, all_labels)
     for key, value in f1.items():
         stats[key] = value
