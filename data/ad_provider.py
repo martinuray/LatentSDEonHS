@@ -407,4 +407,3 @@ def create_win_periods(data_, win_size_, win_stride_):
         win_size_, data_.shape[1]))
     return windows.squeeze()[::win_stride_, :]
 
-t = ADProvider(data_dir='data_dir', dataset='SMD')
