@@ -88,7 +88,10 @@ def start_experiment(args):
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
     writer = SummaryWriter(f'runs/{experiment_id_str}')
-    #writer.add_scalars('params' ,{pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},)
+    stats2tensorboard(
+        stats_={pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},
+        writer_=writer, epoch_=0 , prefix_='param_'
+    )
     #writer.add_text('params',{pkey_: pvalue_ for pkey_, pvalue_ in vars(args) if type(pvalue_) in [float, int]},)
 
     set_up_logging(
