@@ -43,49 +43,60 @@ class ADData(object):
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
 
-        if not self._check_exists():
-            print((os.path.join(self.processed_folder, self.destination_file)))
-            raise RuntimeError('Dataset not found. You can use download=True to download it')
+        if not self._check_exists(): # does raw exist?
+            if not self._check_exist_raw_data():
+                raise RuntimeError('Dataset not found. You can use download=True to download it')
 
-        if self.data_kind in ["SWaT", "WaDi"]:
-            self._load_water_treatment_data(
-                columns=columns, overlapping_windows=overlapping_windows,
-                n_samples=n_samples)
-        elif self.data_kind in ["SMD"]:
-            self._load_server_machine_data(
-                columns=columns, overlapping_windows=overlapping_windows,
-                n_samples=n_samples)
-        else:
-            raise NotImplementedError
+            if self.data_kind in ["SWaT", "WaDi"]:
+                if not self._check_exists():
+                    self._process_water_treatment_data(
+                        columns=columns, overlapping_windows=overlapping_windows,
+                        n_samples=n_samples)
+            elif self.data_kind in ["SMD"]:
+                self._process_server_machine_data(
+                    columns=columns, overlapping_windows=overlapping_windows,
+                    n_samples=n_samples)
+            else:
+                raise NotImplementedError
+
+        self.data = torch.load(os.path.join(self.processed_folder, self.destination_file))
+        if self.mode == 'test':
+            self.targets = torch.load(os.path.join(self.processed_folder, self.label_file))
 
 
-    def download(self):
-        if self._check_exists():
-            return
-
+    def _check_exist_raw_data(self):
         os.makedirs(self.raw_folder, exist_ok=True)
         os.makedirs(self.processed_folder, exist_ok=True)
+
+        if self.data_kind == "SMD": # TODO: maybe a bit more love
+            return os.path.isdir(os.path.join(self.raw_folder, self.mode))
+
+        return os.path.isfile(os.path.join(self.raw_folder, 'train.csv')) and \
+            os.path.isfile(os.path.join(self.raw_folder, 'test.csv')) and \
+            os.path.isfile(os.path.join(self.raw_folder, 'labels.csv'))
                 
     def _check_exists(self):
-        if self.data_kind == "SMD":
-            return os.path.isdir(os.path.join(self.processed_folder, self.mode))
-        return os.path.isfile(os.path.join(self.processed_folder, self.destination_file))
+        if self.data_kind == "SMD": # TODO: maybe a bit more love
+            return os.path.isfile(os.path.join(self.processed_folder,
+                                               f'{self.mode}.pt'))
+
+        return os.path.isfile(os.path.join(self.processed_folder, f'{self.mode}.pt'))
 
     @property
     def raw_folder(self):
-        return os.path.join(self.root, self.data_kind)
+        return os.path.join(self.root, self.data_kind, 'raw')
 
     @property
     def processed_folder(self):
-        return os.path.join(self.root, self.data_kind)
+        return os.path.join(self.root, self.data_kind, 'processed')
 
     @property
     def training_file(self):
-        return 'train.csv'
+        return 'train.pt'
 
     @property
     def test_file(self):
-        return 'test.csv'
+        return 'test.pt'
 
     @property
     def val_file(self):
@@ -101,7 +112,7 @@ class ADData(object):
 
     @property
     def label_file(self):
-        return 'labels.csv'
+        return 'labels.pt'
 
     def __getitem__(self, index):
         return self.data[index]
@@ -112,9 +123,10 @@ class ADData(object):
     def get_label(self, record_id):
         return self.labels[record_id]
 
-    def _load_water_treatment_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+    def _process_water_treatment_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+        logging.warning("Processing Water Treatment Data")
         raw_data_df = pd.read_csv(
-            os.path.join(self.processed_folder, self.destination_file),
+            os.path.join(self.raw_folder, f'{self.mode}.csv'),
             delimiter=',')
         if columns is None:
             raw_data_df = raw_data_df.loc[:, (
@@ -132,7 +144,7 @@ class ADData(object):
                                         raw_data.shape[1])
             # TODO take care that no overlapping windows are taken
             self.targets = pd.read_csv(
-                os.path.join(self.processed_folder, self.label_file))
+                os.path.join(self.raw_folder, f'labels.csv'),)
             self.targets = np.array(self.targets)
             self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
             self.targets = self.targets.reshape(-1, self.max_signal_length)
@@ -167,11 +179,16 @@ class ADData(object):
 
         assert data_tensor.shape[0] == mask.shape[0]
 
-        self.data = [(part_idx, indcs, data_tensor[part_idx, :, :],
-                      mask[part_idx, :, :]) for part_idx in
-                     range(mask.shape[0])]
+        data = [(part_idx, indcs, data_tensor[part_idx, :, :],
+                 mask[part_idx, :, :]) for part_idx in
+                range(mask.shape[0])]
 
-    def _load_server_machine_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+        torch.save(data, os.path.join(self.processed_folder, self.destination_file))
+        if self.mode == 'test':
+            torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
+
+    def _process_server_machine_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+        logging.warning("Processing Server Machine Data")
 
         all_dfs = self.get_all_dfs()
 
@@ -204,8 +221,6 @@ class ADData(object):
             raw_data = np.vstack(raw_data_list)
             self.targets = np.vstack(raw_targets_list)
             data_tensor = torch.Tensor(raw_data)
-
-            # TODO
             mask = torch.Tensor(np.vstack(masks_list))
 
         else:
@@ -239,12 +254,16 @@ class ADData(object):
 
         #assert data_tensor.shape[0] == mask.shape[0]
 
-        self.data = [(part_idx, indcs, data_tensor[part_idx, :, :],
-                      mask[part_idx, :, :]) for part_idx in
-                     range(mask.shape[0])]
+        data = [(part_idx, indcs, data_tensor[part_idx, :, :],
+                 mask[part_idx, :, :]) for part_idx in
+                range(mask.shape[0])]
+
+        torch.save(data, os.path.join(self.processed_folder, self.destination_file))
+        if self.mode == 'test':
+            torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
 
     def get_all_dfs(self):
-        all_files = glob.glob(os.path.join(self.processed_folder, self.mode, '*.txt'))
+        all_files = glob.glob(os.path.join(self.raw_folder, self.mode, '*.txt'))
 
         data = {}
 
@@ -291,8 +310,10 @@ class ADDataset(Dataset):
                                  range(len(data.data))]).float()
         tps = tps[None, :].repeat(obs.shape[0], 1).float()
 
-
-        tgt = torch.Tensor(data.targets)
+        if mode == 'test':
+            tgt = torch.Tensor(data.targets)
+        else:
+            tgt = torch.zeros((obs.shape[0], obs.shape[1])).long()
 
         obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
 
@@ -386,4 +407,4 @@ def create_win_periods(data_, win_size_, win_stride_):
         win_size_, data_.shape[1]))
     return windows.squeeze()[::win_stride_, :]
 
-t = ADProvider(data_dir='data_dir', dataset='SMD', n_samples=100)
+t = ADProvider(data_dir='data_dir', dataset='SMD')
