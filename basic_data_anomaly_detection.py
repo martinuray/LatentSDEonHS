@@ -83,7 +83,7 @@ def logprob2f1s(scores, true_labels, clip_value=100):
     return f1, f1_ts
 
 
-def start_experiment(args):
+def start_experiment(args, provider=None):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
@@ -111,9 +111,12 @@ def start_experiment(args):
     logging.debug(f"Seed set to {args.seed}")
     logging.debug(f'Parameters set: {vars(args)}')
 
-    #provider = BasicDataProvider(data_dir='data_dir', num_features=args.num_features, sample_tp=1., data_kind=None)
-    provider = ADProvider(data_dir='data_dir', dataset=args.dataset, n_samples=1000 if args.debug else None)
-    #provider = IMMProvider(data_dir='data_dir')
+    if provider is None:
+        logging.info("Instantiating data provider")
+        provider = ADProvider(data_dir='data_dir', dataset=args.dataset, n_samples=1000 if args.debug else None)
+    else:
+        logging.info("Using provided data provider")
+
     dl_trn = provider.get_train_loader(
         batch_size=args.batch_size,
         shuffle=True,
@@ -347,7 +350,7 @@ def main():
     parser = extend_argparse(generic_parser)
     args_ = parser.parse_args()
     print(args_)
-    start_experiment(args_)
+    start_experiment(args_, provider=None)
 
 
 if __name__ == "__main__":

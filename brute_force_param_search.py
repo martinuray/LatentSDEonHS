@@ -3,6 +3,7 @@ from random import SystemRandom
 from itertools import product
 
 from basic_data_anomaly_detection import start_experiment, extend_argparse
+from data.ad_provider import ADProvider
 from utils.parser import generic_parser
 
 params = {
@@ -30,6 +31,9 @@ def main():
     args_ = parser.parse_args()
     args_dict_ = vars(args_)
 
+    provider = ADProvider(data_dir='data_dir', dataset=args_.dataset, n_samples=1000 if args_.debug else None)
+
+
     os.makedirs('runs/', exist_ok=True)
 
     combinations = generate_param_combinations(params)
@@ -43,7 +47,7 @@ def main():
             args_dict_[key_] = value_
 
         print(args_)
-        start_experiment(args_)
+        start_experiment(args_, provider=provider)
 
 
 if __name__ == "__main__":
