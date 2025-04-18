@@ -85,7 +85,7 @@ def logprob2f1s(scores, true_labels, clip_value=100):
 
 def start_experiment(args):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
-    experiment_log_file_string = 'anomaly_detection'
+    experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
     writer = SummaryWriter(f'runs/{experiment_id_str}')
     #writer.add_scalars('params' ,{pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},)
