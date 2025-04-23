@@ -14,13 +14,9 @@ import numpy as np
 import pandas as pd
 
 import torch
-from numpy.lib._stride_tricks_impl import sliding_window_view
+from numpy.lib.stride_tricks import sliding_window_view
 from torch.utils.data import DataLoader, Dataset
-from torchvision.datasets.utils import download_url
-from torch.distributions import Categorical
-from torch.utils.data.dataloader import default_collate
 
-from sklearn.model_selection import train_test_split
 from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 
