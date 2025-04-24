@@ -30,6 +30,9 @@ class LogFormatter(logging.Formatter):
 
 def set_up_logging(console_log_level, console_log_color, logfile_file, logfile_log_level, logfile_log_color, log_line_template):
 	logger = logging.getLogger()
+	for handler in logger.handlers[:]:
+		logger.removeHandler(handler)
+
 	logger.setLevel(logging.DEBUG)
 
 	console_handler = logging.StreamHandler(sys.stdout)
