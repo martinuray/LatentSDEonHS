@@ -60,6 +60,28 @@ def stats2tensorboard(stats_, writer_, epoch_, prefix_=''):
         if value_ is not None:
             writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
 
+def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
+    f1, f1_ts = 0, 0
+    for ep_dict in stats[::-1]:
+        if 'f1' in ep_dict.keys() and 'ts_f1' in ep_dict.keys():
+            f1 = ep_dict['f1']
+            f1_ts = ep_dict['f1_ts']
+            break
+
+    param2store = ['lr', 'kl0_weight', 'klp_weight', 'pxz_weight', 'z_dim',
+                   'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder']
+
+    params_ = {key: value for key, value in params_.items() if key in param2store}
+
+    writer_.add_hparams(
+        hparam_dict=params_,
+        metric_dict={
+            "fin_test_f1": f1,
+            "fin_test_f1_ts": f1_ts,
+        },
+        run_name="hparams_run",
+    )
+
 
 def logprob2f1s(scores, true_labels, clip_value=100):
     eval = Evaluator()
@@ -87,12 +109,11 @@ def start_experiment(args, provider=None):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
+
+    if args.debug:
+        args.n_epochs = 1
+
     writer = SummaryWriter(f'runs/{experiment_id_str}')
-    stats2tensorboard(
-        stats_={pkey_: pvalue_ for pkey_, pvalue_ in vars(args).items() if type(pvalue_) in [float, int]},
-        writer_=writer, epoch_=0 , prefix_='param_'
-    )
-    #writer.add_text('params',{pkey_: pvalue_ for pkey_, pvalue_ in vars(args) if type(pvalue_) in [float, int]},)
 
     set_up_logging(
         console_log_level=args.loglevel,
@@ -268,8 +289,12 @@ def start_experiment(args, provider=None):
             )
             save_stats(args, stats, fname)
 
+
+    finalstats2tensorboard(writer_=writer, params_=vars(args),
+                           stats=stats["tst"], args=args)
+
     logging.shutdown()
-    writer.flush()
+    writer.close()
 
 
 def evaluate(
