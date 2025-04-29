@@ -45,7 +45,7 @@ from utils.scoring_functions import Evaluator
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     #group.add_argument("--aux-weight", type=float, default=10.0)
-    group.add_argument("--num-features", type=int, default=4)
+    #group.add_argument("--num-features", type=int, default=4)
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--dec-hidden-dim", type=int, default=64)
@@ -65,11 +65,12 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     for ep_dict in stats[::-1]:
         if 'f1' in ep_dict.keys() and 'ts_f1' in ep_dict.keys():
             f1 = ep_dict['f1']
-            f1_ts = ep_dict['f1_ts']
+            f1_ts = ep_dict['ts_f1']
             break
 
     param2store = ['lr', 'kl0_weight', 'klp_weight', 'pxz_weight', 'z_dim',
-                   'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder']
+                   'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder',
+                   'dataset', 'n_dec_layers']
 
     params_ = {key: value for key, value in params_.items() if key in param2store}
 
@@ -79,7 +80,6 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
             "fin_test_f1": f1,
             "fin_test_f1_ts": f1_ts,
         },
-        run_name="hparams_run",
     )
 
 
