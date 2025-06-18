@@ -6,13 +6,17 @@ import numpy as np
 import torch
 from argparse import Namespace
 
+from basic_data_anomaly_detection import calculate_z_normalization_values
 from data.ad_provider import ADProvider
+from data.aero_provider import AeroDataProvider
 from notebooks.utils.analyze import (get_modules, plot_stat,
                                      reconstruct_display_data,
                                      get_anomaly_performance)
-from utils.anomaly_detection import calculate_anomaly_threshold
+from utils.anomaly_detection import calculate_anomaly_threshold, \
+    get_number_over_threshold
+from utils.scoring_functions import Evaluator
 
-# %% some old stats
+# % some old stats
 data_kind, num_data_features = None, 4
 dataset = "anomaly_detection"
 experiment_id = 60625   # mine
@@ -23,14 +27,24 @@ checkpoint_epoch = 2190
 
 log_file = f"logs/{dataset}_{experiment_id}.json"
 
-#%% SWAT
+#% SWAT
 num_data_features = 10
 experiment_id_str = "anomaly_detection_250401-15:38:22"
 checkpoint_epoch = 990
+
+#% aero
+experiment_id_str = "AD_aero_250612-12:30:29"
+checkpoint_epoch = 590
+experiment_id_str = "AD_aero_250616-14:28:12"
+#checkpoint_epoch = 2100
+dataset = "AD_aero"
+
+# SMD
+#experiment_id_str = "AD_SMD_250617-23:17:10"
+#checkpoint_epoch = 590
+
 log_file = f"logs/{experiment_id_str}.json"
-
-
-#%% load logfile
+#% load logfile
 with open(log_file,'r') as f:
     logs = json.load(f)
 
@@ -43,16 +57,18 @@ from pprint import pprint
 pprint(logs['final'])
 
 # plot loss curves
-plot_stat(logs, 'loss')
+plot_stat(logs, stat='loss')
 plt.tight_layout()
 plt.show()
 
-#%% load args and data
+#% load args and data
 args = Namespace(**logs['args'])
 #args.device = 'cuda:0'
 
+#%
 #provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
-provider = ADProvider(data_dir='data_dir', data_kind="SWaT")
+#provider = ADProvider(data_dir='data_dir', dataset="SMD", window_length=args.data_window_length, window_overlap=args.data_window_overlap)
+provider = AeroDataProvider(data_dir="data_dir/aero")
 
 dl_trn = provider.get_train_loader(batch_size=1)
 #dl_val = provider.get_val_loader(batch_size=1)
@@ -60,77 +76,183 @@ dl_test = provider.get_test_loader(batch_size=1)
 batch = next(iter(dl_trn))
 
 
-#%% load models and checkpoint
+#% load models and checkpoint
 desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device).float()
 
-# load model
+#% load model
 modules = get_modules(args, provider, desired_t)
 
-# load_model
+#%% load_model
 checkpoint = f"checkpoints/checkpoint_{experiment_id_str}_{checkpoint_epoch}.h5"
 checkpoint = torch.load(checkpoint)
 modules.load_state_dict(checkpoint['modules'])
 
+normalizing_stats = None
+if args.normalize_score:
+    normalizing_stats = calculate_z_normalization_values(args, dl_trn, modules, desired_t, args.device)
+
+
 #%% reconstruct training data
-reconstruct_display_data(dl_trn, args, modules, desired_t, label="train")
+reconstruct_display_data(dl_trn, args, modules, desired_t, normalizing_stats,
+                         label="train", disturb_value_offset=0.0)
 
 #%% reconstruct test data
-reconstruct_display_data(dl_test, args, modules, desired_t, label="test")
+reconstruct_display_data(dl_test, args, modules, desired_t, normalizing_stats, label="test")#, dst='out/export/recon_test/')
+
+#%% reconstruct test data
+reconstruct_display_data(dl_test, args, modules, desired_t, normalizing_stats, label="test", dst='out/export/recon_test/')
 
 #%% calculate anomaly threshold
-anomaly_threshold = calculate_anomaly_threshold(dl_trn, args, modules, desired_t)
+#anomaly_threshold = calculate_anomaly_threshold(dl_trn, args, modules, desired_t)
+
+#n_over_threshold = get_number_over_threshold(dl_trn, args, modules, desired_t, anomaly_threshold)
+#n_over_threshold_threshold = n_over_threshold.mean() + 2 * n_over_threshold.std()
+#print(n_over_threshold)
 
 #%%  calculate anomaly metrics
-get_anomaly_performance(dl_test, args, modules, desired_t, anomaly_threshold)
+import tqdm
+from notebooks.utils.analyze import batch_get_log_prob
+#n_over_threshold_threshold = n_over_threshold.mean() + 2 * n_over_threshold.std()
+
+#def get_anomaly_performance_mine(dl_test, args, modules, desired_t):
+print("Evaluation...")
+
+true_label, pred = [], []
+
+for _, batch_it in tqdm.tqdm(enumerate(dl_test)):
+    lg_prb = batch_get_log_prob(batch_it, args, modules, desired_t)
+
+    #pred_tgt = np.zeros(batch_it["aux_tgt"].squeeze().shape)
+    # TODO: mean - first guess
+    pred_tgt_score = lg_prb.squeeze().mean(axis=1)  # -> anomaly score
+    #if pred_tgt.ndim == 1:
+    #    #anomaly_selector = anomaly_selector.any(axis=1)
+    #    anomaly_selector = (anomaly_selector * 1).sum(axis=1) >  n_over_threshold_threshold
+
+    #pred_tgt_score[pred_tgt_score > clip_value] = clip_value
+    #pred_tgt[anomaly_selector] = 1
+    pred_tgt_score = pred_tgt_score.detach().cpu()
+    true_tgt = batch_it["aux_tgt"].flatten().detach().cpu()
+
+    true_label.append(true_tgt)
+    pred.append(pred_tgt_score)
+
+all_predicted_np = np.concatenate(pred)
+all_true_labels_np = np.concatenate(true_label)
+
+all_predicted_torch = torch.cat(pred, dtype=torch.float64)
+all_true_labels_torch = torch.cat(true_label)
 
 #%%
-t = qzx.t.cpu().detach()
-latents = qzx.sample((500,)).cpu().detach()
+from utils.scoring_functions import Evaluator
+eval_np = Evaluator()
 
-fig, ax = plt.subplots(3)
-for i in range(3):
-    ax[i].plot(t, latents[:,0,:,i].permute(1,0), color='tab:blue', alpha=0.1)
+from utils.scoring_functions_torch import Evaluator as TorchEvaluator
+eval_torch = TorchEvaluator()
+
+
+def calculate_f1s_np(scores, true, evaluator=None, clip_value_=100):
+    # TODO: to speed shit up
+    scores = np.round(scores, 2)
+    scores[scores > clip_value_] = clip_value_
+
+    f1 = evaluator.best_f1_score(true, scores)
+    f1_ts = evaluator.best_ts_f1_score(true, scores)
+
+    print(f"F1:{f1['f1']:.4f}" )
+    print(f"F1_ts:{f1_ts['f1']:.4f}" )
+
+    return f1['f1'], f1_ts['f1']
+
+
+def calculate_f1s_torch(scores, true, evaluator=None, clip_value_=100):
+    # TODO: to speed shit up
+    scores = torch.round(scores, decimals=2)
+    scores[scores > clip_value_] = clip_value_
+
+    f1 = evaluator.best_f1_score(true, scores)
+    f1_ts = evaluator.best_ts_f1_score(true, scores)
+
+    #print(f"F1:{f1['f1']:.4f}" )
+    #print(f"F1_ts:{f1_ts['f1']:.4f}" )
+
+    return f1[0], f1_ts[0]
+
+
+#%%
+print("Mean")
+calculate_f1s_np(all_predicted_np, all_true_labels_np, evaluator=eval_np)
+#%%
+calculate_f1s_torch(all_predicted_torch, all_true_labels_torch, evaluator=eval_torch)
+
+#%%
+all_predicted_median = np.median(all_predicted_np, axis=1)
+print("Median")
+calculate_f1s(all_predicted_median, all_true_labels_np)
+
+print("Std")
+#all_predicted_std = np.std(all_predicted, axis=1)
+#calculate_f1s(all_predicted_std, all_true_labels)
+
+#%
+print("Var")
+all_predicted_std = np.var(all_predicted_np, axis=1)
+f1, f1t = calculate_f1s(all_predicted_std, all_true_labels_np)
+print(f1, f1t)
+
+#% irrelevant, same as mean, just not normed
+print("Sum")
+all_predicted_sum = np.sum(all_predicted_np, axis=1)
+calculate_f1s(all_predicted_sum, all_true_labels_np, clip_value_=50 * 31)
+
+#%
+print("Max")
+all_predicted_max = np.max(all_predicted_np, axis=1)
+calculate_f1s(all_predicted_max, all_true_labels_np)
+
+print("75% Q")
+all_predicted_75q = np.quantile(all_predicted_np, 0.75, axis=1)
+calculate_f1s(all_predicted_75q, all_true_labels_np)
+
+print("90% Q")
+all_predicted_90q = np.quantile(all_predicted_np, 0.90, axis=1)
+calculate_f1s(all_predicted_90q, all_true_labels_np)
+
+#%
+print("95% Q")
+all_predicted_95q = np.quantile(all_predicted_np, 0.95, axis=1)
+calculate_f1s(all_predicted_95q, all_true_labels_np)
+
+#%% search quantile
+
+def calc_scores_quantiles(pred, true, q):
+    pred_q = np.quantile(pred, q, axis=1)
+    f1, f1ts = calculate_f1s(pred_q, true)
+    return f1, f1ts
+
+
+quantiles_to_search = np.arange(0.25, 0.99, 0.025)
+results_exh_quant_search = [
+    calc_scores_quantiles(all_predicted_np, all_true_labels_np, q) for q in tqdm.tqdm(quantiles_to_search)
+]
+
+#%%
+np_results_exh_quant_search = np.array(results_exh_quant_search)
+plt.figure()
+plt.plot(quantiles_to_search, np_results_exh_quant_search[0, :], label='$f1$')
+plt.plot(quantiles_to_search, np_results_exh_quant_search[1, :], label='$f1_{ts}$')
 plt.show()
 
-#%%
-import imageio
-import os
-sphere_dir = './out/sphere/'
-os.makedirs(sphere_dir, exist_ok=True)
+#%% check according to true label
+max_ = 10000000
 
-images = []
+all_predicted_benign = all_predicted_np[:max_][all_true_labels_np[:max_] == 0, :]
+all_predicted_anomaly = all_predicted_np[:max_][all_true_labels_np[:max_] == 1, :]
 
-endat = 0 #101
-for current_at in range(endat):
-    fig = plt.figure()
-    ax = fig.add_subplot(projection='3d')
-    print(current_at)
-    for idx in range(len(latents)):
-        ax.plot(latents[idx,0,:current_at,0],latents[idx,0,:current_at,1],latents[idx,0,:current_at,2], c='tab:blue',alpha=.1)
-        ax.scatter(latents[idx,0,0,0],latents[idx,0,0,1],latents[idx,0,0,2], c='tab:red', alpha=.1)
-        ax.scatter(latents[idx,0,current_at,0],latents[idx,0,current_at,1],latents[idx,0,current_at,2], c='tab:red', alpha=.1)
-
-    # sphere = np.random.randn(50000,3)
-    # sphere = sphere / np.linalg.norm(sphere, axis=1, keepdims=True)
-    # ax.scatter(sphere[:,0], sphere[:,1],sphere[:,2], s=.01)
-
-    u, v = np.mgrid[0:2*np.pi:100j, 0:np.pi:50j]
-    x = np.cos(u)*np.sin(v)
-    y = np.sin(u)*np.sin(v)
-    z = np.cos(v)
-    ax.plot_wireframe(x, y, z, color="k", alpha=.2)
-    ax.set_xlim(-1,1)
-    ax.set_ylim(-1,1)
-    ax.set_zlim(-1,1)
-    ax.set_aspect("equal")
-    ax.axis('off')
-    file_name = os.path.join(sphere_dir, f'sphere_{current_at:04d}.png')
-    images.append(file_name)
-
-    fig.savefig(file_name, dpi=150)
-    plt.close()
-
-with imageio.get_writer(os.path.join(sphere_dir, f'sphere.gif'), mode='I') as writer:
-    for fn in images:
-        image = imageio.imread(fn)
-        writer.append_data(image)
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots(nrows=1, ncols=1)
+ax.hist(all_predicted_anomaly.flatten(), bins=100, color='r', alpha=0.5, label='anomaly')
+ax.hist(all_predicted_benign.flatten(), bins=100, color='b', alpha=0.25, label='benign')
+ax.set_yscale('log')
+plt.legend()
+plt.savefig('out.png')
