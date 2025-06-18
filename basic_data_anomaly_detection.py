@@ -185,7 +185,7 @@ def start_experiment(args, provider=None):
     pxz_net = PathToGaussianDecoder(
         mu_map=recon_net,
         sigma_map=None,
-        initial_sigma=0.1) # TODO: is this initial sigma ok so?
+        initial_sigma=args.initial_sigma) # TODO: is this initial sigma ok so?
 
     qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,

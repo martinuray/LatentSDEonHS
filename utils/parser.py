@@ -31,6 +31,7 @@ group2.add_argument("--learnable-prior", action=argparse.BooleanOptionalAction, 
 
 group3 = generic_parser.add_argument_group('Misc/Logging arguments')
 group3.add_argument("--freeze-sigma", action=argparse.BooleanOptionalAction, default=False)
+group3.add_argument("--initial-sigma", type=float, default=0.2)
 group3.add_argument("--mc-eval-samples", type=int, default=1)
 group3.add_argument("--mc-train-samples", type=int, default=1)
 group3.add_argument(
