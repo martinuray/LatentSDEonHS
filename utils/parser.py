@@ -12,6 +12,10 @@ group0.add_argument("--enable-checkpointing", action=argparse.BooleanOptionalAct
 group0.add_argument("--checkpoint-dir", type=str, default=None)
 group0.add_argument("--checkpoint-at", type=int, nargs='*', default=[])
 
+group1 = generic_parser.add_argument_group('Data arguments')
+group1.add_argument("--data-window-length", type=int, default=100)
+group1.add_argument("--data-window-overlap", type=float, default=0.75)
+
 group1 = generic_parser.add_argument_group('Training arguments')
 group1.add_argument("--batch-size", type=int, default=64)
 group1.add_argument("--lr", type=float, default=1e-3)

@@ -28,13 +28,14 @@ class ADData(object):
     labels = None
     params_dict, labels_dict = None, None
 
-    def __init__(self, root, data_kind="SWaT", mode='train', n_samples = None, columns = None):
+    def __init__(self, root, data_kind="SWaT", mode='train', window_length:int = 100, window_overlap: float = 0.75, n_samples = None, columns = None):
 
         self.root = root
         self.data_kind = data_kind
         self.mode = mode
-        self.max_signal_length = 150
-        overlapping_windows = 0.5
+        self.max_signal_length = window_length
+
+        self.overlapping_windows = window_overlap
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -46,12 +47,10 @@ class ADData(object):
             if self.data_kind in ["SWaT", "WaDi"]:
                 if not self._check_exists():
                     self._process_water_treatment_data(
-                        columns=columns, overlapping_windows=overlapping_windows,
-                        n_samples=n_samples)
+                        columns=columns, n_samples=n_samples)
             elif self.data_kind in ["SMD"]:
                 self._process_server_machine_data(
-                    columns=columns, overlapping_windows=overlapping_windows,
-                    n_samples=n_samples)
+                    columns=columns, n_samples=n_samples)
             else:
                 raise NotImplementedError
 
@@ -119,14 +118,14 @@ class ADData(object):
     def get_label(self, record_id):
         return self.labels[record_id]
 
-    def _process_water_treatment_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+    def _process_water_treatment_data(self, columns=None, n_samples=None):
         logging.warning("Processing Water Treatment Data")
         raw_data_df = pd.read_csv(
             os.path.join(self.raw_folder, f'{self.mode}.csv'),
             delimiter=',')
         if columns is None:
-            raw_data_df = raw_data_df.loc[:, (
-                                                         raw_data_df.nunique() > 1)]  # TODO: otherwise issue when normalizing
+            # TODO: otherwise issue when normalizing
+            raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)]
             self.params = list(raw_data_df.columns)
         else:
             self.params = columns
@@ -147,7 +146,7 @@ class ADData(object):
         else:
             raw_data = raw_data_df.to_numpy().copy()
             raw_data = create_win_periods(raw_data, self.max_signal_length,
-                                          int(self.max_signal_length * overlapping_windows))
+                                          int(self.max_signal_length * self.overlapping_windows))
 
             self.targets = np.zeros(raw_data.shape[0:2])
 
@@ -183,7 +182,7 @@ class ADData(object):
         if self.mode == 'test':
             torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
 
-    def _process_server_machine_data(self, columns=None, overlapping_windows=0.5, n_samples=None):
+    def _process_server_machine_data(self, columns=None, n_samples=None):
         logging.warning("Processing Server Machine Data")
 
         all_dfs = self.get_all_dfs()
@@ -224,7 +223,7 @@ class ADData(object):
             for _, values in all_dfs.items():
                 rd = values['train'].to_numpy().copy()
                 raw_dfs.append(create_win_periods(rd, self.max_signal_length,
-                                                  int(self.max_signal_length * overlapping_windows)))
+                                                  int(self.max_signal_length * self.overlapping_windows)))
 
             raw_data = np.vstack(raw_dfs)
             self.targets = np.zeros(raw_data.shape[0:2])
@@ -284,11 +283,11 @@ class ADDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None, n_samples: int=None):
+    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None, window_length: int=100, window_overlap:float = 0.75, n_samples: int=None):
 
         objs = dict()
-        objs['train'] = ADData(data_dir, mode='train', data_kind=data_kind, n_samples=n_samples)
-        objs['test'] = ADData(data_dir, mode='test', data_kind=data_kind, columns=objs['train'].params, n_samples=n_samples)
+        objs['train'] = ADData(data_dir, mode='train', data_kind=data_kind, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
+        objs['test'] = ADData(data_dir, mode='test', data_kind=data_kind, window_length=window_length, window_overlap=window_overlap, columns=objs['train'].params, n_samples=n_samples)
 
         data = objs[mode]
 
@@ -350,7 +349,7 @@ class ADDataset(Dataset):
 
 
 class ADProvider(DatasetProvider):
-    def __init__(self, data_dir=None, dataset=None, sample_tp=0.5, n_samples:int=None):
+    def __init__(self, data_dir=None, dataset=None, window_length:int = 100, window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None):
         DatasetProvider.__init__(self)
 
         if dataset not in ["SWaT", "WaDi", "SMD"]:
@@ -359,8 +358,8 @@ class ADProvider(DatasetProvider):
         self._dataset = dataset
 
         self._sample_tp = sample_tp
-        self._ds_trn = ADDataset(data_dir, 'train', data_kind=dataset, n_samples=n_samples)
-        self._ds_tst = ADDataset(data_dir, 'test', data_kind=dataset, n_samples=n_samples)
+        self._ds_trn = ADDataset(data_dir, 'train', data_kind=dataset, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
+        self._ds_tst = ADDataset(data_dir, 'test', data_kind=dataset, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
 
     @property 
     def input_dim(self):
