@@ -14,6 +14,7 @@ def get_all_log_probs(args_, desired_t_, dl_, modules_):
         batch_get_log_prob(batch_it, args_, modules_, desired_t_)
         for _, batch_it in tqdm.tqdm(enumerate(dl_))
     ]
+    log_probs_test = [log_prob for pxz, log_prob in log_probs_test]
     log_probs_test = np.vstack(log_probs_test)
     return log_probs_test
 
