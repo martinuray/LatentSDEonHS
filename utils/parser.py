@@ -34,6 +34,8 @@ group3.add_argument("--freeze-sigma", action=argparse.BooleanOptionalAction, def
 group3.add_argument("--initial-sigma", type=float, default=0.2)
 group3.add_argument("--mc-eval-samples", type=int, default=1)
 group3.add_argument("--mc-train-samples", type=int, default=1)
+group3.add_argument("--num-max-cpu-worker", type=int, default=10)
+group3.add_argument("--eval-every-n-epochs", type=int, default=30)
 group3.add_argument(
     "--loglevel",
     choices=["debug", "info", "error", "warning", "critical"],

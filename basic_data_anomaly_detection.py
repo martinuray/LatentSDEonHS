@@ -85,24 +85,25 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     )
 
 
-def logprob2f1s(scores, true_labels, clip_value=100):
+def logprob2f1s(scores, true_labels, clip_value=100, including_ts = False):
     eval = Evaluator()
 
     scores = torch.cat(scores, dim=0)
     true_labels = torch.cat(true_labels, dim=0)
 
     # TODO: to speed shit up
-    scores = scores.round(decimals=2)
-    scores[scores > clip_value] = clip_value
+    scores = scores.round(decimals=4)
+    #scores[scores > clip_value] = clip_value
 
     scores = scores.flatten().detach().cpu().numpy()
     true_labels = true_labels.flatten().detach().cpu().numpy()
 
     f1, f1_ts = 0, 0
-    unique_values, counts = np.unique(true_labels, return_counts=True)
+    unique_values = np.unique(true_labels, return_counts=False)
     if  unique_values.shape[0] > 1:
         f1 = eval.best_f1_score(true_labels, scores)
-        f1_ts = eval.best_ts_f1_score(true_labels, scores)
+        if including_ts:
+            f1_ts = eval.best_ts_f1_score(true_labels, scores)
 
     return f1, f1_ts
 
@@ -347,7 +348,6 @@ def start_experiment(args, provider=None):
             )
             save_stats(args, stats, fname)
 
-
     finalstats2tensorboard(writer_=writer, params_=vars(args),
                            stats=stats["tst"], args=args)
 
@@ -425,12 +425,14 @@ def evaluate(
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
 
     f1, f1_ts = {}, {}
-    if epoch % 30 == 0:
-        f1, f1_ts = logprob2f1s(all_scores, all_labels)
+    #if epoch % 10 == 0:
+    f1, f1_ts = logprob2f1s(all_scores, all_labels, including_ts=(epoch == args.n_epochs))
+
     for key, value in f1.items():
         stats[key] = value
-    for key, values in f1_ts.items():
-        stats[f"ts_{key}"] = values
+    if epoch == args.n_epochs:
+        for key, value in f1_ts.items():
+            stats[key] = value
     return stats
 
 

@@ -2,6 +2,9 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, auc
 from typing import List, Any, Dict, Tuple, Callable, Optional
 
+from concurrent.futures import ProcessPoolExecutor
+
+
 '''
 Numpy implementation of torch based evualtion from TiemseAD (https://github.com/wagner-d/TimeSeAD)
 '''
@@ -259,11 +262,51 @@ def ts_precision_and_recall(anomalies: np.ndarray, predictions: np.ndarray, alph
     return precision, recall
 
 
+def compute_ts_precision_recall_wrapper(t, labels, scores, recall_cardinality_fn,
+                                        label_ranges, weighted_precision):
+    """
+    Compute precision and recall for a single threshold.
+    """
+    predictions = scores > t
+    prec, rec = ts_precision_and_recall(
+        labels,
+        predictions.astype(int),
+        alpha=0,
+        recall_cardinality_fn=recall_cardinality_fn,
+        anomaly_ranges=label_ranges,
+        weighted_precision=weighted_precision,
+    )
+
+    # Handle the case where precision and recall are both 0
+    if prec == rec == 0:
+        rec = 1
+
+    return prec, rec
+
+
+def compute_ts_metrics_for_threshold_wrapper(t, labels, scores, label_ranges,
+                                             weighted_precision):
+    """
+    Compute precision and recall for a single threshold.
+    """
+    predictions = scores >= t
+    prec, rec = ts_precision_and_recall(
+        labels, predictions, alpha=0,
+        recall_cardinality_fn=improved_cardinality_fn,
+        anomaly_ranges=label_ranges,
+        weighted_precision=weighted_precision
+    )
+    return prec, rec
+
+
 class Evaluator:
     """
     A class that can compute several evaluation metrics for a dataset using NumPy arrays.
     Each method returns the score as a single float, but it can also return additional information in a dict.
     """
+
+    def __init__(self, max_process_workers: int = 10):
+        self.max_process_workers = max_process_workers
 
     def rocauc(self, labels: np.ndarray, scores: np.ndarray) -> Tuple[float, Dict[str, Any]]:
         """
@@ -367,7 +410,6 @@ class Evaluator:
         """
         return self.auprc(labels, scores, integration='riemann')
 
-
     def ts_auprc(self, labels: np.ndarray, scores: np.ndarray, integration='trapezoid',
                  weighted_precision: bool = True) -> Tuple[float, Dict[str, Any]]:
         """
@@ -377,7 +419,6 @@ class Evaluator:
 
         precision = np.empty(len(thresholds) + 1)
         recall = np.empty(len(thresholds) + 1)
-        predictions = np.empty_like(scores, dtype=int)
 
         # Set last values when threshold is at infinity so that no point is predicted as anomalous.
         # Precision is not defined in this case, we set it to 1 to stay consistent with scikit-learn
@@ -386,12 +427,21 @@ class Evaluator:
 
         label_ranges = compute_window_indices(labels)
 
-        for i, t in enumerate(thresholds):
-            predictions = scores >= t
-            prec, rec = ts_precision_and_recall(labels, predictions, alpha=0,
-                                                recall_cardinality_fn=improved_cardinality_fn,
-                                                anomaly_ranges=label_ranges,
-                                                weighted_precision=weighted_precision)
+        # Use ProcessPoolExecutor for parallel computation
+        with ProcessPoolExecutor(max_workers=self.max_process_workers) as executor:
+            results = list(executor.map(
+                compute_ts_metrics_for_threshold_wrapper,
+                thresholds,  # Each threshold goes to t
+                [labels] * len(thresholds),  # Same labels for all calls
+                [scores] * len(thresholds),  # Same scores for all calls
+                [label_ranges] * len(thresholds),
+                # Same label_ranges for all calls
+                [weighted_precision] * len(thresholds)
+                # Same weighted_precision for all calls
+            ))
+
+        # Unpack the results into precision and recall arrays
+        for i, (prec, rec) in enumerate(results):
             precision[i] = prec
             recall[i] = rec
 
@@ -444,23 +494,30 @@ class Evaluator:
 
         precision = np.empty(len(thresholds))
         recall = np.empty(len(thresholds))
-        predictions = np.empty_like(scores, dtype=int)
 
         label_ranges = compute_window_indices(labels)
 
-        for i, t in enumerate(thresholds):
-            predictions = scores > t
-            prec, rec = ts_precision_and_recall(labels, predictions.astype(int), alpha=0,
-                                                recall_cardinality_fn=recall_cardinality_fn,
-                                                anomaly_ranges=label_ranges,
-                                                weighted_precision=weighted_precision)
+        # Use ProcessPoolExecutor to parallelize the computations
+        with ProcessPoolExecutor(max_workers=self.max_process_workers) as executor:
+            results = list(
+                executor.map(
+                    compute_ts_precision_recall_wrapper,
+                    thresholds,  # Pass each threshold
+                    [labels] * len(thresholds),
+                    # Labels are constant for all computations
+                    [scores] * len(thresholds),
+                    # Scores are constant for all computations
+                    [recall_cardinality_fn] * len(thresholds),
+                    # Function is constant for all computations
+                    [label_ranges] * len(thresholds),
+                    # Label ranges are constant
+                    [weighted_precision] * len(thresholds),
+                    # Same weighted_precision value for all
+                )
+            )
 
-            # We need to handle the case where precision and recall are both 0. This can either happen for an
-            # extremely bad classifier or if all predictions are 0
-            if prec == rec == 0:
-                # We simply set rec = 1 to avoid dividing by zero. The F-score will still be 0
-                rec = 1
-
+        # Unpack the results into precision and recall arrays
+        for i, (prec, rec) in enumerate(results):
             precision[i] = prec
             recall[i] = rec
 
