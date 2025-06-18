@@ -10,6 +10,68 @@ python basic_data_interpolation.py --enable-file-logging --log-dir logs \
   --mc-train-samples 10 --loglevel debug
 ```
 
+Working setup:
+```
+--enable-file-logging
+--log-dir
+logs
+--enable-checkpointing
+--checkpoint-dir
+checkpoints
+--checkpoint-at
+90
+150
+190
+210
+390
+590
+990
+2100
+--lr
+0.005
+--n-epochs
+2101
+--kl0-weight
+.0001
+--klp-weight
+0.1
+--pxz-weight
+10
+--seed
+-1
+--restart
+30
+--device
+cuda:2
+--z-dim
+8
+--h-dim
+128
+--n-deg
+8
+--n-dec-layers
+2
+--dec-hidden-dim
+32
+--no-learnable-prior
+--freeze-sigma
+--mc-eval-samples
+1
+--mc-train-samples
+1
+--loglevel
+debug
+--no-use-atanh
+--batch-size
+35
+--num-max-cpu-worker
+15
+--eval-every-n-epochs
+50
+--dataset
+aero
+```
+
 # Latent SDEs on Homogeneous Spaces
 <p align="center">
   <img width="300" height="300" src="./assets/spherepaths.gif">
