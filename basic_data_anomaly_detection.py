@@ -247,7 +247,16 @@ def start_experiment(args, provider=None):
     )
     modules = modules.to(args.device)
 
-    optimizer = optim.Adam(modules.parameters(), lr=args.lr)
+    param_groups = [
+        {"params": recon_net.parameters(), "weight_decay": 1e-4},
+        {"params": recog_net.parameters()},
+        #{"params": pxz_net.parameters()},
+        {"params": qzx_net.parameters()},
+        # Specific weight decay for fc2
+    ]
+
+
+    optimizer = optim.Adam(param_groups, lr=args.lr)
     #optimizer = optim.SGD(modules.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
 
