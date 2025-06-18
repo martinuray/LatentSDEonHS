@@ -23,10 +23,11 @@ class AeroData(object):
     labels = None
     params_dict, labels_dict = None, None
 
-    def __init__(self, root, mode='train'):
+    def __init__(self, root, mode='train', subsample=None):
 
         self.root = root
         self.mode = mode
+        self.subsample = subsample
 
         self.download()
 
@@ -62,15 +63,20 @@ class AeroData(object):
         raw_data = torch.load(os.path.join(self.raw_folder, self.destination_file))
         feature_names = raw_data.keys()
 
-        indcs = torch.arange(2500)
-        tps = indcs / 2500
         obs = np.array([raw_data[feature] for feature in feature_names])
-        obs = np.transpose(obs, (1, 2, 0))  # Permute to (batch_size x n_features x signal_per_batch)
+        obs = np.transpose(obs, (1, 2, 0))  # Permute to (batch_size x signal_per_batch x n_features)
         obs = torch.Tensor(obs)
+        if self.subsample is not None:
+            obs = obs[:, ::self.subsample, :]
+
+        indcs = torch.arange(obs.shape[1])
+        tps = indcs / indcs.max()
 
         msk = torch.ones_like(obs)
         if self.mode == 'test':
-            tgt = torch.load(os.path.join(self.raw_folder, 'labels.pt'))[:-1].reshape(-1, 2500)
+            tgt = torch.load(os.path.join(self.raw_folder, 'labels.pt'))#[:-1].reshape(-1, 2500)
+            if self.subsample is not None:
+                tgt = tgt[:, ::self.subsample]
             tgt = torch.from_numpy(tgt)
         else:
             tgt = torch.zeros(obs.shape[0:2])
@@ -128,16 +134,16 @@ class AeroDataDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train'):
+    def __init__(self, data_dir: str, mode: str='train', subsample=None):
 
         objs = {
-            'train': AeroData(data_dir, mode='train'),
-            'test': AeroData(data_dir, mode='test'),
+            'train': AeroData(data_dir, mode='train', subsample=subsample),
+            'test': AeroData(data_dir, mode='test', subsample=subsample),
         }
         data = objs[mode]
 
-        # TODO
-        data_min, data_max = get_data_min_max(data[:])
+        all_obj = objs['train'][:] + objs['test'][:]
+        data_min, data_max = get_data_min_max(all_obj)
         self.data_min = data_min
         self.data_max = data_max
 
@@ -151,6 +157,8 @@ class AeroDataDataset(Dataset):
         self.msk = torch.stack([msk for _, _, _, msk, _ in data], dim=0)
         self.tgt = torch.stack([tgt for _, _, _, _, tgt in data], dim=0)
         self.num_timepoints = self.tps.shape[1]
+
+        self.obs, _, _ = normalize_masked_data(self.obs, self.msk, data_min, data_max)
 
         self.inp_obs = self.obs.float() # obs_new
         self.inp_obs = (self.obs * self.msk).float()# obs_new
@@ -187,11 +195,11 @@ class AeroDataDataset(Dataset):
 
 
 class AeroDataProvider(DatasetProvider):
-    def __init__(self, data_dir=None, data_kind=None, random_state=42):
+    def __init__(self, data_dir=None, subsample=None):
         DatasetProvider.__init__(self)
     
-        self._ds_trn = AeroDataDataset(data_dir, 'train')
-        self._ds_tst = AeroDataDataset(data_dir, 'test')
+        self._ds_trn = AeroDataDataset(data_dir, 'train', subsample=subsample)
+        self._ds_tst = AeroDataDataset(data_dir, 'test', subsample=subsample)
 
     @property
     def input_dim(self):
@@ -222,4 +230,10 @@ class AeroDataProvider(DatasetProvider):
 
     def get_test_loader(self, **kwargs) -> DataLoader:
         return DataLoader(self._ds_tst, **kwargs)
+
+
+
+if __name__ == '__main__':
+    aero_data_provider = AeroDataProvider(data_dir="data_dir/aero", subsample=10)
+
 

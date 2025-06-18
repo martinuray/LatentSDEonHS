@@ -28,6 +28,7 @@ from core.models import (
 )
 
 from core.training import generic_train
+from data.aero_provider import AeroDataProvider
 from data.imm_provider import IMMProvider
 from notebooks.utils.analyze import batch_get_log_prob
 from utils.anomaly_detection import anomaly_detection_performances
@@ -52,7 +53,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero"], default="SWaT")
     return parser
 
 
@@ -172,7 +173,12 @@ def start_experiment(args, provider=None):
 
     if provider is None:
         logging.info("Instantiating data provider")
-        provider = ADProvider(data_dir='data_dir', dataset=args.dataset, n_samples=1000 if args.debug else None)
+        if args.dataset in ['SWaT', 'WaDi', 'SMD']:
+            provider = ADProvider(data_dir='data_dir', dataset=args.dataset, window_length=args.data_window_length, window_overlap=args.data_window_overlap, n_samples=1000 if args.debug else None)
+        elif args.dataset == 'aero':
+            provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
+        else:
+            raise ValueError(f"Unknown dataset {args.dataset}")
     else:
         logging.info("Using provided data provider")
 
