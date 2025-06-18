@@ -48,6 +48,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     #group.add_argument("--num-features", type=int, default=4)
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
@@ -103,6 +104,43 @@ def logprob2f1s(scores, true_labels, clip_value=100):
         f1_ts = eval.best_ts_f1_score(true_labels, scores)
 
     return f1, f1_ts
+
+
+def calculate_z_normalization_values(args, dl, modules, desired_t, device):
+    stats = defaultdict(list)
+
+    modules.eval()
+    with (torch.no_grad()):
+        all_labels, all_scores = [], []
+        for _, batch in enumerate(dl):
+            parts = {key: val.to(device) for key, val in batch.items()}
+
+            inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
+
+            h = modules["recog_net"](inp)
+            qzx, pz = modules["qzx_net"](h, desired_t)
+            zis = qzx.rsample((args.mc_eval_samples,))
+            pxz = modules["pxz_net"](zis)
+
+            aux_log_prob = -pxz.log_prob(parts["evd_obs"])
+
+            # make sure that log_prob is in the right shape
+            if aux_log_prob.dim() >= 4:
+                aux_log_prob = aux_log_prob.squeeze()
+            if aux_log_prob.dim() == 2:
+                aux_log_prob = aux_log_prob[None, :, :]
+
+            # aux_log_prob = aux_log_prob.mean(dim=0)
+            if parts["aux_tgt"].dim() == 2:
+                aux_log_prob = aux_log_prob.mean(
+                    dim=2)  # TODO: mean, but very basic
+
+            all_scores.append(aux_log_prob)
+
+    all_scores = torch.cat(all_scores, dim=0)
+    stats['mu'] = all_scores.mean(dim=0)
+    stats['sigma'] = all_scores.std(dim=0)
+    return stats
 
 
 def start_experiment(args, provider=None):
@@ -243,9 +281,14 @@ def start_experiment(args, provider=None):
             desired_t,
             args.device
         )
-        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device, epoch=epoch)
+
+        normalization_scores = None
+        if args.normalize_score:
+            normalization_scores = calculate_z_normalization_values(
+                args, dl_trn, modules, desired_t, args.device)
+        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device, normalization_stats=normalization_scores, epoch=epoch)
         if use_validation:
-            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device, epoch=epoch)
+            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device, normalization_stats=normalization_scores, epoch=epoch)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
@@ -304,6 +347,7 @@ def evaluate(
     elbo_loss: nn.Module,
     desired_t: torch.Tensor,
     device: str,
+    normalization_stats=None,
     epoch: int = 1,
 ):
     stats = defaultdict(list)
@@ -348,6 +392,10 @@ def evaluate(
             if parts["aux_tgt"].dim() == 2:
                 aux_log_prob = aux_log_prob.mean(dim=2) # TODO: mean, but very basic
 
+            if args.normalize_score and normalization_stats is not None:
+                aux_log_prob = (aux_log_prob - normalization_stats['mu']) / normalization_stats['sigma']
+
+           # if epoch % 10 == 0:
             all_labels.append(parts["aux_tgt"])
             all_scores.append(aux_log_prob)
 
