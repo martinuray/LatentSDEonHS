@@ -13,9 +13,13 @@ import numpy as np
 from random import SystemRandom
 from collections import defaultdict
 
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+from scipy.stats import iqr
+from sklearn.preprocessing import StandardScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
@@ -85,27 +89,92 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     )
 
 
-def logprob2f1s(scores, true_labels, clip_value=100, including_ts = False):
-    eval = Evaluator()
+def normalise_scores(test_delta, norm="median-iqr", smooth=True,
+                     smooth_window=5):
+    """
+    Args:
+        norm: None, "mean-std" or "median-iqr"
+    """
+    if norm == "mean-std":
+        err_scores = StandardScaler().fit_transform(test_delta)
+    elif norm == "median-iqr":
+        n_err_mid = np.median(test_delta, axis=0)
+        n_err_iqr = iqr(test_delta, axis=0)
+        epsilon = 1e-2
 
-    scores = torch.cat(scores, dim=0)
-    true_labels = torch.cat(true_labels, dim=0)
+        err_scores = (test_delta - n_err_mid) / (np.abs(n_err_iqr) + epsilon)
+    elif norm is None:
+        err_scores = test_delta
+    else:
+        raise ValueError(
+            'specified normalisation not implemented, please use one of {None, "mean-std", "median-iqr"}')
 
-    # TODO: to speed shit up
-    scores = scores.round(decimals=4)
-    #scores[scores > clip_value] = clip_value
+    if smooth:
+        smoothed_err_scores = np.zeros(err_scores.shape)
 
-    scores = scores.flatten().detach().cpu().numpy()
-    true_labels = true_labels.flatten().detach().cpu().numpy()
+        for i in range(smooth_window, len(err_scores)):
+            smoothed_err_scores[i] = np.mean(
+                err_scores[i - smooth_window: i + smooth_window - 1], axis=0)
+        return smoothed_err_scores
+    else:
+        return err_scores
 
-    f1, f1_ts = 0, 0
-    unique_values = np.unique(true_labels, return_counts=False)
-    if  unique_values.shape[0] > 1:
-        f1 = eval.best_f1_score(true_labels, scores)
-        if including_ts:
-            f1_ts = eval.best_ts_f1_score(true_labels, scores)
+def get_results_for_all_score_normalizations(
+        scores: np.ndarray,
+        test_labels: np.ndarray):
 
-    return f1, f1_ts
+    # get score under all three normalizations
+    df_list = []
+    f1_scores = []
+    normalisations = ["median-iqr", "mean-std", None]
+    for n in normalisations:
+        r, d = get_ts_eval(
+            normalise_scores(scores, norm=n).flatten(),
+            test_labels.flatten()
+        )
+        f1_scores.append(r['f1'])
+        if n is None:
+            n = 'no'
+        df_list.append((n, d))
+    best_score_idx = np.array(f1_scores).argmax()
+    return dict(df_list), df_list[best_score_idx][1]
+
+
+def get_ts_eval(scores, targets):
+    ts_evalator = Evaluator()
+    # targets = torch.from_numpy(targets)
+    # scores = torch.from_numpy(scores)
+
+    results = ts_evalator.best_f1_score(targets, scores)
+
+    ## dataframe to display
+    metrics_name = ['F1', 'Precision', 'Recall', 'AUPRC', 'AUROC']
+    raw = [results['f1'], results['precision'], results['recall'],
+           results['auprc'], results['auroc']]
+    score_dict = {'': metrics_name, 'point_wise': raw}
+
+    df = pd.DataFrame(score_dict)
+    return results, df
+
+
+def logprob2f1s(scores, true_labels):
+
+    if type(scores) is list:
+        scores = torch.cat(scores, dim=0)
+
+    if type(true_labels) is list:
+        true_labels = torch.cat(true_labels, dim=0)
+
+    scores = scores.detach().cpu().numpy()
+    true_labels = true_labels.detach().cpu().numpy()
+
+    all_metrics_, best_metrics_ = get_results_for_all_score_normalizations(scores, true_labels)
+    #if  unique_values.shape[0] > 1:
+    #    f1 = eval.best_f1_score(true_labels, scores)
+    #    if including_ts:
+    #        f1_ts = eval.best_ts_f1_score(true_labels, scores)
+
+    return best_metrics_
 
 
 def calculate_z_normalization_values(args, dl, modules, desired_t, device):
@@ -424,15 +493,9 @@ def evaluate(
 
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
 
-    f1, f1_ts = {}, {}
     #if epoch % 10 == 0:
-    f1, f1_ts = logprob2f1s(all_scores, all_labels, including_ts=(epoch == args.n_epochs))
-
-    for key, value in f1.items():
-        stats[key] = value
-    if epoch == args.n_epochs:
-        for key, value in f1_ts.items():
-            stats[key] = value
+    best_metrics = logprob2f1s(all_scores, all_labels)
+    stats['f1'] = best_metrics.iloc[0, 1]
     return stats
 
 
