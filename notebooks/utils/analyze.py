@@ -163,6 +163,7 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, normalizing_stats
             axs[ft].set_xlabel('Time t / s')
 
         lg_score = lg_prb[:, :].detach().cpu().mean(axis=1)
+        print(lg_score.shape)
         if normalizing_stats is not None:
             lg_score = (lg_score - normalizing_stats['mu'].to('cpu')) / normalizing_stats['sigma'].to('cpu')
 

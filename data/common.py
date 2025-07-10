@@ -36,19 +36,49 @@ def get_data_min_max(records):
     return data_min, data_max
 
 
+def nanstd(input, dim=None, keepdim=False):
+    # Mask NaN values
+    mask = ~torch.isnan(input)
+    filtered_tensor = input.masked_select(mask)
+
+    # Count non-NaN elements
+    non_nan_count = mask.sum(dim=dim, keepdim=keepdim)
+
+    # Compute the mean along the specified dimension while ignoring NaNs
+    nanmean = torch.nanmean(input, dim=dim, keepdim=True)
+
+    # Compute the variance manually
+    variance = torch.sum(((input - nanmean) * mask) ** 2, dim=dim,
+                         keepdim=keepdim) / (non_nan_count - 1)
+
+    # Return square root of variance
+    return torch.sqrt(variance)
+
+
 def normalize_masked_data(data, mask, att_min, att_max):
     att_max[att_max == 0.] = 1. # we don't want to divide by zero
+
+    o_shape = data.shape
+    data_r = data.reshape(-1, data.shape[-1])
+    mask_r = mask.reshape(-1, mask.shape[-1]).bool()
 
     if (att_max != 0.).all():
         data_norm = (data - att_min) / att_max
     else:
         raise Exception("Zero!")
+    data_mean = data_r.nanmean(0)
+    data_std = nanstd(data_r, dim=0)
+    data_std[data_std == 0.] = 1e-5 # we don't want to divide by zero
+
+    #data_norm = (data - data_mean) / data_std
 
     if torch.isnan(data_norm).any():
         raise Exception("nans!")
 
-    # set masked out elements back to zero
+    # set masked out elements back to 0
     data_norm[mask == 0] = 0
+
+    data_norm = data_norm.reshape(o_shape)
 
     return data_norm, att_min, att_max
 

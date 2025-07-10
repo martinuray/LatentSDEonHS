@@ -63,7 +63,7 @@ def get_results_for_best_score_normalizations(
         df_list.append(r)
 
     best_score_idx = np.array(f1_scores).argmax()
-    print(df_list[best_score_idx]['f1'], df_list)
+    #print(df_list[best_score_idx]['f1'], df_list)
     return df_list[best_score_idx]
 
 def pca_recon_error(np_train, np_test, n_components=10):
@@ -155,7 +155,7 @@ def minmax_scale_traces(smd_train, smd_test):
 #%% load Swat data
 swat_train = pd.read_csv('data_dir/SWaT/raw/train.csv')
 swat_test = pd.read_csv('data_dir/SWaT/raw/test.csv')
-swat_labels = pd.read_csv('data_dir/SWaT/raw/labels.csv').to_numpy().squeeze()[:,1]
+swat_labels = pd.read_csv('data_dir/SWaT/raw/labels.csv').to_numpy().squeeze()#[:,1]
 
 mm_scaler = MinMaxScaler(feature_range=(0,1))
 swat_train = mm_scaler.fit_transform(swat_train)

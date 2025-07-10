@@ -39,6 +39,9 @@ experiment_id_str = "AD_aero_250616-14:28:12"
 #checkpoint_epoch = 2100
 dataset = "AD_aero"
 
+experiment_id_str = "AD_SWaT_250707-13:56:09"
+checkpoint_epoch = 90
+
 # SMD
 #experiment_id_str = "AD_SMD_250617-23:17:10"
 #checkpoint_epoch = 590
@@ -67,8 +70,8 @@ args = Namespace(**logs['args'])
 
 #%
 #provider = BasicDataProvider(data_dir='data_dir', data_kind=data_kind, num_features=num_data_features, sample_tp=1.)
-#provider = ADProvider(data_dir='data_dir', dataset="SMD", window_length=args.data_window_length, window_overlap=args.data_window_overlap)
-provider = AeroDataProvider(data_dir="data_dir/aero")
+provider = ADProvider(data_dir='data_dir', dataset=args.dataset, window_length=args.data_window_length, window_overlap=args.data_window_overlap)
+#provider = AeroDataProvider(data_dir="data_dir/aero")
 
 dl_trn = provider.get_train_loader(batch_size=1)
 #dl_val = provider.get_val_loader(batch_size=1)

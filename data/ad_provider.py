@@ -15,6 +15,7 @@ import pandas as pd
 
 import torch
 from numpy.lib.stride_tricks import sliding_window_view
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
 from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
@@ -28,8 +29,16 @@ class ADData(object):
     labels = None
     params_dict, labels_dict = None, None
 
-    def __init__(self, root, data_kind="SWaT", mode='train', window_length:int = 100, window_overlap: float = 0.75, n_samples = None, columns = None):
+    def __init__(
+            self, root, data_kind="SWaT", mode='train',
+            window_length:int = 100, window_overlap: float = 0.75,
+            n_samples = None, columns = None,
+            normalizer=None,
+            data_normalization_strategy:str="none"
+    ):
 
+        self.scaler = normalizer
+        self.data_normalization_strategy = data_normalization_strategy
         self.root = root
         self.data_kind = data_kind
         self.mode = mode
@@ -55,6 +64,7 @@ class ADData(object):
                 raise NotImplementedError
 
         self.data = torch.load(os.path.join(self.processed_folder, self.destination_file))
+
         if self.mode == 'test':
             self.targets = torch.load(os.path.join(self.processed_folder, self.label_file))
 
@@ -118,6 +128,20 @@ class ADData(object):
     def get_label(self, record_id):
         return self.labels[record_id]
 
+    def normalize_data(self, data_):
+        if self.scaler is None:
+            if self.data_normalization_strategy != "none":
+                assert self.data_normalization_strategy in ["std", "min-max"]
+                if self.data_normalization_strategy == "std":
+                    self.scaler = StandardScaler()
+                else:
+                    self.scaler = MinMaxScaler(feature_range=(0, 1))
+                self.scaler.fit(data_)
+
+        if self.scaler is not None:
+            data_ = self.scaler.transform(data_)
+        return data_
+
     def _process_water_treatment_data(self, columns=None, n_samples=None):
         logging.warning("Processing Water Treatment Data")
         raw_data_df = pd.read_csv(
@@ -125,11 +149,19 @@ class ADData(object):
             delimiter=',')
         if columns is None:
             # TODO: otherwise issue when normalizing
-            raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)]
+            #raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)]
             self.params = list(raw_data_df.columns)
         else:
             self.params = columns
             raw_data_df = raw_data_df.loc[:, self.params]
+
+        # normalize data
+        raw_data_df = self.normalize_data(raw_data_df)
+        if "WaDi" in self.data_kind:
+            logging.info(f"Limiting WaDi Dataset to {60_000} samples, as per reference")
+            # done as with QuoVadis, see
+            # https://github.com/ssarfraz/QuoVadisTAD/blob/8e2de5a1574d1f8b2b669e2aa81a34fd92bd5b58/quovadis_tad/model_utils/model_def.py#L55
+            raw_data_df = raw_data_df.iloc[:60_000]
 
         if self.mode == 'test':
             added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
@@ -137,18 +169,33 @@ class ADData(object):
             raw_data = np.vstack((raw_data_df, added_)).copy()
             raw_data = raw_data.reshape(-1, self.max_signal_length,
                                         raw_data.shape[1])
+
             # TODO take care that no overlapping windows are taken
             self.targets = pd.read_csv(
-                os.path.join(self.raw_folder, f'labels.csv'),)
-            self.targets = np.array(self.targets)
+                os.path.join(self.raw_folder, f'labels.csv'))
+            self.targets = np.array(self.targets.values)
             self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
             self.targets = self.targets.reshape(-1, self.max_signal_length)
         else:
-            raw_data = raw_data_df.to_numpy().copy()
+            raw_data = raw_data_df.copy()
             raw_data = create_win_periods(raw_data, self.max_signal_length,
-                                          int(self.max_signal_length * self.overlapping_windows))
+                                          int(self.max_signal_length * (1-self.overlapping_windows)))
 
             self.targets = np.zeros(raw_data.shape[0:2])
+
+        # temp stuff
+#        raw_data = raw_data_df.copy()
+#        raw_data = create_win_periods(raw_data, self.max_signal_length,
+#                                      int(self.max_signal_length * (1 - self.overlapping_windows)))
+
+#        if self.mode == 'test':
+#            self.targets = pd.read_csv(
+#                os.path.join(self.raw_folder, f'labels.csv'))
+#            self.targets = np.array(self.targets.values)
+#            self.targets = create_win_periods(self.targets, self.max_signal_length,
+#                                              int(self.max_signal_length * (1 - self.overlapping_windows)))
+#        else:
+#            self.targets = np.zeros(raw_data.shape[0:2])
 
         self.params_dict = {k: i for i, k in enumerate(self.params)}
         indcs = torch.arange(0, raw_data.shape[1])
@@ -283,11 +330,22 @@ class ADDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None, window_length: int=100, window_overlap:float = 0.75, n_samples: int=None):
+    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None,
+                 window_length: int=100, window_overlap:float = 0.75,
+                 n_samples: int=None, data_normalization_strategy:str="none"):
 
         objs = dict()
-        objs['train'] = ADData(data_dir, mode='train', data_kind=data_kind, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
-        objs['test'] = ADData(data_dir, mode='test', data_kind=data_kind, window_length=window_length, window_overlap=window_overlap, columns=objs['train'].params, n_samples=n_samples)
+        objs['train'] = ADData(
+            data_dir, mode='train', data_kind=data_kind,
+            window_length=window_length, window_overlap=window_overlap,
+            n_samples=n_samples,
+            data_normalization_strategy=data_normalization_strategy)
+
+        objs['test'] = ADData(
+            data_dir, mode='test', data_kind=data_kind,
+            window_length=window_length, window_overlap=window_overlap,
+            columns=objs['train'].params, n_samples=n_samples,
+            normalizer=objs['train'].scaler)
 
         data = objs[mode]
 
@@ -347,9 +405,22 @@ class ADDataset(Dataset):
             }
         return inp_and_evd
 
+    def fit_normalizer(self):
+        logging.info("Fitting Standard Scaler")
+        scaler = StandardScaler()
+        scaler.fit(self.evd_obs)
+        return scaler
+
+    def normalizer_transform(self, scaler):
+        logging.info("Applying Scaler")
+        self.evd_obs = scaler.transform(self.evd_obs)
+        self.inp_obs = scaler.transform(self.inp_obs)
+
 
 class ADProvider(DatasetProvider):
-    def __init__(self, data_dir=None, dataset=None, window_length:int = 100, window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None):
+    def __init__(self, data_dir=None, dataset=None, window_length:int = 100,
+                 window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None,
+                 data_normalization_strategy:str="none"):
         DatasetProvider.__init__(self)
 
         if dataset not in ["SWaT", "WaDi", "SMD"]:
@@ -358,8 +429,21 @@ class ADProvider(DatasetProvider):
         self._dataset = dataset
 
         self._sample_tp = sample_tp
-        self._ds_trn = ADDataset(data_dir, 'train', data_kind=dataset, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
-        self._ds_tst = ADDataset(data_dir, 'test', data_kind=dataset, window_length=window_length, window_overlap=window_overlap, n_samples=n_samples)
+        self._ds_trn = ADDataset(
+            data_dir, 'train', data_kind=dataset,
+            window_length=window_length, window_overlap=window_overlap,
+            n_samples=n_samples,
+            data_normalization_strategy=data_normalization_strategy)
+
+        self._ds_tst = ADDataset(
+            data_dir, 'test', data_kind=dataset,
+            window_length=window_length, window_overlap=window_overlap,
+            n_samples=n_samples,
+            data_normalization_strategy=data_normalization_strategy)
+
+        #scaler = self._ds_trn.fit_normalizer()
+        #self._ds_trn.normalizer_transform(scaler)
+        #self._ds_tst.normalizer_transform(scaler)
 
     @property 
     def input_dim(self):
@@ -398,6 +482,9 @@ class ADProvider(DatasetProvider):
 
 def create_win_periods(data_, win_size_, win_stride_):
     """ returns the rolling windows of the given flattened data """
+    if win_stride_ < 1:
+        win_stride_ = 1
+
     windows = sliding_window_view(data_, (
         win_size_, data_.shape[1]))
     return windows.squeeze()[::win_stride_, :]

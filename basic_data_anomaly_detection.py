@@ -9,6 +9,8 @@ import datetime
 import os
 import logging
 import argparse
+import shutil
+
 import numpy as np
 from random import SystemRandom
 from collections import defaultdict
@@ -49,11 +51,9 @@ from utils.scoring_functions import Evaluator
 
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
-    #group.add_argument("--aux-weight", type=float, default=10.0)
-    #group.add_argument("--num-features", type=int, default=4)
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
@@ -127,17 +127,33 @@ def get_results_for_all_score_normalizations(
     df_list = []
     f1_scores = []
     normalisations = ["median-iqr", "mean-std", None]
+    aggregation_strategies = ["mean", "max", "median", "p75", "p95"]
     for n in normalisations:
-        r, d = get_ts_eval(
-            normalise_scores(scores, norm=n).flatten(),
-            test_labels.flatten()
-        )
-        f1_scores.append(r['f1'])
-        if n is None:
-            n = 'no'
-        df_list.append((n, d))
+        normed_scores = normalise_scores(scores, norm=n)
+
+        for aggregation_strategy in aggregation_strategies:
+            if aggregation_strategy == 'mean':
+                normed_agg_scores = normed_scores.mean(1)
+            elif aggregation_strategy == 'max':
+                normed_agg_scores = normed_scores.max(1)
+            elif aggregation_strategy == 'median':
+                normed_agg_scores = np.median(normed_scores, axis=1)
+            elif aggregation_strategy == 'p75':
+                normed_agg_scores = np.percentile(normed_scores, 75, axis=1)
+            elif aggregation_strategy == 'p95':
+                normed_agg_scores = np.percentile(normed_scores, 95, axis=1)
+
+            r, d = get_ts_eval(
+                normed_agg_scores,
+                test_labels.flatten()
+            )
+
+            f1_scores.append(r['f1'])
+            if n is None:
+                n = 'no'
+            df_list.append((n, (aggregation_strategy, d)))
     best_score_idx = np.array(f1_scores).argmax()
-    return dict(df_list), df_list[best_score_idx][1]
+    return dict(df_list), df_list[best_score_idx][1][1]
 
 
 def get_ts_eval(scores, targets):
@@ -169,11 +185,6 @@ def logprob2f1s(scores, true_labels):
     true_labels = true_labels.detach().cpu().numpy()
 
     all_metrics_, best_metrics_ = get_results_for_all_score_normalizations(scores, true_labels)
-    #if  unique_values.shape[0] > 1:
-    #    f1 = eval.best_f1_score(true_labels, scores)
-    #    if including_ts:
-    #        f1_ts = eval.best_ts_f1_score(true_labels, scores)
-
     return best_metrics_
 
 
@@ -203,8 +214,14 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
             # aux_log_prob = aux_log_prob.mean(dim=0)
             if parts["aux_tgt"].dim() == 2:
-                aux_log_prob = aux_log_prob.mean(
-                    dim=2)  # TODO: mean, but very basic
+                if args.aggregation_strategy == 'mean':
+                    aux_log_prob = aux_log_prob.mean(
+                        dim=2)  # TODO: mean, but very basic
+                elif args.aggregation_strategy == 'max':
+                    aux_log_prob = aux_log_prob.max(dim=2).values
+                else:
+                    raise NotImplementedError(
+                        "Anomaly Aggregation Strategy not implemented.")
 
             all_scores.append(aux_log_prob)
 
@@ -235,6 +252,11 @@ def start_experiment(args, provider=None):
         log_line_template="%(color_on)s[%(created)d] [%(levelname)-8s] %(message)s%(color_off)s",
     )
 
+    # temp
+    processed_dir = f'data_dir/{args.dataset}/processed'
+    if os.path.exists(processed_dir):
+        shutil.rmtree(processed_dir)
+
     logging.debug(f"{experiment_log_file_string} -- Experiment ID={experiment_id}")
     if args.seed > 0:
         set_seed(args.seed)
@@ -244,7 +266,12 @@ def start_experiment(args, provider=None):
     if provider is None:
         logging.info("Instantiating data provider")
         if args.dataset in ['SWaT', 'WaDi', 'SMD']:
-            provider = ADProvider(data_dir='data_dir', dataset=args.dataset, window_length=args.data_window_length, window_overlap=args.data_window_overlap, n_samples=1000 if args.debug else None)
+            provider = ADProvider(
+                data_dir='data_dir', dataset=args.dataset,
+                window_length=args.data_window_length, window_overlap=args.data_window_overlap,
+                n_samples=1000 if args.debug else None,
+                data_normalization_strategy=args.data_normalization_strategy
+            )
         elif args.dataset == 'aero':
             provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
         else:
@@ -343,7 +370,7 @@ def start_experiment(args, provider=None):
     stats = defaultdict(list)
     stats_mask = {
         "trn": ["log_pxz", "kl0", "klp", "loss"],
-        "tst": ["loss"],
+        "tst": ["loss", "f1"],
         "oth": ["lr"],
     }
     if use_validation:
@@ -367,13 +394,10 @@ def start_experiment(args, provider=None):
             args.device
         )
 
-        normalization_scores = None
-        if args.normalize_score:
-            normalization_scores = calculate_z_normalization_values(
-                args, dl_trn, modules, desired_t, args.device)
-        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device, normalization_stats=normalization_scores, epoch=epoch)
+        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t, args.device, epoch=epoch)
+
         if use_validation:
-            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device, normalization_stats=normalization_scores, epoch=epoch)
+            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t, args.device, epoch=epoch)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
@@ -473,14 +497,12 @@ def evaluate(
                 aux_log_prob = aux_log_prob[None, :, :]
 
             #aux_log_prob = aux_log_prob.mean(dim=0)
-            if parts["aux_tgt"].dim() == 2:
-                aux_log_prob = aux_log_prob.mean(dim=2) # TODO: mean, but very basic
 
-            if args.normalize_score and normalization_stats is not None:
-                aux_log_prob = (aux_log_prob - normalization_stats['mu']) / normalization_stats['sigma']
+            # from batch -> to one ts again
+            aux_log_prob = aux_log_prob.reshape(-1, aux_log_prob.shape[-1])
 
            # if epoch % 10 == 0:
-            all_labels.append(parts["aux_tgt"])
+            all_labels.append(parts["aux_tgt"].flatten())
             all_scores.append(aux_log_prob)
 
             batch_len = parts["evd_obs"].shape[0]
