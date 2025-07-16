@@ -162,8 +162,7 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, normalizing_stats
             ac.set_ylim(0 , 150)
             axs[ft].set_xlabel('Time t / s')
 
-        lg_score = lg_prb[:, :].detach().cpu().mean(axis=1)
-        print(lg_score.shape)
+        lg_score = lg_prb[:, :].detach().cpu().max(axis=1).values
         if normalizing_stats is not None:
             lg_score = (lg_score - normalizing_stats['mu'].to('cpu')) / normalizing_stats['sigma'].to('cpu')
 
@@ -184,7 +183,7 @@ def reconstruct_display_data(dl_, args_, modules_, desired_t_, normalizing_stats
 
         if dst is None:
             plt.show()
-            if idx > 45:
+            if idx > 25:
                 break
         else:
             plt.savefig(os.path.join(dst, f'{label}_recondstruction{idx}.png'))

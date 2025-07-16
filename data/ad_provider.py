@@ -163,42 +163,43 @@ class ADData(object):
             # https://github.com/ssarfraz/QuoVadisTAD/blob/8e2de5a1574d1f8b2b669e2aa81a34fd92bd5b58/quovadis_tad/model_utils/model_def.py#L55
             raw_data_df = raw_data_df.iloc[:60_000]
 
-        if self.mode == 'test':
-            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
-                0]) % self.max_signal_length, raw_data_df.shape[1]))
-            raw_data = np.vstack((raw_data_df, added_)).copy()
-            raw_data = raw_data.reshape(-1, self.max_signal_length,
-                                        raw_data.shape[1])
-
-            # TODO take care that no overlapping windows are taken
-            self.targets = pd.read_csv(
-                os.path.join(self.raw_folder, f'labels.csv'))
-            self.targets = np.array(self.targets.values)
-            self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
-            self.targets = self.targets.reshape(-1, self.max_signal_length)
-        else:
-            raw_data = raw_data_df.copy()
-            raw_data = create_win_periods(raw_data, self.max_signal_length,
-                                          int(self.max_signal_length * (1-self.overlapping_windows)))
-
-            self.targets = np.zeros(raw_data.shape[0:2])
-
-        # temp stuff
-#        raw_data = raw_data_df.copy()
-#        raw_data = create_win_periods(raw_data, self.max_signal_length,
-#                                      int(self.max_signal_length * (1 - self.overlapping_windows)))
-
 #        if self.mode == 'test':
+#            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
+#                0]) % self.max_signal_length, raw_data_df.shape[1]))
+#            raw_data = np.vstack((raw_data_df, added_)).copy()
+#            raw_data = raw_data.reshape(-1, self.max_signal_length,
+#                                        raw_data.shape[1])
+
+#            # TODO take care that no overlapping windows are taken
 #            self.targets = pd.read_csv(
 #                os.path.join(self.raw_folder, f'labels.csv'))
 #            self.targets = np.array(self.targets.values)
-#            self.targets = create_win_periods(self.targets, self.max_signal_length,
-#                                              int(self.max_signal_length * (1 - self.overlapping_windows)))
+#            self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
+#            self.targets = self.targets.reshape(-1, self.max_signal_length)
 #        else:
+#            raw_data = raw_data_df.copy()
+#            start_idcs, raw_data = create_win_periods(
+#                raw_data, self.max_signal_length,
+#                int(self.max_signal_length * (1-self.overlapping_windows)))
+
 #            self.targets = np.zeros(raw_data.shape[0:2])
 
+        # temp stuff
+        raw_data = raw_data_df.copy()
+        indcs, raw_data = create_win_periods(raw_data, self.max_signal_length,
+                                             int(self.max_signal_length * (1 - self.overlapping_windows)))
+
+        if self.mode == 'test':
+            self.targets = pd.read_csv(
+                os.path.join(self.raw_folder, f'labels.csv'))
+            self.targets = np.array(self.targets.values)
+            start_idcs_tgt, self.targets = create_win_periods(self.targets, self.max_signal_length,
+                                              int(self.max_signal_length * (1 - self.overlapping_windows)))
+        else:
+            self.targets = np.zeros(raw_data.shape[0:2])
+
         self.params_dict = {k: i for i, k in enumerate(self.params)}
-        indcs = torch.arange(0, raw_data.shape[1])
+        indcs = torch.Tensor(indcs)
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
 
@@ -206,8 +207,8 @@ class ADData(object):
         mask[data_tensor.isnan()] = 0
         data_tensor[data_tensor.isnan()] = 0
 
-        if self.mode == 'test':
-            mask[-1, -added_.shape[0]:, :] = 0
+        #if self.mode == 'test':
+        #    mask[-1, -added_.shape[0]:, :] = 0
 
         if n_samples is not None:
             logging.warning(f"Limiting dataset to {n_samples} samples")
@@ -221,7 +222,7 @@ class ADData(object):
 
         assert data_tensor.shape[0] == mask.shape[0]
 
-        data = [(part_idx, indcs, data_tensor[part_idx, :, :],
+        data = [(part_idx, indcs[part_idx], data_tensor[part_idx, :, :],
                  mask[part_idx, :, :]) for part_idx in
                 range(mask.shape[0])]
 
@@ -356,6 +357,8 @@ class ADDataset(Dataset):
 
         tps = data.data[0][1]
         tps = torch.Tensor(tps / tps.max())
+        indcs = torch.vstack([data.data[part_idx][1] for part_idx in
+                            range(len(data.data))])
         obs = torch.vstack([data.data[part_idx][2][None, :, :] for part_idx in
                                  range(len(data.data))]).float()
 
@@ -377,6 +380,7 @@ class ADDataset(Dataset):
         self.inp_msk = msk.long() #obs_msk
         self.inp_tps = tps
         self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long() #tid_new.long()
+        self.indcs = indcs
 
         self.evd_msk = torch.ones_like(self.inp_msk).long()
         self.evd_tid = self.inp_tid.long() #all_idx.repeat(self.tps.shape[0], 1).long()
@@ -401,7 +405,8 @@ class ADDataset(Dataset):
             'evd_msk' : self.evd_msk[idx].long(),
             'evd_tid' : self.evd_tid[idx].long(),
             'evd_tps' : self.evd_tps[idx].float(),
-            'aux_tgt' : self.aux_tgt[idx].long()
+            'aux_tgt' : self.aux_tgt[idx].long(),
+            'inp_indcs' : self.indcs[idx]
             }
         return inp_and_evd
 
@@ -487,5 +492,8 @@ def create_win_periods(data_, win_size_, win_stride_):
 
     windows = sliding_window_view(data_, (
         win_size_, data_.shape[1]))
-    return windows.squeeze()[::win_stride_, :]
+    windows = windows.squeeze()
+    indcs = sliding_window_view(np.arange(data_.shape[0]), win_size_)
+
+    return indcs[::win_stride_], windows.squeeze()[::win_stride_, :]
 

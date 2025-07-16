@@ -39,7 +39,7 @@ experiment_id_str = "AD_aero_250616-14:28:12"
 #checkpoint_epoch = 2100
 dataset = "AD_aero"
 
-experiment_id_str = "AD_SWaT_250707-13:56:09"
+experiment_id_str = "AD_SWaT_250710-16:22:09"
 checkpoint_epoch = 90
 
 # SMD
