@@ -31,8 +31,8 @@ for root, dirs, files in os.walk(data_dir):
         with open(file_path, 'r') as file:
             test_data_point_cnt += sum(1 for line in file)
 
-train_swat = pd.read_csv("data_dir/SWaT/raw/train.csv")
-test_swat = pd.read_csv("data_dir/SWaT/raw/test.csv")
+train_swat = pd.read_csv("data_dir/SWaT/raw/backup/train.csv")
+test_swat = pd.read_csv("data_dir/SWaT/raw/backup/test.csv")
 train_wadi = pd.read_csv("data_dir/WaDi/raw/train.csv")
 test_wadi = pd.read_csv("data_dir/WaDi/raw/test.csv")
 
