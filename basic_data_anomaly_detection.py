@@ -128,13 +128,22 @@ def get_results_for_all_score_normalizations(
     df_list = []
     f1_scores = []
     normalisations = ["median-iqr", "mean-std", None]
-    aggregation_strategies = ["mean", "max", "median", "p75", "p95"]
+    aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
 
     for n in normalisations:
         normed_scores = normalise_scores(scores, norm=n, smooth=True)
 
         for aggregation_strategy in aggregation_strategies:
-            if aggregation_strategy == 'mean':
+            if aggregation_strategy == 'l1':
+                # manhatten norm: basically the sum
+                normed_agg_scores = np.linalg.norm(normed_scores, ord=1, axis=1)
+            elif aggregation_strategy == 'l2':
+                # euclidean norm: sqrt(sum(x^2))
+                normed_agg_scores = np.linalg.norm(normed_scores, ord=2, axis=1)
+            elif aggregation_strategy == 'linfty':
+                # infinity norm: max(abs(x))
+                normed_agg_scores = np.linalg.norm(normed_scores, ord=np.inf, axis=1)
+            elif aggregation_strategy == 'mean':
                 normed_agg_scores = normed_scores.mean(1)
             elif aggregation_strategy == 'max':
                 normed_agg_scores = normed_scores.max(1)
