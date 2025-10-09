@@ -63,10 +63,10 @@ class ADData(object):
             else:
                 raise NotImplementedError
 
-        self.data = torch.load(os.path.join(self.processed_folder, self.destination_file))
+        self.data = torch.load(os.path.join(self.processed_folder, self.destination_file), weights_only=False)
 
         if self.mode == 'test':
-            self.targets = torch.load(os.path.join(self.processed_folder, self.label_file))
+            self.targets = torch.load(os.path.join(self.processed_folder, self.label_file), weights_only=False)
 
 
     def _check_exist_raw_data(self):
