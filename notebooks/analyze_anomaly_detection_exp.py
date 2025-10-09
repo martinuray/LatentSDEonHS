@@ -16,35 +16,8 @@ from utils.anomaly_detection import calculate_anomaly_threshold, \
     get_number_over_threshold
 from utils.scoring_functions import Evaluator
 
-# % some old stats
-data_kind, num_data_features = None, 4
-dataset = "anomaly_detection"
-experiment_id = 60625   # mine
-checkpoint_epoch = 4500
-# 108826 bis 2190
-experiment_id = 82435   # mine
-checkpoint_epoch = 2190
-
-log_file = f"logs/{dataset}_{experiment_id}.json"
-
-#% SWAT
-num_data_features = 10
-experiment_id_str = "anomaly_detection_250401-15:38:22"
-checkpoint_epoch = 990
-
-#% aero
-experiment_id_str = "AD_aero_250612-12:30:29"
-checkpoint_epoch = 590
-experiment_id_str = "AD_aero_250616-14:28:12"
-#checkpoint_epoch = 2100
-dataset = "AD_aero"
-
-experiment_id_str = "AD_SWaT_250710-16:22:09"
-checkpoint_epoch = 90
-
-# SMD
-#experiment_id_str = "AD_SMD_250617-23:17:10"
-#checkpoint_epoch = 590
+experiment_id_str = "AD_SWaT_250808-15:59:44"
+checkpoint_epochs = [3, 90, 2100]
 
 log_file = f"logs/{experiment_id_str}.json"
 #% load logfile
@@ -60,9 +33,9 @@ from pprint import pprint
 pprint(logs['final'])
 
 # plot loss curves
-plot_stat(logs, stat='loss')
-plt.tight_layout()
-plt.show()
+#plot_stat(logs, stat='loss')
+#plt.tight_layout()
+#plt.show()
 
 #% load args and data
 args = Namespace(**logs['args'])
@@ -73,22 +46,26 @@ args = Namespace(**logs['args'])
 provider = ADProvider(data_dir='data_dir', dataset=args.dataset, window_length=args.data_window_length, window_overlap=args.data_window_overlap)
 #provider = AeroDataProvider(data_dir="data_dir/aero")
 
-dl_trn = provider.get_train_loader(batch_size=1)
+dl_trn = provider.get_train_loader(batch_size=1, shuffle=False)
 #dl_val = provider.get_val_loader(batch_size=1)
-dl_test = provider.get_test_loader(batch_size=1)
+dl_test = provider.get_test_loader(batch_size=1, shuffle=False)
 batch = next(iter(dl_trn))
 
 
-#% load models and checkpoint
+#%% load models and checkpoint
 desired_t = torch.linspace(0, 1.0, provider.num_timepoints, device=args.device).float()
 
 #% load model
-modules = get_modules(args, provider, desired_t)
+modules = [get_modules(args, provider, desired_t) for _ in checkpoint_epochs]
 
 #%% load_model
-checkpoint = f"checkpoints/checkpoint_{experiment_id_str}_{checkpoint_epoch}.h5"
-checkpoint = torch.load(checkpoint)
-modules.load_state_dict(checkpoint['modules'])
+import argparse
+torch.serialization.add_safe_globals([argparse.Namespace])
+
+for idx, cpe in enumerate(checkpoint_epochs):
+    checkpoint = f"checkpoints/checkpoint_{experiment_id_str}_{cpe}.h5"
+    checkpoint = torch.load(checkpoint)
+    modules[idx].load_state_dict(checkpoint['modules'])
 
 normalizing_stats = None
 if args.normalize_score:
@@ -96,9 +73,22 @@ if args.normalize_score:
 
 
 #%% reconstruct training data
-reconstruct_display_data(dl_trn, args, modules, desired_t, normalizing_stats,
-                         label="train", disturb_value_offset=0.0)
+from notebooks.utils.analyze import reconstruct_display_data
 
+fig, axs = plt.subplots(nrows=26, ncols=len(checkpoint_epochs), figsize=(24, 36), sharex=True, sharey='row')
+for idx, cpe in enumerate(checkpoint_epochs):
+    reconstruct_display_data(dl_trn, args,
+                             modules_=modules,
+                             desired_t_=desired_t,
+                             axs=axs,
+                             checkpoint_epochs_=checkpoint_epochs,
+                             normalizing_stats=normalizing_stats,
+                             label=f"train",
+                             disturb_value_offset=0.0,
+                             dst='out/')
+plt.show()
+
+import sys; sys.exit(1)
 #%% reconstruct test data
 reconstruct_display_data(dl_test, args, modules, desired_t, normalizing_stats, label="test")#, dst='out/export/recon_test/')
 
