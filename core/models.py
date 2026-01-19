@@ -231,8 +231,8 @@ class EncMtanRnn(nn.Module):
         Returns:
             (Tensor): _description_
         """
-        time_steps = time_steps
-        mask = x[:, :, self.dim :]
+        # time_steps = time_steps.cpu()
+        mask = x[:, :, self.input_dim :]
         mask = torch.cat((mask, mask), 2)
         if self.learn_emb:
             key = self.learn_time_embedding(time_steps)

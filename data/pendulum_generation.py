@@ -379,7 +379,7 @@ class Pendulum:
             draw.ellipse((x_l, y_l, x_u, y_u), fill=1.0)
 
         img = img.resize((self.img_size, self.img_size),
-                         resample=Image.ANTIALIAS)
+                         resample=Image.LANCZOS)
         img_as_array = np.asarray(img)
         img_as_array = np.clip(img_as_array, 0, 1)
         return 255.0 * img_as_array
