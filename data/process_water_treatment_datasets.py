@@ -1,43 +1,50 @@
 import argparse
-import numpy as np
 import os
+
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+import tqdm
 from scipy.signal import savgol_filter
+from sklearn.preprocessing import MinMaxScaler
 
 
-def norm(train, test):
-
+def norm(train_df, test_df):
     normalizer = MinMaxScaler(feature_range=(0, 1))
-    normalizer.fit(train) # scale training data to [0,1] range
-    train_ret = normalizer.transform(train)
-    test_ret = normalizer.transform(test)
-    return train_ret, test_ret
+    normalizer.fit(train_df) # scale training data to [0,1] range
+
+    train_df_normed, test_df_normed = train_df.copy(), test_df.copy()
+    train_df_normed[train_df.columns] = normalizer.transform(train_df)
+    test_df_normed[test_df.columns] = normalizer.transform(test_df)
+    return train_df_normed, test_df_normed
 
 # downsample by 10
-def downsample(data, labels=None, down_len=10):
-    np_data = np.array(data)
+def downsample(data_df, labels=None, down_len:int=10):
+    """
+    Args:
+        data_df: dataframe with data
+        labels: dataframe with labels
+        down_len: the factor, by which the data is downsampled
+
+    Returns:
+
+    """
+    np_data = np.array(data_df)
     orig_len, col_num = np_data.shape
 
     down_time_len = orig_len // down_len
 
-    np_data = np_data.transpose()
-
     # see [Deng and Hooi, 2021]
-    d_data = np_data[:, :down_time_len*down_len].reshape(col_num, -1, down_len)
-    d_data = np.median(d_data, axis=2).reshape(col_num, -1)
-    d_data = d_data.transpose()
+    d_data = data_df.groupby(data_df.index // 10).median()
 
-    if labels is None:
-        d_labels = None
-    else:
-        d_labels = labels.values[:down_time_len*down_len].reshape(-1, down_len)
+    d_labels = None
+    if labels is not None:
+        d_labels = labels.groupby(labels.index // 10).max()
         # if exist anomalies, then this sample is abnormal
         # implemented unlike [Deng and Hooi, 2021]; they say take the mode
-        d_labels = np.round(np.max(d_labels, axis=1))
-        d_labels = d_labels.tolist()
 
-    return d_data.tolist(), d_labels
+
+    return d_data, d_labels
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Water Treatment Data Preprocessor")
@@ -48,21 +55,21 @@ def get_parser():
         choices=["SWaT", "WaDiv1", "WaDiv2"],
         help="Dataset to process"
     )
+    parser.add_argument("--downsample-factor", type=int, default=5)
+    parser.add_argument("--savgol-polyorder", type=int, default=2)
+    parser.add_argument("--savgol-window-length", type=int, default=300)
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    args_ = parser.parse_args()
-    return args_
+    parser.add_argument("--smoothen", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--make-validation-set", action=argparse.BooleanOptionalAction, default=False)
+    arguments_ = parser.parse_args()
+    return arguments_
 
 
-def filter_transition_df(df_):
-    from scipy.ndimage import gaussian_filter1d
-    from scipy.interpolate import UnivariateSpline
-
-    for col in df_.columns:
-        #df_[col] = savgol_filter(df_[col], window_length=11, polyorder=5)
-        #df_.loc[:, col] = gaussian_filter1d(df_.loc[:, col], sigma=5)
-        df_[col] = df_[col].astype(float)
-
-        df_.loc[:, col] = savgol_filter(df_[col].to_numpy(), window_length=300, polyorder=3).round(3)
+def filter_transition_df(df_, args_):
+    df_ = df_.astype(np.float32)
+    df_ = savgol_filter(df_.to_numpy(), axis=0,
+                        window_length=args_.savgol_window_length,
+                        polyorder=args_.savgol_polyorder).round(3)
     return df_
 
 
@@ -75,36 +82,45 @@ def filter_transition_df_all(train_df, test_df, args_):
     df_train_few_uniques_filtered = train_df[columns_with_few_uniques]
     df_test_few_uniques_filtered = test_df[columns_with_few_uniques]
 
-    df_train_few_uniques_filtered_softened = filter_transition_df(df_train_few_uniques_filtered.copy())
-    df_test_few_uniques_filtered_softened = filter_transition_df(df_test_few_uniques_filtered.copy())
+    df_train_few_uniques_filtered_softened = filter_transition_df(df_train_few_uniques_filtered.copy(), args_)
+    df_test_few_uniques_filtered_softened = filter_transition_df(df_test_few_uniques_filtered.copy(), args_)
 
-    train_df[columns_with_few_uniques] = df_train_few_uniques_filtered_softened
-    test_df[columns_with_few_uniques] = df_test_few_uniques_filtered_softened
+    train_df_r, test_df_r = train_df.copy(), test_df.copy()
+    train_df_r[columns_with_few_uniques] = df_train_few_uniques_filtered_softened
+    test_df_r[columns_with_few_uniques] = df_test_few_uniques_filtered_softened
 
-    return train_df, test_df
+    return train_df_r, test_df_r
 
 
-def viz_before_after_smoothing(after, before, step_size=10000):
-    import matplotlib.pyplot as plt
+def visualize_comparison(after_transform=None, before_transform=None,
+                         num_viz:int=30, step_size:int=10000):
 
-    for start_idx in range(0, before.shape[0], step_size):
+    for viz_idx in tqdm.tqdm(range(num_viz)):
+        start_idx = viz_idx * step_size
 
-        if start_idx > 30*step_size:
+        if start_idx > before_transform.shape[0]:
             break
 
-        fig, axs = plt.subplots(nrows=before.shape[1]//2, ncols=2, sharex=True, figsize=(24, 14))
+        n_rows = before_transform.shape[1] // 2
+        fig, axs = plt.subplots(nrows=n_rows, ncols=2, sharex=True, figsize=(24, 14))
         axs = axs.flatten()
 
-        for idx, column in enumerate(before.columns):
-            if idx == len(axs):
+        for col_idx, column_name in enumerate(before_transform.columns):
+            if col_idx == len(axs):
                 break
-            axs[idx].plot(before[column].iloc[start_idx:start_idx+step_size], label="before")
-            axs[idx].plot(after[column].iloc[start_idx:start_idx+step_size], '--', label="after")
-            axs[idx].set_title(column)
-            axs[idx].legend()
 
+            if before_transform is not None:
+                axs[col_idx].plot(before_transform[column_name].iloc[start_idx:start_idx + step_size],
+                                  label="raw")
+            if after_transform is not None:
+                axs[col_idx].plot(after_transform[column_name].iloc[start_idx:start_idx + step_size],
+                                  '--', label="processed")
+            axs[col_idx].set_title(column_name)
+            axs[col_idx].legend()
+
+        plt.ioff()
         plt.show()
-    plt.close('all')
+        plt.close('all')
 
 
 def main(args):
@@ -124,9 +140,9 @@ def main(args):
         test_df = test_df.iloc[:, 3:]
 
     else:
-        train_df = pd.read_csv(f'data_dir/{args.dataset}/raw/train_raw.csv')
-        test_df = pd.read_csv(f'data_dir/{args.dataset}/raw/test_raw.csv')
-        test_labels = pd.read_csv(f'data_dir/{args.dataset}/raw/labels_raw.csv')
+        train_df = pd.read_csv(f'data_dir/{args.dataset}/rawraw/train.csv')
+        test_df = pd.read_csv(f'data_dir/{args.dataset}/rawraw/test.csv')
+        test_labels = pd.read_csv(f'data_dir/{args.dataset}/rawraw/labels.csv')
         test_labels = test_labels['labels']
 
     train_df = train_df.fillna(train_df.mean())
@@ -142,22 +158,45 @@ def main(args):
         train_df.columns = cols
         test_df.columns = cols
 
-    train_df_filtered, test_df_filtered = filter_transition_df_all(train_df, test_df, args)
-    x_train, x_test = norm(train_df_filtered.values, test_df_filtered.values)
+    # remove columns, where there is only one value in either train or test set
+    def _get_set_of_unique_values(df_):
+        return set(df_.columns[df_.nunique() == 1].tolist())
+    train_col_set = _get_set_of_unique_values(train_df)
+    test_col_set = _get_set_of_unique_values(test_df)
+    common_set = list(train_col_set.union(test_col_set))
 
-    d_train_x, _ = downsample(x_train, down_len=5)
-    d_test_x, d_test_labels = downsample(x_test, test_labels, down_len=5)
+    train_df = train_df.drop(common_set, axis=1)
+    test_df = test_df.drop(common_set, axis=1)
 
-    train_df_filtered = pd.DataFrame(d_train_x, columns=train_df_filtered.columns)
-    test_df_filtered = pd.DataFrame(d_test_x, columns=test_df_filtered.columns)
-    test_labels_df = pd.DataFrame(d_test_labels, columns=['labels'])
+    col_names_train = train_df.columns[train_df.nunique() <= 10]
+
+    train_df_filtered, test_df_filtered = train_df, test_df
+    if args.smoothen and False:
+        train_df_filtered, test_df_filtered = filter_transition_df_all(train_df, test_df, args)
+
+    # what normalize?
+    train_df_normalized, test_df_normalized = norm(train_df_filtered, test_df_filtered)
+
+    train_df_filtered, _ = downsample(train_df_normalized, down_len=args.downsample_factor)
+
+    test_df_filtered, test_labels = downsample(test_df_normalized, test_labels,
+                                                    down_len=args.downsample_factor)
+
+    df_test_labels = pd.DataFrame(test_labels, columns=['labels'])
+    train_df_filtered = train_df_filtered.reset_index()
 
     if args_.debug:
-        columns_with_few_uniques = train_df.columns[train_df.nunique() <= 10]
-        viz_before_after_smoothing(
-            train_df_filtered[columns_with_few_uniques],
-            train_df[columns_with_few_uniques],
-            step_size = 10000//5
+        df_comparison_num_critical_features = pd.DataFrame({
+            'before': train_df[col_names_train].nunique(),
+            'after': train_df_filtered[col_names_train].nunique(),
+        })
+
+        print(df_comparison_num_critical_features)
+
+        visualize_comparison(
+            train_df_filtered[col_names_train],
+            train_df[col_names_train].iloc[::10].reset_index().drop(['index'], axis=1),
+            step_size = 200
         )
 
     # implemented as [Deng and Hooi, 2021]; they say to ignore the first 2160
@@ -170,9 +209,16 @@ def main(args):
         np.save(os.path.join(path_, f'{file_}.npy'), df_.to_numpy())
 
     if not args.debug:
-        store_file(train_df_filtered, f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/', 'train')
-        store_file(test_df_filtered, f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/', 'test')
-        store_file(test_labels_df, f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/', 'labels')
+        path_ = f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/'
+        if args.make_validation_set:
+            df_len = train_df_filtered.shape[0]
+            train_split = int(0.9 * df_len)
+            store_file(train_df_filtered.iloc[:train_split], path_, 'train')
+            store_file(train_df_filtered.iloc[train_split:], path_, 'val')
+        else:
+            store_file(train_df_filtered, path_, 'train')
+        store_file(test_df_filtered, path_, 'test')
+        store_file(df_test_labels, path_, 'labels')
 
         with open(f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/list.txt', 'w') as f:
             for col in train_df.columns:
