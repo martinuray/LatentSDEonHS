@@ -105,7 +105,7 @@ class ADData(object):
 
     @property
     def val_file(self):
-        return None
+        return 'val.pt'
 
     @property
     def destination_file(self):
@@ -151,9 +151,12 @@ class ADData(object):
             # TODO: otherwise issue when normalizing
             #raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)]
             self.params = list(raw_data_df.columns)
+            if 'index' in self.params:
+                self.params.remove('index')
         else:
             self.params = columns
-            raw_data_df = raw_data_df.loc[:, self.params]
+
+        raw_data_df = raw_data_df.loc[:, self.params]
 
         # normalize data
         raw_data_df = self.normalize_data(raw_data_df)
@@ -314,9 +317,10 @@ class ADData(object):
             machine = file_.split('/')[-1].replace('.txt', '')
             data[machine] = {}
             data[machine]['train'] = None
+            data[machine]['val'] = None
             data[machine]['test'] = None
             data[machine]['labels'] = None
-            if self.mode == 'train':
+            if self.mode in ['train', 'val']:
                 data[machine]['train'] = pd.read_csv(file_, delimiter=',', header=None)
             elif self.mode == 'test':
                 data[machine]['test'] = pd.read_csv(file_, delimiter=',', header=None)
@@ -344,6 +348,12 @@ class ADDataset(Dataset):
 
         objs['test'] = ADData(
             data_dir, mode='test', data_kind=data_kind,
+            window_length=window_length, window_overlap=window_overlap,
+            columns=objs['train'].params, n_samples=n_samples,
+            normalizer=objs['train'].scaler)
+
+        objs['val'] = ADData(
+            data_dir, mode='val', data_kind=data_kind,
             window_length=window_length, window_overlap=window_overlap,
             columns=objs['train'].params, n_samples=n_samples,
             normalizer=objs['train'].scaler)
@@ -446,6 +456,11 @@ class ADProvider(DatasetProvider):
             n_samples=n_samples,
             data_normalization_strategy=data_normalization_strategy)
 
+        self._ds_val = ADDataset(data_dir, 'val', data_kind=dataset,
+            window_length=window_length, window_overlap=window_overlap,
+            n_samples=n_samples,
+            data_normalization_strategy=data_normalization_strategy)
+
         #scaler = self._ds_trn.fit_normalizer()
         #self._ds_trn.normalizer_transform(scaler)
         #self._ds_tst.normalizer_transform(scaler)
@@ -478,11 +493,18 @@ class ADProvider(DatasetProvider):
     def num_test_samples(self) -> int:
         return len(self._ds_tst)
 
+    @property
+    def num_val_samples(self) -> int:
+        return len(self._ds_val)
+
     def get_train_loader(self, **kwargs) -> DataLoader:
         return DataLoader(self._ds_trn, **kwargs)
 
     def get_test_loader(self, **kwargs) -> DataLoader:
         return DataLoader(self._ds_tst, **kwargs)
+
+    def get_val_loader(self, **kwargs):
+        return DataLoader(self._ds_val, **kwargs)
 
 
 def create_win_periods(data_, win_size_, win_stride_):

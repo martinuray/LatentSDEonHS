@@ -29,13 +29,14 @@ def downsample(data_df, labels=None, down_len:int=10):
     Returns:
 
     """
+    return data_df, labels
     np_data = np.array(data_df)
     orig_len, col_num = np_data.shape
 
     down_time_len = orig_len // down_len
 
     # see [Deng and Hooi, 2021]
-    d_data = data_df.groupby(data_df.index // 10).median()
+    d_data = data_df #.groupby(data_df.index // 10).median()
 
     d_labels = None
     if labels is not None:

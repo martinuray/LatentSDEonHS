@@ -22,6 +22,7 @@ import torch.optim as optim
 
 from scipy.stats import iqr
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
@@ -62,10 +63,31 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
-def stats2tensorboard(stats_, writer_, epoch_, prefix_=''):
-    for key_, value_ in stats_.items():
-        if value_ is not None:
-            writer_.add_scalar(f'{prefix_}{key_}', value_, epoch_)
+def stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch):
+    # trn_stats, val_stats, tst_stats, epoch
+    trn_keys, tst_keys = set(trn_stats.keys()), set(tst_stats.keys())
+    val_keys = set(val_stats.keys()) if val_stats else {}
+
+    key_intersection = trn_keys.intersection(tst_keys)
+    if val_stats:
+        key_intersection = key_intersection.intersection(val_keys)
+
+    for key_ in key_intersection:
+        writer.add_scalar(f'{key_}/trn', trn_stats[key_], epoch)
+        writer.add_scalar(f'{key_}/tst', tst_stats[key_], epoch)
+        if val_stats:
+            writer.add_scalar(f'{key_}/val', val_stats[key_], epoch)
+
+    non_intersecting_stats2tensorboard(trn_stats, key_intersection, 'trn', writer, epoch)
+    non_intersecting_stats2tensorboard(tst_stats, key_intersection, 'tst', writer, epoch)
+    if val_stats:
+        non_intersecting_stats2tensorboard(val_stats, key_intersection, 'val', writer, epoch)
+
+
+def non_intersecting_stats2tensorboard(stats, keys_intersected, prefix, writer, epoch):
+    keys_non_intersected = set(stats.keys()) - keys_intersected
+    for key_ in keys_non_intersected:
+        writer.add_scalar(f'{prefix}/{key_}', stats[key_], epoch)
 
 def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     f1, f1_ts = 0, 0
@@ -371,11 +393,11 @@ def start_experiment(args, provider=None):
     stats = defaultdict(list)
     stats_mask = {
         "trn": ["log_pxz", "kl0", "klp", "loss"],
-        "tst": ["loss", "prec", "rec", "f1"],
+        "tst": ["loss", "prec", "rec", "f1", "auc", "auprc"],
         "oth": ["lr"],
     }
     if use_validation:
-        stats_mask["val"] = ["loss", "aux_val", "aux_log_prob"]
+        stats_mask["val"] = stats_mask['trn']
 
     pm = ProgressMessage(stats_mask)
 
@@ -405,11 +427,13 @@ def start_experiment(args, provider=None):
                              normalization_stats=normalization_scores,
                              epoch=epoch)
 
+        val_stats = None
         if use_validation:
             val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t,
                                  args.device,
                                  normalization_stats=normalization_scores,
-                                 epoch=epoch)
+                                 epoch=epoch,
+                                 test=False)
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
@@ -427,14 +451,11 @@ def start_experiment(args, provider=None):
         # tst_stats["aux_val*"] = best_epoch_tst_aux
 
         stats["trn"].append(trn_stats)
-        stats2tensorboard(trn_stats, writer, epoch, prefix_='trn')
-
         stats["tst"].append(tst_stats)
-        stats2tensorboard(tst_stats, writer, epoch, prefix_='tst')
-
         if use_validation:
             stats["val"].append(val_stats)
-            stats2tensorboard(val_stats, writer, epoch, prefix_='val')
+
+        stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
             save_checkpoint(
@@ -469,6 +490,7 @@ def evaluate(
     device: str,
     normalization_stats=None,
     epoch: int = 1,
+    test=True,
 ):
     stats = defaultdict(list)
 
@@ -542,11 +564,14 @@ def evaluate(
     all_scores = (all_scores.T / normalize_counts).T
 
     #if epoch % 10 == 0:
-    best_metrics = logprob2f1s(all_scores, all_labels)
-    best_metrics.set_index(best_metrics.columns[0], inplace=True)
-    stats['f1'] = best_metrics.loc["F1", "point_wise"]
-    stats['prec'] = best_metrics.loc["Precision", "point_wise"]
-    stats['rec'] = best_metrics.loc["Recall", "point_wise"]
+    if test:
+        best_metrics = logprob2f1s(all_scores, all_labels)
+        best_metrics.set_index(best_metrics.columns[0], inplace=True)
+        stats['f1'] = best_metrics.loc["F1", "point_wise"]
+        stats['prec'] = best_metrics.loc["Precision", "point_wise"]
+        stats['rec'] = best_metrics.loc["Recall", "point_wise"]
+        stats['auc'] = roc_auc_score(all_labels, all_scores.mean(1))
+        stats['auprc'] = average_precision_score(all_labels, all_scores.mean(1))
     return stats
 
 

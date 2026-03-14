@@ -153,7 +153,7 @@ def minmax_scale_traces(smd_train, smd_test):
 
 
 #%% load Swat data
-swat_train = pd.read_csv('data_dir/SWaT/raw/train.csv')
+swat_train = pd.read_csv('data_dir/SWaT/raw/train.csv').drop('index', axis=1)
 swat_test = pd.read_csv('data_dir/SWaT/raw/test.csv')
 swat_labels = pd.read_csv('data_dir/SWaT/raw/labels.csv').to_numpy().squeeze()#[:,1]
 
