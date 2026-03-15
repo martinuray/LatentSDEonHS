@@ -336,8 +336,11 @@ class ADDataset(Dataset):
     input_dim = None  # nr. of different measurements per time point
     
     def __init__(self, data_dir: str, mode: str='train', data_kind: str=None,
-                 window_length: int=100, window_overlap:float = 0.75,
+                 window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
                  n_samples: int=None, data_normalization_strategy:str="none"):
+
+        self.mode = mode
+        self.subsample=subsample
 
         objs = dict()
         objs['train'] = ADData(
@@ -406,9 +409,14 @@ class ADDataset(Dataset):
         return len(self.evd_obs)
 
     def __getitem__(self, idx):
+        if self.mode == 'train':
+            msk = (torch.rand(self.inp_msk[idx].shape) < self.subsample).to(torch.int).long()
+        else:
+            msk = self.inp_msk[idx].long()
+
         inp_and_evd = {
             'inp_obs' : self.inp_obs[idx].float(),
-            'inp_msk' : self.inp_msk[idx].long(),
+            'inp_msk' : msk,
             'inp_tid' : self.inp_tid[idx].long(),
             'inp_tps' : self.inp_tps[idx].float(),
             'evd_obs' : self.evd_obs[idx].float(),
@@ -435,7 +443,7 @@ class ADDataset(Dataset):
 class ADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset=None, window_length:int = 100,
                  window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None,
-                 data_normalization_strategy:str="none"):
+                 data_normalization_strategy:str="none", subsample=1.0):
         DatasetProvider.__init__(self)
 
         if dataset not in ["SWaT", "WaDi", "SMD"]:
@@ -447,7 +455,7 @@ class ADProvider(DatasetProvider):
         self._ds_trn = ADDataset(
             data_dir, 'train', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
-            n_samples=n_samples,
+            n_samples=n_samples, subsample=subsample,
             data_normalization_strategy=data_normalization_strategy)
 
         self._ds_tst = ADDataset(
@@ -458,7 +466,7 @@ class ADProvider(DatasetProvider):
 
         self._ds_val = ADDataset(data_dir, 'val', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
-            n_samples=n_samples,
+            n_samples=n_samples, subsample=subsample,
             data_normalization_strategy=data_normalization_strategy)
 
         #scaler = self._ds_trn.fit_normalizer()

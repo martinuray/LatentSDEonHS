@@ -54,6 +54,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument("--subsample", type=float, default=0.1)
     group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
     group.add_argument("--dec-hidden-dim", type=int, default=64)
@@ -293,6 +294,7 @@ def start_experiment(args, provider=None):
                 data_dir='data_dir', dataset=args.dataset,
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
                 n_samples=1000 if args.debug else None,
+                subsample=args.subsample,
                 data_normalization_strategy=args.data_normalization_strategy
             )
         elif args.dataset == 'aero':
