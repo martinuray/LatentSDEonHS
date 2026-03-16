@@ -178,15 +178,30 @@ def main(args):
     # stabilizing state; 2160 equals the subsampled duration of 6 hours
     train_df_filtered = train_df_filtered.iloc[2160:]
 
+    # TODO
+    #if "WaDi" in self.data_kind:
+    #    logging.info(f"Limiting WaDi Dataset to {60_000} samples, as per reference")
+    #    # done as with QuoVadis, see
+    #    # https://github.com/ssarfraz/QuoVadisTAD/blob/8e2de5a1574d1f8b2b669e2aa81a34fd92bd5b58/quovadis_tad/model_utils/model_def.py#L55
+    #    raw_data_df = raw_data.iloc[:60_000]
+
     def reshape_data(data, window_length):
         data_np = data.to_numpy()
         mod = data_np.shape[0] % window_length
-        data_np = data_np[:-mod, 1:]  # to ignore index col
-        return data_np.reshape(-1, window_length, data_np.shape[1])
+        if 'labels' in data.columns:
+            # only for labels
+            data_np = data_np.squeeze()[:-mod]  # to ignore index col
+            shaped = data_np.reshape(-1, window_length)
+        else:
+            # to ignore index col
+            data_np = data_np[:-mod, 1:]
+            shaped = data_np.reshape(-1, window_length, data_np.shape[1])
+        return shaped
 
     # process further
     train_np = reshape_data(train_df_filtered, args.window_length)
     test_np = reshape_data(test_df_filtered, args.window_length)
+    labels_np = reshape_data(df_test_labels, args.window_length)
 
 
     def store_file(data, path_, file_):
@@ -207,7 +222,7 @@ def main(args):
         else:
             store_file(train_np, path_, 'train')
         store_file(test_np, path_, 'test')
-        store_file(df_test_labels.to_numpy(), path_, 'labels')
+        store_file(labels_np, path_, 'labels')
 
         with open(f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/list.txt', 'w') as f:
             for col in train_df.columns:
