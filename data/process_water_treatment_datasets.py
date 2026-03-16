@@ -157,7 +157,7 @@ def main(args):
                                                     down_len=args.downsample_factor)
 
     df_test_labels = pd.DataFrame(test_labels, columns=['labels'])
-    train_df_filtered = train_df_filtered.reset_index()
+    #train_df_filtered = train_df_filtered.reset_index()
 
     if args_.debug:
         df_comparison_num_critical_features = pd.DataFrame({
