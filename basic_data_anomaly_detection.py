@@ -100,7 +100,7 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
 
     param2store = ['lr', 'kl0_weight', 'klp_weight', 'pxz_weight', 'z_dim',
                    'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder',
-                   'dataset', 'n_dec_layers']
+                   'dataset', 'n_dec_layers', 'subsample', 'freeze-sigma', 'initial_sigma']
 
     params_ = {key: value for key, value in params_.items() if key in param2store}
 
@@ -151,7 +151,7 @@ def get_results_for_all_score_normalizations(
     df_list = []
     f1_scores = []
     normalisations = ["median-iqr", "mean-std", None]
-    aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
+    aggregation_strategies = ["l2"]  # ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
 
     for n in normalisations:
         normed_scores = normalise_scores(scores, norm=n, smooth=True)

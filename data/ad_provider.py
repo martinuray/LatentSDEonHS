@@ -76,9 +76,9 @@ class ADData(object):
         if self.data_kind == "SMD": # TODO: maybe a bit more love
             return os.path.isdir(os.path.join(self.raw_folder, self.mode))
 
-        return os.path.isfile(os.path.join(self.raw_folder, 'train.csv')) and \
-            os.path.isfile(os.path.join(self.raw_folder, 'test.csv')) and \
-            os.path.isfile(os.path.join(self.raw_folder, 'labels.csv'))
+        return os.path.isfile(os.path.join(self.raw_folder, 'train.npy')) and \
+            os.path.isfile(os.path.join(self.raw_folder, 'test.npy')) and \
+            os.path.isfile(os.path.join(self.raw_folder, 'labels.npy'))
                 
     def _check_exists(self):
         if self.data_kind == "SMD": # TODO: maybe a bit more love
@@ -144,64 +144,22 @@ class ADData(object):
 
     def _process_water_treatment_data(self, columns=None, n_samples=None):
         logging.warning("Processing Water Treatment Data")
-        raw_data_df = pd.read_csv(
-            os.path.join(self.raw_folder, f'{self.mode}.csv'),
-            delimiter=',')
-        if columns is None:
-            # TODO: otherwise issue when normalizing
-            #raw_data_df = raw_data_df.loc[:, (raw_data_df.nunique() > 1)]
-            self.params = list(raw_data_df.columns)
-            if 'index' in self.params:
-                self.params.remove('index')
-        else:
-            self.params = columns
-
-        raw_data_df = raw_data_df.loc[:, self.params]
-
-        # normalize data
-        raw_data_df = self.normalize_data(raw_data_df)
-        if "WaDi" in self.data_kind:
-            logging.info(f"Limiting WaDi Dataset to {60_000} samples, as per reference")
-            # done as with QuoVadis, see
-            # https://github.com/ssarfraz/QuoVadisTAD/blob/8e2de5a1574d1f8b2b669e2aa81a34fd92bd5b58/quovadis_tad/model_utils/model_def.py#L55
-            raw_data_df = raw_data_df.iloc[:60_000]
-
-#        if self.mode == 'test':
-#            added_ = np.zeros(((self.max_signal_length - raw_data_df.shape[
-#                0]) % self.max_signal_length, raw_data_df.shape[1]))
-#            raw_data = np.vstack((raw_data_df, added_)).copy()
-#            raw_data = raw_data.reshape(-1, self.max_signal_length,
-#                                        raw_data.shape[1])
-
-#            # TODO take care that no overlapping windows are taken
-#            self.targets = pd.read_csv(
-#                os.path.join(self.raw_folder, f'labels.csv'))
-#            self.targets = np.array(self.targets.values)
-#            self.targets = np.hstack((self.targets.squeeze(), added_[:, 0]))
-#            self.targets = self.targets.reshape(-1, self.max_signal_length)
-#        else:
-#            raw_data = raw_data_df.copy()
-#            start_idcs, raw_data = create_win_periods(
-#                raw_data, self.max_signal_length,
-#                int(self.max_signal_length * (1-self.overlapping_windows)))
-
-#            self.targets = np.zeros(raw_data.shape[0:2])
+        raw_data = np.load(os.path.join(self.raw_folder, f'{self.mode}.npy'))
 
         # temp stuff
-        raw_data = raw_data_df.copy()
-        indcs, raw_data = create_win_periods(raw_data, self.max_signal_length,
-                                             int(self.max_signal_length * (1 - self.overlapping_windows)))
+        #raw_data = raw_data_df.copy()
+        #indcs, raw_data = create_win_periods(raw_data, self.max_signal_length,
+        #                                     int(self.max_signal_length * (1 - self.overlapping_windows)))
+        indcs = np.arange(0, raw_data.shape[1])
 
         if self.mode == 'test':
-            self.targets = pd.read_csv(
-                os.path.join(self.raw_folder, f'labels.csv'))
-            self.targets = np.array(self.targets.values)
-            start_idcs_tgt, self.targets = create_win_periods(self.targets, self.max_signal_length,
-                                              int(self.max_signal_length * (1 - self.overlapping_windows)))
+            self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'))
+            #start_idcs_tgt, self.targets = create_win_periods(self.targets, self.max_signal_length,
+            #                                  int(self.max_signal_length * (1 - self.overlapping_windows)))
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
 
-        self.params_dict = {k: i for i, k in enumerate(self.params)}
+        #self.params_dict = {k: i for i, k in enumerate(self.params)}
         indcs = torch.Tensor(indcs)
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
@@ -225,9 +183,8 @@ class ADData(object):
 
         assert data_tensor.shape[0] == mask.shape[0]
 
-        data = [(part_idx, indcs[part_idx], data_tensor[part_idx, :, :],
-                 mask[part_idx, :, :]) for part_idx in
-                range(mask.shape[0])]
+        data = [(part_idx, indcs+(indcs.shape[0]*part_idx), data_tensor[part_idx, :, :],
+                 mask[part_idx, :, :]) for part_idx in range(mask.shape[0])]
 
         torch.save(data, os.path.join(self.processed_folder, self.destination_file))
         if self.mode == 'test':
