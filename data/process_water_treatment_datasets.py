@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tqdm
-from scipy.signal import savgol_filter
 from sklearn.preprocessing import MinMaxScaler
 
 
@@ -59,38 +58,14 @@ def get_parser():
     parser.add_argument("--downsample-factor", type=int, default=5)
     parser.add_argument("--savgol-polyorder", type=int, default=2)
     parser.add_argument("--savgol-window-length", type=int, default=300)
+    parser.add_argument("--window-length", type=int, default=100)
+    parser.add_argument("--window-overlap", type=float, default=0)
+    parser.add_argument("--validation-split", type=float, default=0.1)
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--smoothen", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--make-validation-set", action=argparse.BooleanOptionalAction, default=False)
     arguments_ = parser.parse_args()
     return arguments_
-
-
-def filter_transition_df(df_, args_):
-    df_ = df_.astype(np.float32)
-    df_ = savgol_filter(df_.to_numpy(), axis=0,
-                        window_length=args_.savgol_window_length,
-                        polyorder=args_.savgol_polyorder).round(3)
-    return df_
-
-
-def filter_transition_df_all(train_df, test_df, args_):
-    # now, lets soften the transition in step, non-differentiable transitions
-    # Get columns with 10 or fewer unique values
-    columns_with_few_uniques = train_df.columns[train_df.nunique() <= 10]
-
-    # Select only those columns from the dataframe
-    df_train_few_uniques_filtered = train_df[columns_with_few_uniques]
-    df_test_few_uniques_filtered = test_df[columns_with_few_uniques]
-
-    df_train_few_uniques_filtered_softened = filter_transition_df(df_train_few_uniques_filtered.copy(), args_)
-    df_test_few_uniques_filtered_softened = filter_transition_df(df_test_few_uniques_filtered.copy(), args_)
-
-    train_df_r, test_df_r = train_df.copy(), test_df.copy()
-    train_df_r[columns_with_few_uniques] = df_train_few_uniques_filtered_softened
-    test_df_r[columns_with_few_uniques] = df_test_few_uniques_filtered_softened
-
-    return train_df_r, test_df_r
 
 
 def visualize_comparison(after_transform=None, before_transform=None,
@@ -172,8 +147,6 @@ def main(args):
     col_names_train = train_df.columns[train_df.nunique() <= 10]
 
     train_df_filtered, test_df_filtered = train_df, test_df
-    if args.smoothen and False:
-        train_df_filtered, test_df_filtered = filter_transition_df_all(train_df, test_df, args)
 
     # what normalize?
     train_df_normalized, test_df_normalized = norm(train_df_filtered, test_df_filtered)
@@ -205,21 +178,36 @@ def main(args):
     # stabilizing state; 2160 equals the subsampled duration of 6 hours
     train_df_filtered = train_df_filtered.iloc[2160:]
 
-    def store_file(df_, path_, file_):
-        df_.to_csv(os.path.join(path_, f'{file_}.csv'), index=False)
-        np.save(os.path.join(path_, f'{file_}.npy'), df_.to_numpy())
+    def reshape_data(data, window_length):
+        data_np = data.to_numpy()
+        mod = data_np.shape[0] % window_length
+        data_np = data_np[:-mod, 1:]  # to ignore index col
+        return data_np.reshape(-1, window_length, data_np.shape[1])
+
+    # process further
+    train_np = reshape_data(train_df_filtered, args.window_length)
+    test_np = reshape_data(test_df_filtered, args.window_length)
+
+
+    def store_file(data, path_, file_):
+        os.makedirs(path_, exist_ok=True)
+        #df_.to_csv(os.path.join(path_, f'{file_}.csv'), index=False)
+        np.save(os.path.join(path_, f'{file_}.npy'), data)
 
     if not args.debug:
         path_ = f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/'
         if args.make_validation_set:
-            df_len = train_df_filtered.shape[0]
-            train_split = int(0.9 * df_len)
-            store_file(train_df_filtered.iloc[:train_split], path_, 'train')
-            store_file(train_df_filtered.iloc[train_split:], path_, 'val')
+            df_len = train_np.shape[0]
+            indices = np.random.permutation(df_len)
+            val_indices = indices[:int(df_len * args.validation_split)]
+            train_indices = indices[int(df_len * args.validation_split):]
+
+            store_file(train_np[train_indices], path_, 'train')
+            store_file(train_np[val_indices], path_, 'val')
         else:
-            store_file(train_df_filtered, path_, 'train')
-        store_file(test_df_filtered, path_, 'test')
-        store_file(df_test_labels, path_, 'labels')
+            store_file(train_np, path_, 'train')
+        store_file(test_np, path_, 'test')
+        store_file(df_test_labels.to_numpy(), path_, 'labels')
 
         with open(f'data_dir/{args.dataset.replace("v1", "").replace("v2", "")}/raw/list.txt', 'w') as f:
             for col in train_df.columns:
