@@ -138,47 +138,41 @@ def get_results_for_all_score_normalizations(
         scores: np.ndarray,
         test_labels: np.ndarray):
 
-    # get score under all three normalizations
+    # Options
+    #normalisations = ["median-iqr", "mean-std", None] # TODO: then for better performance in the end ?
+    normalisations = ["median-iqr"]
+    #aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"] # TODO: then for better performance in the end
+    aggregation_strategies = ["l1"]
+
+    AGG_STRATEGIES = {
+        'l1': lambda x: np.linalg.norm(x, ord=1, axis=1),
+        'l2': lambda x: np.linalg.norm(x, ord=2, axis=1),
+        'linfty': lambda x: np.linalg.norm(x, ord=np.inf, axis=1),
+        'mean': lambda x: x.mean(1),
+        'max': lambda x: x.max(1),
+        'median': lambda x: np.median(x, axis=1),
+        'p75': lambda x: np.percentile(x, 75, axis=1),
+        'p95': lambda x: np.percentile(x, 95, axis=1),
+    }
+
+    agg_scores = {}
     df_list = []
-    f1_scores = []
-    normalisations = ["median-iqr", "mean-std", None]
-    aggregation_strategies = ["l2"]  # ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
 
     for n in normalisations:
         normed_scores = normalise_scores(scores, norm=n, smooth=True)
+        n_key = n if n is not None else 'no'
 
         for aggregation_strategy in aggregation_strategies:
-            if aggregation_strategy == 'l1':
-                # manhatten norm: basically the sum
-                normed_agg_scores = np.linalg.norm(normed_scores, ord=1, axis=1)
-            elif aggregation_strategy == 'l2':
-                # euclidean norm: sqrt(sum(x^2))
-                normed_agg_scores = np.linalg.norm(normed_scores, ord=2, axis=1)
-            elif aggregation_strategy == 'linfty':
-                # infinity norm: max(abs(x))
-                normed_agg_scores = np.linalg.norm(normed_scores, ord=np.inf, axis=1)
-            elif aggregation_strategy == 'mean':
-                normed_agg_scores = normed_scores.mean(1)
-            elif aggregation_strategy == 'max':
-                normed_agg_scores = normed_scores.max(1)
-            elif aggregation_strategy == 'median':
-                normed_agg_scores = np.median(normed_scores, axis=1)
-            elif aggregation_strategy == 'p75':
-                normed_agg_scores = np.percentile(normed_scores, 75, axis=1)
-            elif aggregation_strategy == 'p95':
-                normed_agg_scores = np.percentile(normed_scores, 95, axis=1)
+            normed_agg_scores = AGG_STRATEGIES[aggregation_strategy](normed_scores)
+            r, d = get_ts_eval(normed_agg_scores, test_labels.flatten())
 
-            r, d = get_ts_eval(
-                normed_agg_scores,
-                test_labels.flatten()
-            )
+            agg_scores[(aggregation_strategy, n_key)] = r['f1']
+            df_list.append((n_key, (aggregation_strategy, d)))
 
-            f1_scores.append(r['f1'])
-            if n is None:
-                n = 'no'
-            df_list.append((n, (aggregation_strategy, d)))
-    best_score_idx = np.array(f1_scores).argmax()
-    return dict(df_list), df_list[best_score_idx][1][1]
+    best_strategy = max(agg_scores, key=agg_scores.get)
+    logging.debug(f"Best score through {best_strategy[0]} and {best_strategy[1]}: {agg_scores[best_strategy]}")
+    best_idx = next(i for i, (n, (s, _)) in enumerate(df_list) if (s, n) == best_strategy)
+    return dict(df_list), df_list[best_idx][1][1]
 
 
 def get_ts_eval(scores, targets):
@@ -563,8 +557,8 @@ def evaluate(
         stats['f1'] = best_metrics.loc["F1", "point_wise"]
         stats['prec'] = best_metrics.loc["Precision", "point_wise"]
         stats['rec'] = best_metrics.loc["Recall", "point_wise"]
-        stats['auc'] = roc_auc_score(all_labels, all_scores.mean(1))
-        stats['auprc'] = average_precision_score(all_labels, all_scores.mean(1))
+        stats['auc'] = best_metrics.loc["AUROC", "point_wise"] #roc_auc_score(all_labels, all_scores.mean(1))
+        stats['auprc'] = best_metrics.loc["AUPRC", "point_wise"] #average_precision_score(all_labels, all_scores.mean(1))
     return stats
 
 
