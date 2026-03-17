@@ -5,40 +5,31 @@
     NeurIPS 2023
 """
 
-import datetime
-import os
-import logging
 import argparse
-import shutil
-
-import numpy as np
-from random import SystemRandom
+import datetime
+import logging
+import os
 from collections import defaultdict
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 from scipy.stats import iqr
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
-from data.ad_provider import ADProvider
 from core.models import (
     PathToGaussianDecoder,
     ELBO,
     default_SOnPathDistributionEncoder,
     PhysioNetRecogNetwork, GenericMLP,
 )
-
 from core.training import generic_train
+from data.ad_provider import ADProvider
 from data.aero_provider import AeroDataProvider
-from data.imm_provider import IMMProvider
-from notebooks.utils.analyze import batch_get_log_prob
-from utils.anomaly_detection import anomaly_detection_performances
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
