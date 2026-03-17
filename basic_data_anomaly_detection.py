@@ -245,6 +245,9 @@ def start_experiment(args, provider=None):
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
 
+    best_auc = 0.0
+    best_stats = None
+
     if args.debug:
         args.n_epochs = 1
 
@@ -414,6 +417,10 @@ def start_experiment(args, provider=None):
                              normalization_stats=normalization_scores,
                              epoch=epoch)
 
+        if tst_stats["auc"] > best_auc:
+            best_stats = tst_stats
+
+
         val_stats = None
         if use_validation:
             val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t,
@@ -466,6 +473,7 @@ def start_experiment(args, provider=None):
 
     logging.shutdown()
     writer.close()
+    return best_stats
 
 
 def evaluate(
@@ -566,7 +574,7 @@ def main():
     parser = extend_argparse(generic_parser)
     args_ = parser.parse_args()
     print(args_)
-    start_experiment(args_, provider=None)
+    _ = start_experiment(args_, provider=None)
 
 
 if __name__ == "__main__":
