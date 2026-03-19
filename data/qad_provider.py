@@ -23,17 +23,18 @@ from data.dataset_provider import DatasetProvider
 from data.process_water_treatment_datasets import reshape_data
 
 
-class QADData(object):
+class QADData:
 
     params = None
     labels = None
-    params_dict, labels_dict = None, None
+    params_dict = None
+    labels_dict = None
 
     def __init__(
             self, root_path, dataset_number=1, mode='train',
-            window_length:int = 100, window_overlap: float = 0.0,
+            window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
-            data_normalization_strategy:str="none"
+            data_normalization_strategy: str = "none"
     ):
 
         self.scaler = normalizer
@@ -49,14 +50,10 @@ class QADData(object):
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
 
-        if not self._check_exists(): # does raw exist?
+        if not self._check_exists():
             if not self._check_exist_raw_data():
                 raise RuntimeError('Dataset not found.')
-
-            if not self._check_exists():
-                self._process_QAD_data()
-            else:
-                raise NotImplementedError
+            self._process_QAD_data()
 
         self.data = torch.load(os.path.join(self.processed_folder, self.destination_file), weights_only=False)
 
@@ -67,13 +64,14 @@ class QADData(object):
     def _check_exist_raw_data(self):
         os.makedirs(self.raw_folder, exist_ok=True)
         os.makedirs(self.processed_folder, exist_ok=True)
-        print(os.path.join(self.raw_folder, f'train_{self.dataset_number}.pkl') ,
-            os.path.join(self.raw_folder, f'test_{self.dataset_number}.pkl') ,
-            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl'))
 
-        return os.path.isfile(os.path.join(self.raw_folder, f'train_{self.dataset_number}.pkl')) and \
-            os.path.isfile(os.path.join(self.raw_folder, f'test_{self.dataset_number}.pkl')) and \
-            os.path.isfile(os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl'))
+        required_files = [
+            os.path.join(self.raw_folder, f'train_{self.dataset_number}.pkl'),
+            os.path.join(self.raw_folder, f'test_{self.dataset_number}.pkl'),
+            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl')
+        ]
+
+        return all(os.path.isfile(f) for f in required_files)
                 
     def _check_exists(self):
         return os.path.isfile(os.path.join(
@@ -82,8 +80,7 @@ class QADData(object):
 
     @property
     def raw_folder(self):
-        return os.path.join(self.root_path, "QAD", f'raw/qad_clean_pkl_{self.ds_hz}'
-                                                   f'Hz/')
+        return os.path.join(self.root_path, "QAD", f'raw/qad_clean_pkl_{self.ds_hz}Hz/')
 
     @property
     def processed_folder(self):
@@ -107,11 +104,12 @@ class QADData(object):
 
     @property
     def destination_file(self):
-        if self.mode == 'train':
-            return self.training_file
-        if self.mode == 'test':
-            return self.test_file
-        return self.val_file
+        mode_to_file = {
+            'train': self.training_file,
+            'test': self.test_file,
+            'val': self.val_file
+        }
+        return mode_to_file.get(self.mode, self.val_file)
 
     def __getitem__(self, index):
         return self.data[index]
@@ -123,14 +121,15 @@ class QADData(object):
         return self.labels[record_id]
 
     def normalize_data(self, data_):
-        if self.scaler is None:
-            if self.data_normalization_strategy != "none":
-                assert self.data_normalization_strategy in ["std", "min-max"]
-                if self.data_normalization_strategy == "std":
-                    self.scaler = StandardScaler()
-                else:
-                    self.scaler = MinMaxScaler(feature_range=(0, 1))
-                self.scaler.fit(data_)
+        if self.scaler is None and self.data_normalization_strategy != "none":
+            if self.data_normalization_strategy not in ["std", "min-max"]:
+                raise ValueError(f"Invalid normalization strategy: {self.data_normalization_strategy}")
+
+            if self.data_normalization_strategy == "std":
+                self.scaler = StandardScaler()
+            else:
+                self.scaler = MinMaxScaler(feature_range=(0, 1))
+            self.scaler.fit(data_)
 
         if self.scaler is not None:
             data_ = self.scaler.transform(data_)
@@ -146,8 +145,6 @@ class QADData(object):
             self.targets = reshape_data(self.targets, self.window_length)
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
-
-        #self.params_dict = {k: i for i, k in enumerate(self.params)}
 
         indcs = torch.arange(raw_data.shape[1])
         data_tensor = torch.Tensor(raw_data)
@@ -175,14 +172,14 @@ class QADData(object):
         if self.mode == 'train':
             data_len = len(data)
             indices = np.random.permutation(data_len)
-            val_indices = indices[:int(data_len * 0.9)]
-            train_indices = indices[int(data_len * 0.9):]
+            split_idx = int(data_len * 0.9)
+            val_indices = indices[:split_idx]
+            train_indices = indices[split_idx:]
 
             torch.save([data[i] for i in train_indices], os.path.join(self.processed_folder, self.destination_file))
             torch.save([data[i] for i in val_indices], os.path.join(self.processed_folder, self.val_file))
 
-
-        if self.mode == 'test':
+        elif self.mode == 'test':
             torch.save(data, os.path.join(self.processed_folder, self.destination_file))
             torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
 
@@ -192,28 +189,30 @@ class QADDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str='train', dataset_number: int=1,
-                 window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
-                 data_normalization_strategy:str="none"):
+    def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = 1,
+                 window_length: int = 100, window_overlap: float = 0.75, subsample: float = 1.0,
+                 data_normalization_strategy: str = "none"):
 
         self.mode = mode
-        self.subsample=subsample
+        self.subsample = subsample
 
-        objs = dict()
-        objs['train'] = QADData(
+        # Load all datasets to ensure consistent scaling
+        train_data = QADData(
             data_dir, mode='train', dataset_number=dataset_number,
             window_length=window_length, window_overlap=window_overlap,
             data_normalization_strategy=data_normalization_strategy)
 
-        objs['test'] = QADData(
-            data_dir, mode='test', dataset_number=dataset_number,
-            window_length=window_length, window_overlap=window_overlap,
-            normalizer=objs['train'].scaler)
-
-        objs['val'] = QADData(
-            data_dir, mode='val', dataset_number=dataset_number,
-            window_length=window_length, window_overlap=window_overlap,
-            normalizer=objs['train'].scaler)
+        objs = {
+            'train': train_data,
+            'test': QADData(
+                data_dir, mode='test', dataset_number=dataset_number,
+                window_length=window_length, window_overlap=window_overlap,
+                normalizer=train_data.scaler),
+            'val': QADData(
+                data_dir, mode='val', dataset_number=dataset_number,
+                window_length=window_length, window_overlap=window_overlap,
+                normalizer=train_data.scaler)
+        }
 
         data = objs[mode]
 
@@ -242,15 +241,14 @@ class QADDataset(Dataset):
 
         self.num_timepoints = tps.shape[1]
 
-        self.inp_obs = obs.float() # obs_new
-        self.inp_obs = (obs * msk).float()# obs_new
-        self.inp_msk = msk.long() #obs_msk
+        self.inp_obs = (obs * msk).float()
+        self.inp_msk = msk.long()
         self.inp_tps = tps
-        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long() #tid_new.long()
+        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long()
         self.indcs = indcs
 
         self.evd_msk = torch.ones_like(self.inp_msk).long()
-        self.evd_tid = self.inp_tid.long() #all_idx.repeat(self.tps.shape[0], 1).long()
+        self.evd_tid = self.inp_tid.long()
         self.evd_tps = tps
         self.evd_obs = obs.float()
         self.aux_tgt = tgt.long()
@@ -264,23 +262,22 @@ class QADDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.mode == 'train':
-            msk = (torch.rand(self.inp_msk[idx].shape) < self.subsample).to(torch.int).long()
+            msk = (torch.rand(self.inp_msk[idx].shape) < self.subsample).long()
         else:
             msk = self.inp_msk[idx].long()
 
-        inp_and_evd = {
-            'inp_obs' : self.inp_obs[idx].float(),
-            'inp_msk' : msk,
-            'inp_tid' : self.inp_tid[idx].long(),
-            'inp_tps' : self.inp_tps[idx].float(),
-            'evd_obs' : self.evd_obs[idx].float(),
-            'evd_msk' : self.evd_msk[idx].long(),
-            'evd_tid' : self.evd_tid[idx].long(),
-            'evd_tps' : self.evd_tps[idx].float(),
-            'aux_tgt' : self.aux_tgt[idx].long(),
-            'inp_indcs' : self.indcs[idx]
-            }
-        return inp_and_evd
+        return {
+            'inp_obs': self.inp_obs[idx].float(),
+            'inp_msk': msk,
+            'inp_tid': self.inp_tid[idx].long(),
+            'inp_tps': self.inp_tps[idx].float(),
+            'evd_obs': self.evd_obs[idx].float(),
+            'evd_msk': self.evd_msk[idx].long(),
+            'evd_tid': self.evd_tid[idx].long(),
+            'evd_tps': self.evd_tps[idx].float(),
+            'aux_tgt': self.aux_tgt[idx].long(),
+            'inp_indcs': self.indcs[idx]
+        }
 
     def fit_normalizer(self):
         logging.info("Fitting Standard Scaler")
@@ -295,28 +292,23 @@ class QADDataset(Dataset):
 
 
 class QADProvider(DatasetProvider):
-    def __init__(self, data_dir=None, dataset_number=None, window_length:int = 100,
-                 window_overlap:float = 0.0,
-                 data_normalization_strategy:str="none", subsample=1.0):
-        DatasetProvider.__init__(self)
+    def __init__(self, data_dir=None, dataset_number=None, window_length: int = 100,
+                 window_overlap: float = 0.0,
+                 data_normalization_strategy: str = "none", subsample: float = 1.0):
+        super().__init__()
 
         self._dataset = dataset_number
 
-        self._ds_trn = QADDataset(
-            data_dir, 'train', dataset_number=dataset_number,
-            window_length=window_length, window_overlap=window_overlap,
-            subsample=subsample,
-            data_normalization_strategy=data_normalization_strategy)
+        common_kwargs = {
+            'dataset_number': dataset_number,
+            'window_length': window_length,
+            'window_overlap': window_overlap,
+            'data_normalization_strategy': data_normalization_strategy
+        }
 
-        self._ds_tst = QADDataset(
-            data_dir, 'test', dataset_number=dataset_number,
-            window_length=window_length, window_overlap=window_overlap,
-            data_normalization_strategy=data_normalization_strategy)
-
-        self._ds_val = QADDataset(data_dir, 'val', dataset_number=dataset_number,
-                                  window_length=window_length, window_overlap=window_overlap,
-                                  subsample=subsample,
-                                  data_normalization_strategy=data_normalization_strategy)
+        self._ds_trn = QADDataset(data_dir, 'train', subsample=subsample, **common_kwargs)
+        self._ds_tst = QADDataset(data_dir, 'test', **common_kwargs)
+        self._ds_val = QADDataset(data_dir, 'val', subsample=subsample, **common_kwargs)
 
     @property 
     def input_dim(self):
