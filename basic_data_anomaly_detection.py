@@ -30,6 +30,7 @@ from core.models import (
 from core.training import generic_train
 from data.ad_provider import ADProvider
 from data.aero_provider import AeroDataProvider
+from data.qad_provider import QADProvider
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
@@ -50,8 +51,10 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
+    group.add_argument("--early-stopping-patience", type=int, default=10)
+    group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD"], default="SWaT")
     return parser
 
 
@@ -170,7 +173,7 @@ def get_results_for_all_score_normalizations(
             df_list.append((n_key, (aggregation_strategy, d)))
 
     best_strategy = max(agg_scores, key=agg_scores.get)
-    logging.debug(f"Best score through {best_strategy[0]} and {best_strategy[1]}: {agg_scores[best_strategy]}")
+    #logging.debug(f"Best score through {best_strategy[0]} and {best_strategy[1]}: {agg_scores[best_strategy]}")
     best_idx = next(i for i, (n, (s, _)) in enumerate(df_list) if (s, n) == best_strategy)
     return dict(df_list), df_list[best_idx][1][1]
 
@@ -287,6 +290,8 @@ def start_experiment(args, provider=None):
             )
         elif args.dataset == 'aero':
             provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
+        elif args.dataset == 'QAD':
+            provider = QADProvider(data_dir="data_dir/", dataset_number=3)
         else:
             raise ValueError(f"Unknown dataset {args.dataset}")
     else:
@@ -391,20 +396,13 @@ def start_experiment(args, provider=None):
 
     pm = ProgressMessage(stats_mask)
 
-    best_epoch_val_aux = np.inf
-    best_epoch_tst_aux = np.inf
+    es_counter = 0
+    best_es_loss = np.inf  # the metric early stopping watches
 
     for epoch in range(1, args.n_epochs + 1):
-
         trn_stats = generic_train(
-            args,
-            dl_trn,
-            modules,
-            elbo_loss,
-            None,
-            optimizer,
-            desired_t,
-            args.device
+            args, dl_trn, modules, elbo_loss, None,
+            optimizer, desired_t, args.device
         )
 
         normalization_scores = None
@@ -412,68 +410,61 @@ def start_experiment(args, provider=None):
             normalization_scores = calculate_z_normalization_values(
                 args, dl_trn, modules, desired_t, args.device)
 
-        tst_stats = evaluate(args, dl_tst, modules, elbo_loss, desired_t,
-                             args.device,
-                             normalization_stats=normalization_scores,
-                             epoch=epoch)
+        tst_stats = evaluate(
+            args, dl_tst, modules, elbo_loss, desired_t, args.device,
+            normalization_stats=normalization_scores, epoch=epoch
+        )
+
+        val_stats = evaluate(
+            args, dl_val, modules, elbo_loss, desired_t, args.device,
+            normalization_stats=normalization_scores, epoch=epoch, test=False
+        )
 
         if tst_stats["auc"] > best_auc:
+            best_auc = tst_stats["auc"]
             best_stats = tst_stats
 
-
-        val_stats = None
-        if use_validation:
-            val_stats = evaluate(args, dl_val, modules, elbo_loss, desired_t,
-                                 args.device,
-                                 normalization_stats=normalization_scores,
-                                 epoch=epoch,
-                                 test=False)
+        # --- early stopping check ---
+        es_loss = val_stats["loss"]
+        if es_loss < best_es_loss - args.early_stopping_min_delta:
+            best_es_loss = es_loss
+            es_counter = 0
+        else:
+            es_counter += 1
+            logging.debug(f"Early stopping counter: {es_counter}/{args.early_stopping_patience}")
+            if es_counter >= args.early_stopping_patience:
+                logging.info(f"Early stopping triggered at epoch {epoch}.")
+                # flush final stats before breaking
+                stats["trn"].append(trn_stats)
+                stats["tst"].append(tst_stats)
+                if use_validation:
+                    stats["val"].append(val_stats)
+                stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+                break
 
         stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
         scheduler.step()
-
-        # if val_stats["aux_val"] < best_epoch_val_aux:
-        #     best_epoch_val_aux = val_stats["aux_val"]
-        #     best_epoch_tst_aux = tst_stats["aux_val"]
-        #     save_checkpoint(
-        #         args,
-        #         'best',
-        #         experiment_id,
-        #         modules,
-        #         desired_t)
-        # val_stats["aux_val*"] = best_epoch_val_aux
-        # tst_stats["aux_val*"] = best_epoch_tst_aux
 
         stats["trn"].append(trn_stats)
         stats["tst"].append(tst_stats)
         if use_validation:
             stats["val"].append(val_stats)
-
         stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
-            save_checkpoint(
-                args,
-                epoch,
-                experiment_id_str,
-                modules,
-                desired_t)
+            save_checkpoint(args, epoch, experiment_id_str, modules, desired_t)
 
         msg = pm.build_progress_message(stats, epoch)
         logging.debug(msg)
 
         if args.enable_file_logging:
-            fname = os.path.join(
-                args.log_dir, f"{experiment_id_str}.json"
-            )
+            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
             save_stats(args, stats, fname)
 
-    finalstats2tensorboard(writer_=writer, params_=vars(args),
-                           stats=stats["tst"], args=args)
-
+    finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
     logging.shutdown()
     writer.close()
-    return best_stats
+    return tst_stats #best_stats
 
 
 def evaluate(
