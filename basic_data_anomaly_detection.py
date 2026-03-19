@@ -313,17 +313,13 @@ def start_experiment(args, provider=None):
         pin_memory=True,
     )
 
-    use_validation = True
-    try:
-        dl_val = provider.get_val_loader(
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=None,
-            num_workers=8,
-            pin_memory=True,
-        )
-    except NotImplementedError:
-        use_validation = False
+    dl_val = provider.get_val_loader(
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=None,
+        num_workers=8,
+        pin_memory=True,
+    )
 
     desired_t = torch.linspace(0, 1.00, provider.num_timepoints, device=args.device).float()
 
@@ -387,12 +383,11 @@ def start_experiment(args, provider=None):
 
     stats = defaultdict(list)
     stats_mask = {
+        "oth": ["esc", "lr"],
         "trn": ["log_pxz", "kl0", "klp", "loss"],
-        "tst": ["loss", "prec", "rec", "f1", "auc", "auprc"],
-        "oth": ["lr"],
+        "val": ["log_pxz", "kl0", "klp", "loss"],
+        "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
     }
-    if use_validation:
-        stats_mask["val"] = stats_mask['trn']
 
     pm = ProgressMessage(stats_mask)
 
@@ -431,24 +426,22 @@ def start_experiment(args, provider=None):
             es_counter = 0
         else:
             es_counter += 1
-            logging.debug(f"Early stopping counter: {es_counter}/{args.early_stopping_patience}")
             if es_counter >= args.early_stopping_patience:
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 # flush final stats before breaking
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
-                if use_validation:
-                    stats["val"].append(val_stats)
+                stats["val"].append(val_stats)
                 stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
                 break
 
-        stats["oth"].append({"lr": scheduler.get_last_lr()[-1]})
+        stats["oth"].append({"lr": scheduler.get_last_lr()[-1],
+                             "esc": es_counter})
         scheduler.step()
 
         stats["trn"].append(trn_stats)
         stats["tst"].append(tst_stats)
-        if use_validation:
-            stats["val"].append(val_stats)
+        stats["val"].append(val_stats)
         stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):

@@ -70,7 +70,10 @@ class ProgressMessage(object):
             for key in keys:
                 val = stats[mode][epoch - 1][key]
                 if mode == "oth":
-                    msg += f" {key}={val:0.6f} {self.separator}"
+                    if type(val) == float:
+                        msg += f" {key}={val:0.6f} {self.separator}"
+                    else:
+                        msg += f" {key}={val} {self.separator}"
                 else:
                     msg += f" {mode}_{key}={val:0.{self.precision}f} {self.separator}"
         return msg
