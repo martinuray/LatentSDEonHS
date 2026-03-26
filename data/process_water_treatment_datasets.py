@@ -8,6 +8,29 @@ import tqdm
 from sklearn.preprocessing import MinMaxScaler
 
 
+def reshape_data(data, window_length, remove_zero_column=True):
+    if type(data) != np.ndarray:
+        data_np = data.to_numpy()
+    else:
+        data_np = data
+
+    if data_np.ndim == 1:
+        data_np = data_np.reshape(-1, 1)
+
+    mod = data_np.shape[0] % window_length
+    if type(data) == pd.DataFrame and 'labels' in data.columns:
+        # only for labels
+        data_np = data_np.squeeze()[:-mod]  # to ignore index col
+        shaped = data_np.reshape(-1, window_length)
+    else:
+        # to ignore index col
+        data_np = data_np[:-mod]
+        if remove_zero_column:
+            data_np = data_np[:, 1:]
+
+        shaped = data_np.reshape(-1, window_length, data_np.shape[1])
+    return shaped
+
 def norm(train_df, test_df):
     normalizer = MinMaxScaler(feature_range=(0, 1))
     normalizer.fit(train_df) # scale training data to [0,1] range
@@ -185,19 +208,6 @@ def main(args):
     #    # https://github.com/ssarfraz/QuoVadisTAD/blob/8e2de5a1574d1f8b2b669e2aa81a34fd92bd5b58/quovadis_tad/model_utils/model_def.py#L55
     #    raw_data_df = raw_data.iloc[:60_000]
 
-    def reshape_data(data, window_length):
-        data_np = data.to_numpy()
-        mod = data_np.shape[0] % window_length
-        if 'labels' in data.columns:
-            # only for labels
-            data_np = data_np.squeeze()[:-mod]  # to ignore index col
-            shaped = data_np.reshape(-1, window_length)
-        else:
-            # to ignore index col
-            data_np = data_np[:-mod, 1:]
-            shaped = data_np.reshape(-1, window_length, data_np.shape[1])
-        return shaped
-
     # process further
     train_np = reshape_data(train_df_filtered, args.window_length)
     test_np = reshape_data(test_df_filtered, args.window_length)
@@ -214,8 +224,8 @@ def main(args):
         if args.make_validation_set:
             df_len = train_np.shape[0]
             indices = np.random.permutation(df_len)
-            val_indices = indices[:int(df_len * args.validation_split)]
-            train_indices = indices[int(df_len * args.validation_split):]
+            val_indices = indices[int(df_len * args.validation_split):]
+            train_indices = indices[:int(df_len * args.validation_split)]
 
             store_file(train_np[train_indices], path_, 'train')
             store_file(train_np[val_indices], path_, 'val')

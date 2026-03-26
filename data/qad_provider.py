@@ -1,24 +1,14 @@
-"""Dataset provider for the PhysioNet (2012) interpolation task.
-
-Data loading code is taken and dadpated (in parts) from
-    https://github.com/reml-lab/mTAN
-
-Authors: Sebastian Zeng, Florian Graf, Roland Kwitt (2023)
-"""
-import glob
 import logging
 import os
 import pickle
 
 import numpy as np
 import pandas as pd
-
 import torch
-from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
-from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
+from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 from data.process_water_treatment_datasets import reshape_data
 
@@ -173,8 +163,8 @@ class QADData:
             data_len = len(data)
             indices = np.random.permutation(data_len)
             split_idx = int(data_len * 0.9)
-            val_indices = indices[:split_idx]
-            train_indices = indices[split_idx:]
+            train_indices = indices[:split_idx]
+            val_indices = indices[split_idx:]
 
             torch.save([data[i] for i in train_indices], os.path.join(self.processed_folder, self.destination_file))
             torch.save([data[i] for i in val_indices], os.path.join(self.processed_folder, self.val_file))
@@ -190,7 +180,7 @@ class QADDataset(Dataset):
     input_dim = None  # nr. of different measurements per time point
     
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = 1,
-                 window_length: int = 100, window_overlap: float = 0.75, subsample: float = 1.0,
+                 window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
                  data_normalization_strategy: str = "none"):
 
         self.mode = mode
