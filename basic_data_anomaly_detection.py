@@ -30,6 +30,7 @@ from core.models import (
 from core.training import generic_train
 from data.ad_provider import ADProvider
 from data.aero_provider import AeroDataProvider
+from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
 from utils.logger import set_up_logging
 from utils.misc import (
@@ -54,7 +55,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL"], default="SWaT")
     return parser
 
 
@@ -292,6 +293,11 @@ def start_experiment(args, provider=None):
             provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
         elif args.dataset == 'QAD':
             provider = QADProvider(data_dir="data_dir/", dataset_number=3)
+        elif args.dataset in ['SMAP', 'MSL']:
+            provider = NASAProvider(
+                data_dir="data_dir/", dataset=args.dataset,
+                window_length=args.data_window_length,
+                subsample=args.subsample)
         else:
             raise ValueError(f"Unknown dataset {args.dataset}")
     else:

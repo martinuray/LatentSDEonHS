@@ -20,13 +20,15 @@ def reshape_data(data, window_length, remove_zero_column=True):
     mod = data_np.shape[0] % window_length
     if type(data) == pd.DataFrame and 'labels' in data.columns:
         # only for labels
-        data_np = data_np.squeeze()[:-mod]  # to ignore index col
+        if mod > 0:
+            data_np = data_np.squeeze()[:-mod]
         shaped = data_np.reshape(-1, window_length)
     else:
         # to ignore index col
-        data_np = data_np[:-mod]
+        if mod > 0:
+            data_np = data_np[:-mod]
         if remove_zero_column:
-            data_np = data_np[:, 1:]
+            data_np = data_np[:, 1:] # to ignore index col
 
         shaped = data_np.reshape(-1, window_length, data_np.shape[1])
     return shaped
