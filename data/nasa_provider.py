@@ -224,17 +224,17 @@ class NASADataset(Dataset):
 
         for dataset_id in dataset_ids:
             train_data = NASAData(
-                data_dir, mode='train', dataset_id=dataset_id,
+                data_dir, mode='train', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy)
 
             objs['train'].append(train_data)
             objs['test'].append(NASAData(
-                data_dir, mode='test', dataset_id=dataset_id,
+                data_dir, mode='test', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler))
             objs['val'].append(NASAData(
-                data_dir, mode='val', dataset_id=dataset_id,
+                data_dir, mode='val', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler))
 

@@ -323,7 +323,6 @@ class ADDataset(Dataset):
         data_min, data_max = get_data_min_max(objs['train'][:])
 
         self.feature_names = ADData.params
-        ADDataset.input_dim = data[0][2].shape[1]
 
         tps = data.data[0][1]
         tps = torch.Tensor(tps / tps.max())
@@ -343,45 +342,99 @@ class ADDataset(Dataset):
 
         obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
 
-        self.num_timepoints = tps.shape[1]
+        n_samples = obs.shape[0]
+        n_time = tps.shape[1]
+        input_dim = obs.shape[-1]
+        inp_tid = torch.arange(0, n_time).repeat(n_samples, 1).long()
 
-        self.inp_obs = obs.float() # obs_new
-        self.inp_obs = (obs * msk).float()# obs_new
-        self.inp_msk = msk.long() #obs_msk
-        self.inp_tps = tps
-        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long() #tid_new.long()
-        self.indcs = indcs
+        # Keep one entry to mirror NASADataset layout.
+        self.datasets = [{
+            'inp_obs': (obs * msk).float(),
+            'inp_msk': msk.long(),
+            'inp_tps': tps,
+            'inp_tid': inp_tid,
+            'indcs': indcs,
+            'evd_obs': obs.float(),
+            'evd_msk': torch.ones_like(msk).long(),
+            'evd_tid': inp_tid.long(),
+            'evd_tps': tps,
+            'aux_tgt': tgt.long(),
+            'data_min': data_min,
+            'data_max': data_max,
+            'input_dim': input_dim,
+            'num_timepoints': n_time,
+            'dataset_id': data_kind,
+        }]
 
-        self.evd_msk = torch.ones_like(self.inp_msk).long()
-        self.evd_tid = self.inp_tid.long() #all_idx.repeat(self.tps.shape[0], 1).long()
-        self.evd_tps = tps
-        self.evd_obs = obs.float()
-        self.aux_tgt = tgt.long()
+        self._lengths = [n_samples]
+        self._cumulative = [0]
+
+        # Backward-compatible aliases used by legacy code.
+        ds = self.datasets[0]
+        ADDataset.input_dim = ds['input_dim']
+        self.input_dim = ds['input_dim']
+        self.num_timepoints = ds['num_timepoints']
+        self.data_min = ds['data_min']
+        self.data_max = ds['data_max']
+        self.inp_obs = ds['inp_obs']
+        self.inp_msk = ds['inp_msk']
+        self.inp_tps = ds['inp_tps']
+        self.inp_tid = ds['inp_tid']
+        self.indcs = ds['indcs']
+        self.evd_obs = ds['evd_obs']
+        self.evd_msk = ds['evd_msk']
+        self.evd_tid = ds['evd_tid']
+        self.evd_tps = ds['evd_tps']
+        self.aux_tgt = ds['aux_tgt']
 
     @property
     def has_aux(self):
         return False
 
+    @property
+    def num_datasets(self) -> int:
+        return len(self.datasets)
+
+    def get_dataset(self, ds_idx: int) -> dict:
+        return self.datasets[ds_idx]
+
+    @property
+    def input_dims(self) -> list:
+        return [ds['input_dim'] for ds in self.datasets]
+
+    @property
+    def num_timepoints_list(self) -> list:
+        return [ds['num_timepoints'] for ds in self.datasets]
+
     def __len__(self):
-        return len(self.evd_obs)
+        return sum(self._lengths)
+
+    def _resolve_index(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for size {len(self)}")
+        return 0, idx
 
     def __getitem__(self, idx):
+        ds_idx, local_idx = self._resolve_index(idx)
+        ds = self.datasets[ds_idx]
+
         if self.mode == 'train':
-            msk = (torch.rand(self.inp_msk[idx].shape) < self.subsample).to(torch.int).long()
+            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
         else:
-            msk = self.inp_msk[idx].long()
+            msk = ds['inp_msk'][local_idx].long()
 
         inp_and_evd = {
-            'inp_obs' : self.inp_obs[idx].float(),
+            'inp_obs' : ds['inp_obs'][local_idx].float(),
             'inp_msk' : msk,
-            'inp_tid' : self.inp_tid[idx].long(),
-            'inp_tps' : self.inp_tps[idx].float(),
-            'evd_obs' : self.evd_obs[idx].float(),
-            'evd_msk' : self.evd_msk[idx].long(),
-            'evd_tid' : self.evd_tid[idx].long(),
-            'evd_tps' : self.evd_tps[idx].float(),
-            'aux_tgt' : self.aux_tgt[idx].long(),
-            'inp_indcs' : self.indcs[idx]
+            'inp_tid' : ds['inp_tid'][local_idx].long(),
+            'inp_tps' : ds['inp_tps'][local_idx].float(),
+            'evd_obs' : ds['evd_obs'][local_idx].float(),
+            'evd_msk' : ds['evd_msk'][local_idx].long(),
+            'evd_tid' : ds['evd_tid'][local_idx].long(),
+            'evd_tps' : ds['evd_tps'][local_idx].float(),
+            'aux_tgt' : ds['aux_tgt'][local_idx].long(),
+            'inp_indcs' : ds['indcs'][local_idx],
+            'dataset_idx': ds_idx,
             }
         return inp_and_evd
 
@@ -433,6 +486,18 @@ class ADProvider(DatasetProvider):
     @property 
     def input_dim(self):
         return ADDataset.input_dim
+
+    @property
+    def input_dims(self) -> list:
+        return self._ds_trn.input_dims
+
+    @property
+    def num_datasets(self) -> int:
+        return self._ds_trn.num_datasets
+
+    @property
+    def num_timepoints_list(self) -> list:
+        return self._ds_trn.num_timepoints_list
 
     @property
     def sample_tp(self):

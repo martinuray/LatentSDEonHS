@@ -39,18 +39,57 @@ def vec_to_matrix(vec: Tensor, basis: Tensor) -> Tensor:
 
 
 def save_stats(args, stats: dict, file: str) -> None:
-    assert set(stats.keys()).issubset({"trn", "tst", "val", "oth"})
-    all = dict()
-    for mode, epoch_stats in stats.items():
+    base_keys = {"trn", "tst", "val", "oth"}
+
+    def _is_allowed_key(key: str) -> bool:
+        return key in base_keys or key == "per_dataset" or key.startswith("macro_")
+
+    def _to_jsonable(obj):
+        if isinstance(obj, dict):
+            return {str(k): _to_jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_to_jsonable(v) for v in obj]
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
+    done = all(_is_allowed_key(key) for key in stats.keys())
+    assert done
+
+    all_stats = dict()
+    epochs = 0
+    for mode in ["trn", "tst", "val", "oth"]:
+        if mode not in stats:
+            continue
+
+        epoch_stats = stats[mode]
+        if not isinstance(epoch_stats, list) or len(epoch_stats) == 0:
+            continue
+
+        epochs = max(epochs, len(epoch_stats))
         for key in epoch_stats[0].keys():
-            epochs = len(epoch_stats)
             if mode != "oth":
-                all[f"{mode}_{key}"] = [
-                    str(epoch_stats[epoch][key]) for epoch in range(epochs)
+                all_stats[f"{mode}_{key}"] = [
+                    str(epoch_stats[epoch].get(key, "")) for epoch in range(len(epoch_stats))
                 ]
-    last = {key: str(val[-1]) for key, val in all.items()}
-    last["epoch"] = epochs
-    out = {"args": args.__dict__, "final": last, "all": all}
+
+    last = {key: str(val[-1]) for key, val in all_stats.items() if len(val) > 0}
+    if epochs > 0:
+        last["epoch"] = epochs
+
+    macro_stats = {
+        key: str(val) for key, val in stats.items() if isinstance(key, str) and key.startswith("macro_")
+    }
+    last.update(macro_stats)
+
+    out = {"args": args.__dict__, "final": last, "all": all_stats}
+    if "per_dataset" in stats:
+        out["per_dataset"] = _to_jsonable(stats["per_dataset"])
+    if len(macro_stats) > 0:
+        out["macro"] = macro_stats
+
     with open(file, "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=4)
 

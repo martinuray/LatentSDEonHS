@@ -19,6 +19,7 @@ import torch.optim as optim
 from scipy.stats import iqr
 from sklearn.preprocessing import StandardScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from core.models import (
@@ -32,6 +33,7 @@ from data.ad_provider import ADProvider
 from data.aero_provider import AeroDataProvider
 from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
+from data.smd_provider import SMDProvider
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
@@ -55,7 +57,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP"], default="SWaT")
     return parser
 
 
@@ -84,6 +86,193 @@ def non_intersecting_stats2tensorboard(stats, keys_intersected, prefix, writer, 
     keys_non_intersected = set(stats.keys()) - keys_intersected
     for key_ in keys_non_intersected:
         writer.add_scalar(f'{prefix}/{key_}', stats[key_], epoch)
+
+
+class DatasetSlice(Dataset):
+    """View on one sub-dataset using flattened global indexing."""
+
+    def __init__(self, base_dataset: Dataset, ds_idx: int):
+        self.base_dataset = base_dataset
+        self.ds_idx = ds_idx
+
+        ds = base_dataset.get_dataset(ds_idx)
+        self.input_dim = ds['input_dim']
+        self.num_timepoints = ds['num_timepoints']
+        self.indcs = ds['indcs']
+        self.dataset_id = ds.get('dataset_id', str(ds_idx))
+
+        self.start_idx = base_dataset._cumulative[ds_idx]
+        self.length = base_dataset._lengths[ds_idx]
+
+    @property
+    def has_aux(self):
+        return self.base_dataset.has_aux
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.length:
+            raise IndexError(f"Index {idx} out of range for size {self.length}")
+        return self.base_dataset[self.start_idx + idx]
+
+
+def build_modules_and_optim(args, input_dim, desired_t):
+    recog_net = PhysioNetRecogNetwork(
+        mtan_input_dim=input_dim,
+        mtan_hidden_dim=args.h_dim,
+        use_atanh=args.use_atanh
+    )
+
+    recon_net = GenericMLP(
+        inp_dim=args.z_dim,
+        out_dim=input_dim,
+        n_hidden=args.dec_hidden_dim,
+        n_layers=args.n_dec_layers,
+        non_linear=args.non_linear_decoder
+    )
+
+    pxz_net = PathToGaussianDecoder(
+        mu_map=recon_net,
+        sigma_map=None,
+        initial_sigma=args.initial_sigma)
+
+    qzx_net = default_SOnPathDistributionEncoder(
+        h_dim=args.h_dim,
+        z_dim=args.z_dim,
+        n_deg=args.n_deg,
+        learnable_prior=args.learnable_prior,
+        time_min=0.0,
+        time_max=2.0 * desired_t[-1].item())
+
+    if args.freeze_sigma:
+        logging.debug("Froze sigma when computing PathToGaussianDecoder")
+        pxz_net.sigma.requires_grad = False
+
+    modules = nn.ModuleDict(
+        {
+            "recog_net": recog_net,
+            "recon_net": recon_net,
+            "pxz_net": pxz_net,
+            "qzx_net": qzx_net,
+        }
+    ).to(args.device)
+
+    param_groups = [
+        {"params": recon_net.parameters(), "weight_decay": 1e-4},
+        {"params": recog_net.parameters()},
+        {"params": qzx_net.parameters()},
+    ]
+
+    optimizer = optim.Adam(param_groups, lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
+    elbo_loss = ELBO(reduction="mean")
+
+    logging.debug(f"Number of model parameters={count_parameters(modules)}")
+    return modules, optimizer, scheduler, elbo_loss
+
+
+def train_one_dataset(
+    args,
+    dl_trn,
+    dl_tst,
+    dl_val,
+    input_dim,
+    num_timepoints,
+    writer,
+    stats_prefix,
+    experiment_id_str,
+):
+    desired_t = torch.linspace(0, 1.00, num_timepoints, device=args.device).float()
+    modules, optimizer, scheduler, elbo_loss = build_modules_and_optim(args, input_dim, desired_t)
+
+    stats = defaultdict(list)
+    stats_mask = {
+        "oth": ["esc", "lr"],
+        "trn": ["log_pxz", "kl0", "klp", "loss"],
+        "val": ["log_pxz", "kl0", "klp", "loss"],
+        "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
+    }
+
+    pm = ProgressMessage(stats_mask)
+    best_auc = 0.0
+    best_stats = None
+    es_counter = 0
+    best_es_loss = np.inf
+
+    for epoch in range(1, args.n_epochs + 1):
+        trn_stats = generic_train(
+            args, dl_trn, modules, elbo_loss, None,
+            optimizer, desired_t, args.device
+        )
+
+        normalization_scores = None
+        if args.normalize_score:
+            normalization_scores = calculate_z_normalization_values(
+                args, dl_trn, modules, desired_t, args.device)
+
+        tst_stats = evaluate(
+            args, dl_tst, modules, elbo_loss, desired_t, args.device,
+            normalization_stats=normalization_scores, epoch=epoch
+        )
+
+        val_stats = evaluate(
+            args, dl_val, modules, elbo_loss, desired_t, args.device,
+            normalization_stats=normalization_scores, epoch=epoch, test=False
+        )
+
+        if tst_stats["auc"] > best_auc:
+            best_auc = tst_stats["auc"]
+            best_stats = tst_stats
+
+        es_loss = val_stats["loss"]
+        if es_loss < best_es_loss - args.early_stopping_min_delta:
+            best_es_loss = es_loss
+            es_counter = 0
+        else:
+            es_counter += 1
+            if es_counter >= args.early_stopping_patience:
+                logging.info(f"Early stopping triggered at epoch {epoch}.")
+                stats["trn"].append(trn_stats)
+                stats["tst"].append(tst_stats)
+                stats["val"].append(val_stats)
+                stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+                break
+
+        stats["oth"].append({"lr": scheduler.get_last_lr()[-1],
+                             "esc": es_counter})
+        scheduler.step()
+
+        stats["trn"].append(trn_stats)
+        stats["tst"].append(tst_stats)
+        stats["val"].append(val_stats)
+        stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+
+        if args.checkpoint_at and (epoch in args.checkpoint_at):
+            ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
+            save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
+
+        msg = pm.build_progress_message(stats, epoch)
+        if stats_prefix:
+            msg = f"[{stats_prefix}] {msg}"
+        logging.debug(msg)
+
+        if args.enable_file_logging:
+            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
+            save_stats(args, stats, fname)
+
+    return (best_stats if best_stats is not None else tst_stats), stats
+
+
+def compute_macro_metrics(per_dataset_stats):
+    metric_keys = ["f1", "prec", "rec", "auc", "auprc", "loss", "elbo", "kl0", "klp", "log_pxz"]
+    macro = {}
+
+    for key in metric_keys:
+        values = [stats[key] for stats in per_dataset_stats.values() if key in stats]
+        if values:
+            macro[f"macro_{key}"] = float(np.mean(values))
+    return macro
 
 def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     f1, f1_ts = 0, 0
@@ -249,9 +438,6 @@ def start_experiment(args, provider=None):
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
 
-    best_auc = 0.0
-    best_stats = None
-
     if args.debug:
         args.n_epochs = 1
 
@@ -281,7 +467,7 @@ def start_experiment(args, provider=None):
 
     if provider is None:
         logging.info("Instantiating data provider")
-        if args.dataset in ['SWaT', 'WaDi', 'SMD']:
+        if args.dataset in ['SWaT', 'WaDi']:
             provider = ADProvider(
                 data_dir='data_dir', dataset=args.dataset,
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
@@ -289,10 +475,25 @@ def start_experiment(args, provider=None):
                 subsample=args.subsample,
                 data_normalization_strategy=args.data_normalization_strategy
             )
+        elif args.dataset == 'SMD':
+            provider = SMDProvider(
+                data_dir='data_dir',
+                window_length=args.data_window_length,
+                window_overlap=args.data_window_overlap,
+                subsample=args.subsample,
+                data_normalization_strategy=args.data_normalization_strategy,
+            )
         elif args.dataset == 'aero':
             provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
         elif args.dataset == 'QAD':
-            provider = QADProvider(data_dir="data_dir/", dataset_number=3)
+            provider = QADProvider(
+                data_dir="data_dir/",
+                dataset_number=None,
+                window_length=args.data_window_length,
+                subsample=args.subsample,
+                data_normalization_strategy=args.data_normalization_strategy,
+                raw_subdir="qad_clean_pkl_100Hz",
+            )
         elif args.dataset in ['SMAP', 'MSL']:
             provider = NASAProvider(
                 data_dir="data_dir/", dataset=args.dataset,
@@ -303,13 +504,103 @@ def start_experiment(args, provider=None):
     else:
         logging.info("Using provided data provider")
 
+    has_hybrid_layout = all(
+        hasattr(provider, attr) for attr in ["num_datasets", "input_dims", "num_timepoints_list"]
+    ) and all(hasattr(provider, attr) for attr in ["_ds_trn", "_ds_tst", "_ds_val"])
+
+    if has_hybrid_layout:
+        per_dataset_stats = {}
+        per_dataset_histories = {}
+
+        for ds_idx in range(provider.num_datasets):
+            trn_slice = DatasetSlice(provider._ds_trn, ds_idx)
+            tst_slice = DatasetSlice(provider._ds_tst, ds_idx)
+            val_slice = DatasetSlice(provider._ds_val, ds_idx)
+
+            dataset_id = str(trn_slice.dataset_id)
+            logging.info(
+                f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{provider.num_datasets})"
+            )
+
+            dl_trn = DataLoader(
+                trn_slice,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=None,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=False,
+            )
+            dl_tst = DataLoader(
+                tst_slice,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=None,
+                num_workers=8,
+                pin_memory=True,
+            )
+            dl_val = DataLoader(
+                val_slice,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=None,
+                num_workers=8,
+                pin_memory=True,
+            )
+
+            tst_stats, hist_stats = train_one_dataset(
+                args=args,
+                dl_trn=dl_trn,
+                dl_tst=dl_tst,
+                dl_val=dl_val,
+                input_dim=provider.input_dims[ds_idx],
+                num_timepoints=provider.num_timepoints_list[ds_idx],
+                writer=writer,
+                stats_prefix=dataset_id,
+                experiment_id_str=experiment_id_str,
+            )
+
+            per_dataset_stats[dataset_id] = tst_stats
+            per_dataset_histories[dataset_id] = hist_stats
+
+        if provider.num_datasets == 1:
+            only_id = next(iter(per_dataset_stats.keys()))
+            finalstats2tensorboard(
+                writer_=writer,
+                params_=vars(args),
+                stats=per_dataset_histories[only_id]["tst"],
+                args=args,
+            )
+            logging.shutdown()
+            writer.close()
+            return per_dataset_stats[only_id]
+
+        macro_stats = compute_macro_metrics(per_dataset_stats)
+        for key, value in macro_stats.items():
+            writer.add_scalar(key, value, 0)
+
+        combined_stats = {
+            "per_dataset": per_dataset_stats,
+            **macro_stats,
+        }
+
+        if args.enable_file_logging:
+            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
+            save_stats(args, combined_stats, fname)
+
+        logging.info(f"Macro metrics across {provider.num_datasets} datasets: {macro_stats}")
+        logging.shutdown()
+        writer.close()
+        return combined_stats
+
+    # Fallback path for providers without hybrid layout.
     dl_trn = provider.get_train_loader(
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=None,
         num_workers=8,
         pin_memory=True,
-        drop_last=False,  #what does this do? Necessary?
+        drop_last=False,
     )
     dl_tst = provider.get_test_loader(
         batch_size=args.batch_size,
@@ -318,7 +609,6 @@ def start_experiment(args, provider=None):
         num_workers=8,
         pin_memory=True,
     )
-
     dl_val = provider.get_val_loader(
         batch_size=args.batch_size,
         shuffle=False,
@@ -327,143 +617,22 @@ def start_experiment(args, provider=None):
         pin_memory=True,
     )
 
-    desired_t = torch.linspace(0, 1.00, provider.num_timepoints, device=args.device).float()
-
-    recog_net = PhysioNetRecogNetwork(
-        mtan_input_dim=provider.input_dim,
-        mtan_hidden_dim=args.h_dim,
-        use_atanh=args.use_atanh
+    tst_stats, stats = train_one_dataset(
+        args=args,
+        dl_trn=dl_trn,
+        dl_tst=dl_tst,
+        dl_val=dl_val,
+        input_dim=provider.input_dim,
+        num_timepoints=provider.num_timepoints,
+        writer=writer,
+        stats_prefix="",
+        experiment_id_str=experiment_id_str,
     )
-
-    recon_net = GenericMLP(
-        inp_dim=args.z_dim,
-        out_dim=provider.input_dim,
-        n_hidden=args.dec_hidden_dim,
-        n_layers=args.n_dec_layers,
-        non_linear=args.non_linear_decoder
-    )
-
-    pxz_net = PathToGaussianDecoder(
-        mu_map=recon_net,
-        sigma_map=None,
-        initial_sigma=args.initial_sigma) # TODO: is this initial sigma ok so?
-
-    qzx_net = default_SOnPathDistributionEncoder(
-        h_dim=args.h_dim,
-        z_dim=args.z_dim,
-        n_deg=args.n_deg,
-        learnable_prior=args.learnable_prior,
-        time_min=0.0,
-        time_max=2.0 * desired_t[-1].item())
-
-    if args.freeze_sigma:
-        logging.debug("Froze sigma when computing PathToGaussianDecoder")
-        pxz_net.sigma.requires_grad = False
-
-    modules = nn.ModuleDict(
-        {
-            "recog_net": recog_net,
-            "recon_net": recon_net,
-            "pxz_net": pxz_net,
-            "qzx_net": qzx_net,
-        }
-    )
-    modules = modules.to(args.device)
-
-    param_groups = [
-        {"params": recon_net.parameters(), "weight_decay": 1e-4},
-        {"params": recog_net.parameters()},
-        #{"params": pxz_net.parameters()},
-        {"params": qzx_net.parameters()},
-        # Specific weight decay for fc2
-    ]
-
-
-    optimizer = optim.Adam(param_groups, lr=args.lr)
-    #optimizer = optim.SGD(modules.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
-
-    logging.debug(f"Number of model parameters={count_parameters(modules)}")
-
-    elbo_loss = ELBO(reduction="mean")
-
-    stats = defaultdict(list)
-    stats_mask = {
-        "oth": ["esc", "lr"],
-        "trn": ["log_pxz", "kl0", "klp", "loss"],
-        "val": ["log_pxz", "kl0", "klp", "loss"],
-        "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
-    }
-
-    pm = ProgressMessage(stats_mask)
-
-    es_counter = 0
-    best_es_loss = np.inf  # the metric early stopping watches
-
-    for epoch in range(1, args.n_epochs + 1):
-        trn_stats = generic_train(
-            args, dl_trn, modules, elbo_loss, None,
-            optimizer, desired_t, args.device
-        )
-
-        normalization_scores = None
-        if args.normalize_score:
-            normalization_scores = calculate_z_normalization_values(
-                args, dl_trn, modules, desired_t, args.device)
-
-        tst_stats = evaluate(
-            args, dl_tst, modules, elbo_loss, desired_t, args.device,
-            normalization_stats=normalization_scores, epoch=epoch
-        )
-
-        val_stats = evaluate(
-            args, dl_val, modules, elbo_loss, desired_t, args.device,
-            normalization_stats=normalization_scores, epoch=epoch, test=False
-        )
-
-        if tst_stats["auc"] > best_auc:
-            best_auc = tst_stats["auc"]
-            best_stats = tst_stats
-
-        # --- early stopping check ---
-        es_loss = val_stats["loss"]
-        if es_loss < best_es_loss - args.early_stopping_min_delta:
-            best_es_loss = es_loss
-            es_counter = 0
-        else:
-            es_counter += 1
-            if es_counter >= args.early_stopping_patience:
-                logging.info(f"Early stopping triggered at epoch {epoch}.")
-                # flush final stats before breaking
-                stats["trn"].append(trn_stats)
-                stats["tst"].append(tst_stats)
-                stats["val"].append(val_stats)
-                stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
-                break
-
-        stats["oth"].append({"lr": scheduler.get_last_lr()[-1],
-                             "esc": es_counter})
-        scheduler.step()
-
-        stats["trn"].append(trn_stats)
-        stats["tst"].append(tst_stats)
-        stats["val"].append(val_stats)
-        stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
-
-        if args.checkpoint_at and (epoch in args.checkpoint_at):
-            save_checkpoint(args, epoch, experiment_id_str, modules, desired_t)
-
-        msg = pm.build_progress_message(stats, epoch)
-        logging.debug(msg)
-
-        if args.enable_file_logging:
-            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
-            save_stats(args, stats, fname)
 
     finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
     logging.shutdown()
     writer.close()
-    return tst_stats #best_stats
+    return tst_stats
 
 
 def evaluate(
@@ -534,7 +703,7 @@ def evaluate(
                 normalize_counts[key] += value
 
             for idx in range(parts["aux_tgt"].shape[0]):
-                all_labels[indcs[idx, :]] = parts["aux_tgt"][idx].cpu().numpy()
+                all_labels[indcs[idx, :]] = parts["aux_tgt"][idx].cpu().numpy().ravel()
 
             batch_len = parts["evd_obs"].shape[0]
             stats["loss"].append(loss.item() * batch_len)
@@ -546,7 +715,12 @@ def evaluate(
 
     stats = {key: np.sum(val) / len(dl.dataset) for key, val in stats.items()}
 
-    all_scores = (all_scores.T / normalize_counts).T
+    all_scores = np.divide(
+        all_scores,
+        normalize_counts[:, None],
+        out=np.zeros_like(all_scores),
+        where=normalize_counts[:, None] > 0,
+    )
 
     #if epoch % 10 == 0:
     if test:

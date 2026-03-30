@@ -1,6 +1,7 @@
 import logging
 import os
 import pickle
+import glob
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,8 @@ class QADData:
             self, root_path, dataset_number=1, mode='train',
             window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
-            data_normalization_strategy: str = "none"
+            data_normalization_strategy: str = "none",
+            raw_subdir: str = "qad_clean_pkl_100Hz"
     ):
 
         self.scaler = normalizer
@@ -33,7 +35,7 @@ class QADData:
         self.dataset_number = dataset_number
         self.mode = mode
         self.window_length = window_length
-        self.ds_hz = 100
+        self.raw_subdir = raw_subdir
 
         self.overlapping_windows = window_overlap
 
@@ -68,13 +70,29 @@ class QADData:
             self.processed_folder, f'{self.mode}_{self.dataset_number}.pt')
         )
 
+    def _resolve_raw_subdir(self):
+        requested = os.path.join(self.root_path, "QAD", "raw", self.raw_subdir)
+        if os.path.isdir(requested):
+            return self.raw_subdir
+
+        fallback = "qad_clean_pkl_100Hz"
+        fallback_path = os.path.join(self.root_path, "QAD", "raw", fallback)
+        if os.path.isdir(fallback_path):
+            logging.warning(
+                f"Requested QAD folder '{self.raw_subdir}' not found. Falling back to '{fallback}'."
+            )
+            return fallback
+
+        return self.raw_subdir
+
     @property
     def raw_folder(self):
-        return os.path.join(self.root_path, "QAD", f'raw/qad_clean_pkl_{self.ds_hz}Hz/')
+        return os.path.join(self.root_path, "QAD", "raw", self._resolve_raw_subdir())
 
     @property
     def processed_folder(self):
-        return os.path.join(self.root_path, "QAD", f'processed/qad_clean_pkl_{self.ds_hz}Hz/')
+        # Keep processed namespace aligned with the actual raw folder name.
+        return os.path.join(self.root_path, "QAD", "processed", self._resolve_raw_subdir())
 
     @property
     def training_file(self):
@@ -179,94 +197,187 @@ class QADDataset(Dataset):
     
     input_dim = None  # nr. of different measurements per time point
     
-    def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = 1,
+    def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
-                 data_normalization_strategy: str = "none"):
+                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_pkl_100Hz"):
 
         self.mode = mode
         self.subsample = subsample
 
-        # Load all datasets to ensure consistent scaling
-        train_data = QADData(
-            data_dir, mode='train', dataset_number=dataset_number,
-            window_length=window_length, window_overlap=window_overlap,
-            data_normalization_strategy=data_normalization_strategy)
+        self.datasets = []
+        self._lengths = []
+        self._cumulative = []
 
-        objs = {
-            'train': train_data,
-            'test': QADData(
-                data_dir, mode='test', dataset_number=dataset_number,
+        dataset_ids = self._resolve_dataset_ids(data_dir, dataset_number, raw_subdir)
+
+        for dataset_id in dataset_ids:
+            train_data = QADData(
+                data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler),
-            'val': QADData(
-                data_dir, mode='val', dataset_number=dataset_number,
-                window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler)
-        }
+                data_normalization_strategy=data_normalization_strategy,
+                raw_subdir=raw_subdir)
 
-        data = objs[mode]
+            objs = {
+                'train': train_data,
+                'test': QADData(
+                    data_dir, mode='test', dataset_number=dataset_id,
+                    window_length=window_length, window_overlap=window_overlap,
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir),
+                'val': QADData(
+                    data_dir, mode='val', dataset_number=dataset_id,
+                    window_length=window_length, window_overlap=window_overlap,
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir)
+            }
 
-        data_min, data_max = get_data_min_max(objs['train'][:])
+            data = objs[mode]
+            data_min, data_max = get_data_min_max(objs['train'][:])
+
+            raw = data.data
+            if len(raw) == 0:
+                logging.warning(f"Skipping empty QAD dataset {dataset_id} (mode={mode})")
+                continue
+
+            tps_base = raw[0][1].float()
+            tps_max = tps_base.max()
+            if tps_max > 0:
+                tps_base = tps_base / tps_max
+
+            indcs = torch.stack([raw[i][1] for i in range(len(raw))])
+            obs = torch.stack([raw[i][2] for i in range(len(raw))]).float()
+            msk = torch.stack([raw[i][3] for i in range(len(raw))]).float()
+            tps = tps_base[None, :].repeat(obs.shape[0], 1).float()
+
+            if mode == 'test':
+                tgt = torch.Tensor(data.targets)
+            else:
+                tgt = torch.zeros((obs.shape[0], obs.shape[1])).long()
+
+            obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
+
+            n_samples = obs.shape[0]
+            n_time = tps.shape[1]
+            self._lengths.append(n_samples)
+
+            self.datasets.append({
+                'inp_obs': (obs * msk).float(),
+                'inp_msk': msk.long(),
+                'inp_tps': tps,
+                'inp_tid': torch.arange(n_time).repeat(n_samples, 1).long(),
+                'indcs': indcs,
+                'evd_obs': obs.float(),
+                'evd_msk': torch.ones_like(msk).long(),
+                'evd_tid': torch.arange(n_time).repeat(n_samples, 1).long(),
+                'evd_tps': tps,
+                'aux_tgt': tgt.long(),
+                'data_min': data_min,
+                'data_max': data_max,
+                'input_dim': obs.shape[-1],
+                'num_timepoints': n_time,
+                'dataset_id': dataset_id,
+            })
+
+        csum = 0
+        for length in self._lengths:
+            self._cumulative.append(csum)
+            csum += length
 
         self.feature_names = QADData.params
-        QADDataset.input_dim = data[0][2].shape[1]
 
-        tps = data.data[0][1]
-        tps = torch.Tensor(tps / tps.max())
-        indcs = torch.vstack([data.data[part_idx][1] for part_idx in
-                            range(len(data.data))])
-        obs = torch.vstack([data.data[part_idx][2][None, :, :] for part_idx in
-                                 range(len(data.data))]).float()
+        # Backward-compatible aliases for single-dataset code paths.
+        if len(self.datasets) > 0:
+            ds0 = self.datasets[0]
+            QADDataset.input_dim = ds0['input_dim']
+            self.input_dim = ds0['input_dim']
+            self.num_timepoints = ds0['num_timepoints']
+            self.data_min = ds0['data_min']
+            self.data_max = ds0['data_max']
+            self.indcs = ds0['indcs']
+            self.inp_obs = ds0['inp_obs']
+            self.inp_msk = ds0['inp_msk']
+            self.inp_tps = ds0['inp_tps']
+            self.inp_tid = ds0['inp_tid']
+            self.evd_obs = ds0['evd_obs']
+            self.evd_msk = ds0['evd_msk']
+            self.evd_tid = ds0['evd_tid']
+            self.evd_tps = ds0['evd_tps']
+            self.aux_tgt = ds0['aux_tgt']
 
-        msk = torch.vstack([data.data[part_idx][3][None, :, :] for part_idx in
-                                 range(len(data.data))]).float()
-        tps = tps[None, :].repeat(obs.shape[0], 1).float()
+    @staticmethod
+    def _resolve_dataset_ids(data_dir: str, dataset_number, raw_subdir: str):
+        if dataset_number is None:
+            raw_folder = os.path.join(data_dir, "QAD", "raw", raw_subdir)
+            if not os.path.isdir(raw_folder):
+                fallback = os.path.join(data_dir, "QAD", "raw", "qad_clean_pkl_100Hz")
+                raw_folder = fallback if os.path.isdir(fallback) else raw_folder
 
-        if mode == 'test':
-            tgt = torch.Tensor(data.targets)
-        else:
-            tgt = torch.zeros((obs.shape[0], obs.shape[1])).long()
+            train_files = glob.glob(os.path.join(raw_folder, "train_*.pkl"))
+            ids = []
+            for file_ in train_files:
+                stem = os.path.basename(file_).replace("train_", "").replace(".pkl", "")
+                if stem.isdigit():
+                    ids.append(int(stem))
 
-        obs, _, _ = normalize_masked_data(obs, msk, data_min, data_max)
+            ids = sorted(set(ids))
+            if len(ids) == 0:
+                raise RuntimeError(f"No QAD datasets found in {raw_folder}")
+            return ids
 
-        self.num_timepoints = tps.shape[1]
+        if isinstance(dataset_number, (list, tuple, set)):
+            return [int(x) for x in dataset_number]
 
-        self.inp_obs = (obs * msk).float()
-        self.inp_msk = msk.long()
-        self.inp_tps = tps
-        self.inp_tid = torch.arange(0, self.inp_tps.shape[1]).repeat(obs.shape[0], 1).long()
-        self.indcs = indcs
-
-        self.evd_msk = torch.ones_like(self.inp_msk).long()
-        self.evd_tid = self.inp_tid.long()
-        self.evd_tps = tps
-        self.evd_obs = obs.float()
-        self.aux_tgt = tgt.long()
+        return [int(dataset_number)]
 
     @property
     def has_aux(self):
         return False
 
+    @property
+    def num_datasets(self) -> int:
+        return len(self.datasets)
+
+    def get_dataset(self, ds_idx: int) -> dict:
+        return self.datasets[ds_idx]
+
+    @property
+    def input_dims(self) -> list:
+        return [ds['input_dim'] for ds in self.datasets]
+
+    @property
+    def num_timepoints_list(self) -> list:
+        return [ds['num_timepoints'] for ds in self.datasets]
+
     def __len__(self):
-        return len(self.evd_obs)
+        return sum(self._lengths)
+
+    def _resolve_index(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for size {len(self)}")
+        for ds_idx in range(len(self._lengths) - 1, -1, -1):
+            if idx >= self._cumulative[ds_idx]:
+                return ds_idx, idx - self._cumulative[ds_idx]
+        raise IndexError(f"Index {idx} could not be resolved")
 
     def __getitem__(self, idx):
+        ds_idx, local_idx = self._resolve_index(idx)
+        ds = self.datasets[ds_idx]
+
         if self.mode == 'train':
-            msk = (torch.rand(self.inp_msk[idx].shape) < self.subsample).long()
+            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).long()
         else:
-            msk = self.inp_msk[idx].long()
+            msk = ds['inp_msk'][local_idx].long()
 
         return {
-            'inp_obs': self.inp_obs[idx].float(),
+            'inp_obs': ds['inp_obs'][local_idx].float(),
             'inp_msk': msk,
-            'inp_tid': self.inp_tid[idx].long(),
-            'inp_tps': self.inp_tps[idx].float(),
-            'evd_obs': self.evd_obs[idx].float(),
-            'evd_msk': self.evd_msk[idx].long(),
-            'evd_tid': self.evd_tid[idx].long(),
-            'evd_tps': self.evd_tps[idx].float(),
-            'aux_tgt': self.aux_tgt[idx].long(),
-            'inp_indcs': self.indcs[idx]
+            'inp_tid': ds['inp_tid'][local_idx].long(),
+            'inp_tps': ds['inp_tps'][local_idx].float(),
+            'evd_obs': ds['evd_obs'][local_idx].float(),
+            'evd_msk': ds['evd_msk'][local_idx].long(),
+            'evd_tid': ds['evd_tid'][local_idx].long(),
+            'evd_tps': ds['evd_tps'][local_idx].float(),
+            'aux_tgt': ds['aux_tgt'][local_idx].long(),
+            'inp_indcs': ds['indcs'][local_idx],
+            'dataset_idx': ds_idx,
         }
 
     def fit_normalizer(self):
@@ -284,7 +395,8 @@ class QADDataset(Dataset):
 class QADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset_number=None, window_length: int = 100,
                  window_overlap: float = 0.0,
-                 data_normalization_strategy: str = "none", subsample: float = 1.0):
+                 data_normalization_strategy: str = "none", subsample: float = 1.0,
+                 raw_subdir: str = "qad_clean_pkl_100Hz"):
         super().__init__()
 
         self._dataset = dataset_number
@@ -293,7 +405,8 @@ class QADProvider(DatasetProvider):
             'dataset_number': dataset_number,
             'window_length': window_length,
             'window_overlap': window_overlap,
-            'data_normalization_strategy': data_normalization_strategy
+            'data_normalization_strategy': data_normalization_strategy,
+            'raw_subdir': raw_subdir,
         }
 
         self._ds_trn = QADDataset(data_dir, 'train', subsample=subsample, **common_kwargs)
@@ -303,6 +416,18 @@ class QADProvider(DatasetProvider):
     @property 
     def input_dim(self):
         return QADDataset.input_dim
+
+    @property
+    def input_dims(self) -> list:
+        return self._ds_trn.input_dims
+
+    @property
+    def num_datasets(self) -> int:
+        return self._ds_trn.num_datasets
+
+    @property
+    def num_timepoints_list(self) -> list:
+        return self._ds_trn.num_timepoints_list
 
     @property
     def data_min(self):
