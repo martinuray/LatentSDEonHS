@@ -41,7 +41,8 @@ from utils.misc import (
     count_parameters,
     ProgressMessage,
     save_checkpoint,
-    save_stats)
+    save_stats,
+    append_final_metrics_csv)
 from utils.parser import generic_parser
 from utils.scoring_functions import Evaluator
 
@@ -466,6 +467,14 @@ def start_experiment(args, provider=None):
     logging.debug(f"Seed set to {args.seed}")
     logging.debug(f'Parameters set: {vars(args)}')
 
+    def _store_final_metrics(final_metrics: dict):
+        append_final_metrics_csv(
+            csv_path=getattr(args, "final_metrics_csv", "logs/final_metrics.csv"),
+            benchmark=args.dataset,
+            run_datetime=experiment_id,
+            metrics=final_metrics,
+        )
+
     if provider is None:
         logging.info("Instantiating data provider")
         if args.dataset in ['SWaT', 'WaDi']:
@@ -598,6 +607,7 @@ def start_experiment(args, provider=None):
             save_stats(args, combined_stats, fname)
 
         logging.info(f"Macro metrics across {provider.num_datasets} datasets: {macro_stats}")
+        _store_final_metrics(combined_stats)
         logging.shutdown()
         writer.close()
         return combined_stats
@@ -639,6 +649,7 @@ def start_experiment(args, provider=None):
     )
 
     finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
+    _store_final_metrics(tst_stats)
     logging.shutdown()
     writer.close()
     return tst_stats

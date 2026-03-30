@@ -7,6 +7,7 @@ import os
 import random
 import numpy as np
 import json
+import csv
 
 import torch
 from torch import Tensor
@@ -92,6 +93,64 @@ def save_stats(args, stats: dict, file: str) -> None:
 
     with open(file, "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=4)
+
+
+def append_final_metrics_csv(csv_path: str, benchmark: str, run_datetime: str, metrics: dict) -> None:
+    """Append one run summary row to a CSV file.
+
+    The CSV always contains at least benchmark and run_datetime plus one column
+    per metric key. If new metric keys appear later, the file is rewritten with
+    the expanded header while preserving existing rows.
+    """
+    if csv_path in [None, "", "None"]:
+        return
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+
+    row = {
+        "benchmark": benchmark,
+        "run_datetime": run_datetime,
+    }
+
+    for key, value in metrics.items():
+        if isinstance(value, np.generic):
+            row[key] = value.item()
+        elif isinstance(value, np.ndarray):
+            row[key] = json.dumps(value.tolist())
+        elif isinstance(value, (dict, list, tuple)):
+            row[key] = json.dumps(value)
+        else:
+            row[key] = value
+
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            writer.writeheader()
+            writer.writerow(row)
+        return
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        existing_rows = list(reader)
+        existing_fields = reader.fieldnames or []
+
+    merged_fields = list(existing_fields)
+    for key in row.keys():
+        if key not in merged_fields:
+            merged_fields.append(key)
+
+    if merged_fields == existing_fields:
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=existing_fields)
+            writer.writerow(row)
+        return
+
+    existing_rows.append(row)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=merged_fields)
+        writer.writeheader()
+        for current_row in existing_rows:
+            writer.writerow(current_row)
 
 
 class ProgressMessage(object):

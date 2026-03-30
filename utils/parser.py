@@ -11,6 +11,7 @@ group0.add_argument("--log-dir", type=str, default=None)
 group0.add_argument("--enable-checkpointing", action=argparse.BooleanOptionalAction, default=False)
 group0.add_argument("--checkpoint-dir", type=str, default=None)
 group0.add_argument("--checkpoint-at", type=int, nargs='*', default=[])
+group0.add_argument("--final-metrics-csv", type=str, default="logs/final_metrics.csv")
 
 group1 = generic_parser.add_argument_group('Data arguments')
 group1.add_argument("--data-window-length", type=int, default=100)
