@@ -34,6 +34,7 @@ from data.aero_provider import AeroDataProvider
 from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
 from data.smd_provider import SMDProvider
+from data.psm_provider import PSMProvider
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
@@ -57,7 +58,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
     return parser
 
 
@@ -499,6 +500,14 @@ def start_experiment(args, provider=None):
                 data_dir="data_dir/", dataset=args.dataset,
                 window_length=args.data_window_length,
                 subsample=args.subsample)
+        elif args.dataset == 'PSM':
+            provider = PSMProvider(
+                data_dir='data_dir',
+                window_length=args.data_window_length,
+                window_overlap=args.data_window_overlap,
+                subsample=args.subsample,
+                data_normalization_strategy=args.data_normalization_strategy,
+            )
         else:
             raise ValueError(f"Unknown dataset {args.dataset}")
     else:
