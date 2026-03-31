@@ -15,7 +15,8 @@ COMMON_ARGS="--enable-file-logging --log-dir logs \
 --initial-sigma 0.15 --data-normalization-strategy none"
 
 # Array of datasets
-DATASETS=(SMAP MSL QAD SWaT WaDi PSM SMD)
+#DATASETS=(SMAP MSL QAD SWaT WaDi PSM SMD)
+DATASETS=(SWaT WaDi PSM)
 
 # Track failed runs
 FAILED_DATASETS=()

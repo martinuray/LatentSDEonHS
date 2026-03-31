@@ -583,14 +583,17 @@ def start_experiment(args, provider=None):
 
         if provider.num_datasets == 1:
             only_id = next(iter(per_dataset_stats.keys()))
+            stats2pass = per_dataset_histories[only_id]["tst"]
             finalstats2tensorboard(
                 writer_=writer,
                 params_=vars(args),
-                stats=per_dataset_histories[only_id]["tst"],
+                stats=stats2pass,
                 args=args,
             )
             logging.shutdown()
             writer.close()
+            _store_final_metrics(stats2pass[0])
+            logging.info(f"Final metrics across {provider.num_datasets} datasets: {stats2pass[0]}")
             return per_dataset_stats[only_id]
 
         macro_stats = compute_macro_metrics(per_dataset_stats)
