@@ -300,6 +300,16 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
 
 
 def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, benchmark_name, dataset_id):
+    clf.train_val_pc = 0.1 # hard setting validation part to 10%
+    LOGGER.info(
+        "[%s/%s] %s validation split set to %.0f%% (train_val_pc=%.2f)",
+        benchmark_name,
+        dataset_id,
+        clf_name,
+        clf.train_val_pc * 100,
+        clf.train_val_pc,
+    )
+
     LOGGER.info("[%s/%s] running %s", benchmark_name, dataset_id, clf_name)
     clf.fit(x_train)
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
@@ -341,12 +351,22 @@ def macro_average(per_dataset_df):
     return macro_df
 
 
+def append_df_to_csv(df, csv_path, index=False):
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    df.to_csv(csv_path, mode="a", header=not file_exists, index=index)
+
+
 if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
     configure_gpu(args.gpu_id)
 
     classifier_factories = build_classifier_factories()
+
+    output_dir = ROOT_DIR / "out"
+    os.makedirs(output_dir, exist_ok=True)
+    per_dataset_path = output_dir / "baselines_per_dataset.csv"
+    macro_path = output_dir / "baselines.csv"
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
@@ -394,6 +414,7 @@ if __name__ == "__main__":
                         dataset_id,
                     )
                     per_dataset_rows.append(row)
+                    append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
                 except Exception:
                     failed_runs.append((benchmark_name, dataset_id, clf_name))
                     LOGGER.exception("[%s/%s] %s failed", benchmark_name, dataset_id, clf_name)
@@ -405,14 +426,7 @@ if __name__ == "__main__":
     per_dataset_df = pd.DataFrame(per_dataset_rows)
     macro_df = macro_average(per_dataset_df)
     macro_df = macro_df.set_index(["benchmark", "clf_name"])
-
-    output_dir = ROOT_DIR / "out"
-    os.makedirs(output_dir, exist_ok=True)
-
-    per_dataset_path = output_dir / "baselines_per_dataset.csv"
-    macro_path = output_dir / "baselines.csv"
-    per_dataset_df.to_csv(per_dataset_path, index=False)
-    macro_df.to_csv(macro_path, index=True)
+    append_df_to_csv(macro_df.reset_index(), macro_path, index=False)
 
     LOGGER.info("Completed %d successful run(s)", len(per_dataset_rows))
     if failed_runs:
@@ -420,6 +434,6 @@ if __name__ == "__main__":
 
     LOGGER.info("Per-dataset metrics:\n%s", per_dataset_df.to_string(index=False))
     LOGGER.info("Macro-averaged benchmark metrics:\n%s", macro_df.to_string())
-    LOGGER.info("Saved per-dataset metrics to %s", per_dataset_path)
-    LOGGER.info("Saved macro-averaged metrics to %s", macro_path)
+    LOGGER.info("Appended per-dataset metrics to %s", per_dataset_path)
+    LOGGER.info("Appended macro-averaged metrics to %s", macro_path)
 
