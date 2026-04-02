@@ -2,6 +2,7 @@
 """Evaluate PYOD baselines with optional multi-dataset benchmarks."""
 
 import argparse
+import ast
 import glob
 import logging
 import os
@@ -9,7 +10,9 @@ import pickle
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -131,6 +134,42 @@ def _build_qad_datasets():
     return qad_datasets
 
 
+def _build_nasa_datasets(spacecraft: str):
+    """Build dataset specs for NASA benchmarks (SMAP/MSL), one per channel id."""
+    nasa_base_dir = ROOT_DIR / "data_dir" / "nasa" / "raw"
+    anomalies_csv = nasa_base_dir / "labeled_anomalies.csv"
+    nasa_datasets = []
+
+    if not anomalies_csv.exists():
+        return nasa_datasets
+
+    anomalies_df = pd.read_csv(anomalies_csv)
+    anomalies_df = anomalies_df[anomalies_df["spacecraft"] == spacecraft]
+
+    for _, row in anomalies_df.iterrows():
+        chan_id = row["chan_id"]
+        train_file = nasa_base_dir / "train" / f"{chan_id}.npy"
+        test_file = nasa_base_dir / "test" / f"{chan_id}.npy"
+
+        if not train_file.exists() or not test_file.exists():
+            continue
+
+        anomaly_sequences = ast.literal_eval(row["anomaly_sequences"])
+        nasa_datasets.append(
+            {
+                "dataset_id": str(chan_id),
+                "data_dir": nasa_base_dir,
+                "train_file": f"train/{chan_id}.npy",
+                "test_file": f"test/{chan_id}.npy",
+                "file_format": "nasa_npy",
+                "anomaly_sequences": anomaly_sequences,
+                "num_values": int(row["num_values"]),
+            }
+        )
+
+    return nasa_datasets
+
+
 def configure_logging(level_name: str):
     level = getattr(logging, level_name.upper(), logging.INFO)
     logging.basicConfig(
@@ -152,6 +191,20 @@ BENCHMARK_DATASETS = {
             "label_column": None,
         }
     ],
+    "WaDi": [
+        {
+            "dataset_id": "WaDi",
+            "data_dir": ROOT_DIR / "data_dir" / "WaDi" / "rawraw" / "v2",
+            "train_file": "WADI_14days.csv",
+            "test_file_candidates": ["attackdata_labbelled.csv", "WADI_attackdata_labelled.csv"],
+            "file_format": "wadi_v2",
+            "label_column_candidates": [
+                "Arrack LABLE",
+                "Attack LABLE",
+                "Attack LABLE (1:No Attack, -1:Attack)",
+            ],
+        }
+    ],
     "PSM": [
         {
             "dataset_id": "PSM",
@@ -164,6 +217,8 @@ BENCHMARK_DATASETS = {
             "drop_feature_columns": ["timestamp_(min)"],
         },
     ],
+    "SMAP": _build_nasa_datasets("SMAP"),
+    "MSL": _build_nasa_datasets("MSL"),
     "SMD": _build_smd_datasets(),
     "QAD": _build_qad_datasets(),
 }
@@ -237,8 +292,62 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
     data_dir = spec["data_dir"]
     dataset_id = spec.get("dataset_id", "unknown")
 
+    # Handle WaDi v2 rawraw with second-row test headers and in-file labels.
+    if spec.get("file_format") == "wadi_v2":
+        train_df = pd.read_csv(data_dir / spec["train_file"], sep=",", header=0)
+
+        test_file = None
+        for candidate in spec.get("test_file_candidates", []):
+            candidate_path = data_dir / candidate
+            if candidate_path.exists():
+                test_file = candidate
+                break
+        if test_file is None:
+            raise FileNotFoundError(
+                f"[{dataset_id}] none of test file candidates exist: {spec.get('test_file_candidates', [])}"
+            )
+
+        # In WaDi v2 attack file, sensor names are stored in row 2 (header=1).
+        test_df = pd.read_csv(data_dir / test_file, sep=",", header=1)
+
+        train_df.columns = [str(col).strip() for col in train_df.columns]
+        test_df.columns = [str(col).strip() for col in test_df.columns]
+
+        label_col = None
+        label_candidates = [c.strip().upper() for c in spec.get("label_column_candidates", [])]
+        for col in test_df.columns:
+            col_norm = str(col).strip().upper()
+            if col_norm in label_candidates:
+                label_col = col
+                break
+            if "LABLE" in col_norm and "ATTACK" in col_norm:
+                label_col = col
+                break
+
+        if label_col is None:
+            raise ValueError(f"[{dataset_id}] could not find WaDi label column in test data")
+
+        # WaDi labels are typically 1 for no-attack and -1 for attack.
+        raw_labels = pd.to_numeric(test_df[label_col], errors="coerce")
+        y_test = (raw_labels != 1).astype(float).to_numpy().ravel()
+
+        # Remove metadata and label columns from features.
+        metadata_cols = {"ROW", "ROW ", "DATE", "DATE ", "TIME", "TIME "}
+        train_drop_cols = [c for c in train_df.columns if str(c).strip().upper() in metadata_cols]
+        test_drop_cols = [c for c in test_df.columns if str(c).strip().upper() in metadata_cols]
+        train_df = train_df.drop(columns=train_drop_cols, errors="ignore")
+        test_df = test_df.drop(columns=test_drop_cols + [label_col], errors="ignore")
+
+        common_cols = [c for c in train_df.columns if c in test_df.columns]
+        if not common_cols:
+            raise ValueError(f"[{dataset_id}] no common feature columns between train and test")
+
+        x_train_df = train_df[common_cols].apply(pd.to_numeric, errors="coerce")
+        x_test_df = test_df[common_cols].apply(pd.to_numeric, errors="coerce")
+        x_train = x_train_df.to_numpy(dtype=float)
+        x_test = x_test_df.to_numpy(dtype=float)
     # Handle pickle files (QAD)
-    if spec.get("file_format") == "pickle":
+    elif spec.get("file_format") == "pickle":
         with open(data_dir / spec["train_file"], "rb") as f:
             x_train_df = pickle.load(f)
         with open(data_dir / spec["test_file"], "rb") as f:
@@ -253,20 +362,57 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         
         x_train = x_train_df.to_numpy() if isinstance(x_train_df, pd.DataFrame) else x_train_df
         x_test = x_test_df.to_numpy() if isinstance(x_test_df, pd.DataFrame) else x_test_df
+    elif spec.get("file_format") == "nasa_npy":
+        x_train = np.load(data_dir / spec["train_file"])
+        x_test = np.load(data_dir / spec["test_file"])
+
+        if x_train.ndim == 1:
+            x_train = x_train.reshape(-1, 1)
+        elif x_train.ndim > 2:
+            x_train = x_train.reshape(x_train.shape[0], -1)
+
+        if x_test.ndim == 1:
+            x_test = x_test.reshape(-1, 1)
+        elif x_test.ndim > 2:
+            x_test = x_test.reshape(x_test.shape[0], -1)
+
+        y_len = int(spec.get("num_values", x_test.shape[0]))
+        y_len = max(y_len, 0)
+        y_test = np.zeros(y_len, dtype=float)
+
+        for start_idx, stop_idx in spec.get("anomaly_sequences", []):
+            start = max(0, min(int(start_idx), y_len))
+            stop = max(start, min(int(stop_idx), y_len))
+            y_test[start:stop] = 1.0
+
+        if x_test.shape[0] != y_test.shape[0]:
+            aligned_len = min(x_test.shape[0], y_test.shape[0])
+            LOGGER.warning(
+                "[%s] NASA test/label length mismatch (x_test=%d, y_test=%d); truncating both to %d",
+                dataset_id,
+                x_test.shape[0],
+                y_test.shape[0],
+                aligned_len,
+            )
+            x_test = x_test[:aligned_len]
+            y_test = y_test[:aligned_len]
     else:
-        # Handle CSV files (SWaT, PSM, SMD)
+        # Handle CSV files (SWaT, PSM, SMD, WaDi, ...)
         header = spec.get("header", "infer")  # Default to "infer", can be None for no header
-        
+        # Allow per-split index column overrides (e.g. WaDi train has "index" col, test does not)
+        train_index_col = spec.get("train_index_col", spec.get("feature_index_col"))
+        test_index_col  = spec.get("test_index_col",  spec.get("feature_index_col"))
+
         x_train_df = pd.read_csv(
-            data_dir / spec["train_file"], 
-            sep=",", 
-            index_col=spec.get("feature_index_col"),
+            data_dir / spec["train_file"],
+            sep=",",
+            index_col=train_index_col,
             header=header,
         )
         x_test_df = pd.read_csv(
-            data_dir / spec["test_file"], 
-            sep=",", 
-            index_col=spec.get("feature_index_col"),
+            data_dir / spec["test_file"],
+            sep=",",
+            index_col=test_index_col,
             header=header,
         )
 
@@ -306,6 +452,8 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
             LOGGER.info("[%s] truncating test rows: %s -> %s", dataset_id, x_test.shape[0], max_test_samples)
         x_test = x_test[:max_test_samples]
         y_test = y_test[:max_test_samples]
+
+    x_train, x_test = _standard_scale_features(x_train, x_test, dataset_id)
 
     LOGGER.info(
         "[%s] loaded dataset: train_shape=%s, test_shape=%s, labels_shape=%s",
@@ -372,23 +520,39 @@ def macro_average(per_dataset_df):
 
 def _impute_nan_windowed(X, dataset_id: str, split: str, window: int = 5):
     """Replace NaNs with the mean of a ±window context window, then column mean, then 0."""
-    import numpy as np
-
-    nan_count = int(np.isnan(X).sum())
+    arr = np.asarray(X, dtype=float)
+    original_shape = arr.shape
+    nan_count = int(np.isnan(arr).sum())
     if nan_count == 0:
-        return X
+        return arr
 
     LOGGER.warning(
         "[%s] %s: found %d NaN value(s) in shape %s — imputing with ±%d window mean",
-        dataset_id, split, nan_count, X.shape, window,
+        dataset_id, split, nan_count, original_shape, window,
     )
 
-    df = pd.DataFrame(X, dtype=float)
+    if arr.ndim == 1:
+        df = pd.DataFrame(arr, dtype=float)
+    else:
+        df = pd.DataFrame(arr, dtype=float)
+
     rolling_mean = df.rolling(window=2 * window + 1, min_periods=1, center=True).mean()
     df = df.where(df.notna(), rolling_mean)   # fill NaNs with rolling mean
     df = df.fillna(df.mean())                 # fallback: column mean
     df = df.fillna(0.0)                       # last resort: zero
-    return df.to_numpy()
+    out = df.to_numpy()
+    if len(original_shape) == 1:
+        return out.ravel()
+    return out.reshape(original_shape)
+
+
+def _standard_scale_features(x_train, x_test, dataset_id: str):
+    """Fit a per-feature StandardScaler on train and apply to train/test."""
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_test_scaled = scaler.transform(x_test)
+    LOGGER.info("[%s] applied StandardScaler feature-wise using train statistics", dataset_id)
+    return x_train_scaled, x_test_scaled
 
 
 def append_df_to_csv(df, csv_path, index=False):
