@@ -10,12 +10,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from pyod.models.copod import COPOD
-from pyod.models.iforest import IForest
-from pyod.models.knn import KNN
-from pyod.models.lof import LOF
-from pyod.models.ocsvm import OCSVM
-from pyod.models.pca import PCA
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -27,14 +21,47 @@ from anomaly_detection import get_ts_eval
 LOGGER = logging.getLogger(__name__)
 
 
-CLASSIFIER_FACTORIES = {
-    "KNN": lambda: KNN(),
-    "PCA": lambda: PCA(n_components=3),
-    "COPOD": lambda: COPOD(),
-    "IForest": lambda: IForest(),
-    "LOF": lambda: LOF(),
-    "OCSVM": lambda: OCSVM(),
-}
+def build_classifier_factories():
+    # Import deepod models lazily so GPU visibility can be configured first.
+    from pyod.models.copod import COPOD
+    from pyod.models.iforest import IForest
+    from pyod.models.knn import KNN
+    from pyod.models.lof import LOF
+    from pyod.models.ocsvm import OCSVM
+    from pyod.models.pca import PCA
+
+
+    from deepod.models.time_series import (
+        AnomalyTransformer,
+        COUTA,
+        DeepIsolationForestTS,
+        DeepSVDDTS,
+        TcnED,
+        TimesNet,
+        TranAD,
+        USAD,
+        # DCdetector, NCAD
+    )
+
+    return {
+        "KNN": lambda: KNN(),
+        "PCA": lambda: PCA(n_components=3),
+        "COPOD": lambda: COPOD(),
+        "IForest": lambda: IForest(),
+        "LOF": lambda: LOF(),
+        "OCSVM": lambda: OCSVM(),
+        "TimesNet": lambda: TimesNet(seq_len=100, stride=100),
+        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100),
+        "USAD": lambda: USAD(seq_len=100, stride=100),
+        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100),
+        "TcnED": lambda: TcnED(seq_len=100, stride=100),
+        "TranAD": lambda: TranAD(seq_len=100, stride=100),
+        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100),
+        "COUTA": lambda: COUTA(seq_len=100, stride=100),
+        # "NCAD": lambda: NCAD(seq_len=100, stride=100),
+        # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
+    }
+
 
 def configure_gpu(gpu_id):
     if gpu_id is None:
@@ -319,6 +346,7 @@ if __name__ == "__main__":
     configure_logging(args.log_level)
     configure_gpu(args.gpu_id)
 
+    classifier_factories = build_classifier_factories()
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
@@ -330,7 +358,7 @@ if __name__ == "__main__":
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
-    selected_classifiers = _select_keys(CLASSIFIER_FACTORIES, args.classifiers)
+    selected_classifiers = _select_keys(classifier_factories, args.classifiers)
 
     LOGGER.info("Selected benchmarks: %s", selected_benchmarks)
     LOGGER.info("Selected classifiers: %s", selected_classifiers)
@@ -346,7 +374,7 @@ if __name__ == "__main__":
     for benchmark_name in selected_benchmarks:
         dataset_specs = BENCHMARK_DATASETS[benchmark_name]
         for clf_name in selected_classifiers:
-            clf_factory = CLASSIFIER_FACTORIES[clf_name]
+            clf_factory = classifier_factories[clf_name]
             for dataset_spec in dataset_specs:
                 dataset_id = dataset_spec["dataset_id"]
                 try:
