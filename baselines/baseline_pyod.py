@@ -36,6 +36,26 @@ CLASSIFIER_FACTORIES = {
     "OCSVM": lambda: OCSVM(),
 }
 
+def configure_gpu(gpu_id):
+    if gpu_id is None:
+        LOGGER.info("No --gpu-id provided; keeping CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"))
+        return
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    LOGGER.info("Configured single GPU visibility: CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # After CUDA_VISIBLE_DEVICES remapping, the selected GPU is index 0.
+            torch.cuda.set_device(0)
+            LOGGER.info("Pinned torch CUDA device to cuda:0 (mapped from physical GPU %s)", gpu_id)
+        else:
+            LOGGER.warning("--gpu-id=%s set, but torch.cuda is not available; running without CUDA", gpu_id)
+    except Exception:
+        LOGGER.exception("Failed to pin torch device for --gpu-id=%s", gpu_id)
+
 # One benchmark can contain one or multiple independent datasets.
 def _build_smd_datasets():
     """Build dataset specs for all SMD machines (machine-x-n)."""
@@ -155,6 +175,12 @@ def parse_args():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity.",
     )
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=None,
+        help="Physical GPU id to use exclusively (sets CUDA_VISIBLE_DEVICES to this single id).",
+    )
     return parser.parse_args()
 
 
@@ -249,6 +275,8 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
 def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, benchmark_name, dataset_id):
     LOGGER.info("[%s/%s] running %s", benchmark_name, dataset_id, clf_name)
     clf.fit(x_train)
+    LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
+
     y_test_scores = clf.decision_function(x_test)
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
 
@@ -289,6 +317,8 @@ def macro_average(per_dataset_df):
 if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
+    configure_gpu(args.gpu_id)
+
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
