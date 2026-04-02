@@ -170,6 +170,12 @@ BENCHMARK_DATASETS = {
 
 
 def parse_args():
+    def positive_int(value):
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("--runs must be >= 1")
+        return parsed
+
     parser = argparse.ArgumentParser(description="Run PYOD baselines and macro-average metrics across datasets.")
     parser.add_argument(
         "--benchmarks",
@@ -207,6 +213,12 @@ def parse_args():
         type=int,
         default=None,
         help="Physical GPU id to use exclusively (sets CUDA_VISIBLE_DEVICES to this single id).",
+    )
+    parser.add_argument(
+        "--runs",
+        type=positive_int,
+        default=1,
+        help="How many repeated evaluation runs to execute per benchmark/classifier/dataset combination.",
     )
     return parser.parse_args()
 
@@ -277,6 +289,13 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
 
         x_train = x_train_df.to_numpy()
         x_test = x_test_df.to_numpy()
+
+    x_train = _impute_nan_windowed(x_train, dataset_id, "train")
+    x_test = _impute_nan_windowed(x_test, dataset_id, "test")
+
+    y_test = _impute_nan_windowed(y_test, dataset_id, "test")
+    y_test[y_test < 0.5] = 0
+    y_test[y_test >= 0.5] = 1
 
     if max_train_samples is not None:
         if x_train.shape[0] > max_train_samples:
@@ -351,9 +370,54 @@ def macro_average(per_dataset_df):
     return macro_df
 
 
+def _impute_nan_windowed(X, dataset_id: str, split: str, window: int = 5):
+    """Replace NaNs with the mean of a ±window context window, then column mean, then 0."""
+    import numpy as np
+
+    nan_count = int(np.isnan(X).sum())
+    if nan_count == 0:
+        return X
+
+    LOGGER.warning(
+        "[%s] %s: found %d NaN value(s) in shape %s — imputing with ±%d window mean",
+        dataset_id, split, nan_count, X.shape, window,
+    )
+
+    df = pd.DataFrame(X, dtype=float)
+    rolling_mean = df.rolling(window=2 * window + 1, min_periods=1, center=True).mean()
+    df = df.where(df.notna(), rolling_mean)   # fill NaNs with rolling mean
+    df = df.fillna(df.mean())                 # fallback: column mean
+    df = df.fillna(0.0)                       # last resort: zero
+    return df.to_numpy()
+
+
 def append_df_to_csv(df, csv_path, index=False):
     file_exists = csv_path.exists() and csv_path.stat().st_size > 0
     df.to_csv(csv_path, mode="a", header=not file_exists, index=index)
+
+
+def aggregate_mean_std(df, group_cols):
+    metrics = ["auroc", "auprc", "f1"]
+    mean_df = df.groupby(group_cols, as_index=False)[metrics].mean().rename(columns={m: f"{m}_mean" for m in metrics})
+    std_df = (
+        df.groupby(group_cols, as_index=False)[metrics]
+        .std(ddof=0)
+        .fillna(0.0)
+        .rename(columns={m: f"{m}_std" for m in metrics})
+    )
+    counts_df = df.groupby(group_cols, as_index=False).size().rename(columns={"size": "num_runs"})
+    return mean_df.merge(std_df, on=group_cols, how="inner").merge(counts_df, on=group_cols, how="inner")
+
+
+def build_mean_std_report(df, group_cols):
+    report_df = df[group_cols + ["num_runs"]].copy()
+    for metric in ["auroc", "auprc", "f1"]:
+        report_df[metric] = (
+            df[f"{metric}_mean"].map(lambda value: f"{value:.6f}")
+            + " +- "
+            + df[f"{metric}_std"].map(lambda value: f"{value:.6f}")
+        )
+    return report_df
 
 
 if __name__ == "__main__":
@@ -367,14 +431,17 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     per_dataset_path = output_dir / "baselines_per_dataset.csv"
     macro_path = output_dir / "baselines.csv"
+    per_dataset_summary_path = output_dir / "baselines_per_dataset_mean_std.csv"
+    macro_summary_path = output_dir / "baselines_macro_mean_std.csv"
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
         args.max_test_samples,
+        args.runs,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
@@ -390,43 +457,60 @@ if __name__ == "__main__":
             LOGGER.info("Benchmark %s has %d dataset(s)", benchmark_name, dataset_count)
 
     per_dataset_rows = []
+    per_run_rows = []
     failed_runs = []
-    for benchmark_name in selected_benchmarks:
-        dataset_specs = BENCHMARK_DATASETS[benchmark_name]
-        for clf_name in selected_classifiers:
-            clf_factory = classifier_factories[clf_name]
-            for dataset_spec in dataset_specs:
-                dataset_id = dataset_spec["dataset_id"]
-                try:
-                    x_train, x_test, y_test = load_dataset(
-                        dataset_spec,
-                        max_train_samples=args.max_train_samples,
-                        max_test_samples=args.max_test_samples,
-                    )
-                    clf = clf_factory()
-                    row = evaluate_classifier_on_dataset(
-                        clf_name,
-                        clf,
-                        x_train,
-                        x_test,
-                        y_test,
-                        benchmark_name,
-                        dataset_id,
-                    )
-                    per_dataset_rows.append(row)
-                    append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
-                except Exception:
-                    failed_runs.append((benchmark_name, dataset_id, clf_name))
-                    LOGGER.exception("[%s/%s] %s failed", benchmark_name, dataset_id, clf_name)
+    for run_idx in range(args.runs):
+        run_number = run_idx + 1
+        LOGGER.info("Starting run %d/%d", run_number, args.runs)
+        for benchmark_name in selected_benchmarks:
+            dataset_specs = BENCHMARK_DATASETS[benchmark_name]
+            for clf_name in selected_classifiers:
+                clf_factory = classifier_factories[clf_name]
+                for dataset_spec in dataset_specs:
+                    dataset_id = dataset_spec["dataset_id"]
+                    try:
+                        x_train, x_test, y_test = load_dataset(
+                            dataset_spec,
+                            max_train_samples=args.max_train_samples,
+                            max_test_samples=args.max_test_samples,
+                        )
+                        clf = clf_factory()
+                        row = evaluate_classifier_on_dataset(
+                            clf_name,
+                            clf,
+                            x_train,
+                            x_test,
+                            y_test,
+                            benchmark_name,
+                            dataset_id,
+                        )
+                        per_dataset_rows.append(row)
+                        per_run_rows.append({**row, "run": run_number})
+                        append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
+                    except Exception:
+                        failed_runs.append((run_number, benchmark_name, dataset_id, clf_name))
+                        LOGGER.exception("[run=%d][%s/%s] %s failed", run_number, benchmark_name, dataset_id, clf_name)
 
     if not per_dataset_rows:
         LOGGER.error("No successful runs. Failed runs: %d", len(failed_runs))
         sys.exit(1)
 
     per_dataset_df = pd.DataFrame(per_dataset_rows)
+    per_run_df = pd.DataFrame(per_run_rows)
+
     macro_df = macro_average(per_dataset_df)
     macro_df = macro_df.set_index(["benchmark", "clf_name"])
     append_df_to_csv(macro_df.reset_index(), macro_path, index=False)
+
+    per_dataset_summary_df = aggregate_mean_std(per_run_df, ["benchmark", "dataset_id", "clf_name"])
+    append_df_to_csv(per_dataset_summary_df, per_dataset_summary_path, index=False)
+
+    per_run_macro_df = (
+        per_run_df.groupby(["run", "benchmark", "clf_name"], as_index=False)[["auroc", "auprc", "f1"]]
+        .mean()
+    )
+    macro_summary_df = aggregate_mean_std(per_run_macro_df, ["benchmark", "clf_name"])
+    append_df_to_csv(macro_summary_df, macro_summary_path, index=False)
 
     LOGGER.info("Completed %d successful run(s)", len(per_dataset_rows))
     if failed_runs:
@@ -434,6 +518,16 @@ if __name__ == "__main__":
 
     LOGGER.info("Per-dataset metrics:\n%s", per_dataset_df.to_string(index=False))
     LOGGER.info("Macro-averaged benchmark metrics:\n%s", macro_df.to_string())
+    LOGGER.info(
+        "Per-dataset mean +- std across runs:\n%s",
+        build_mean_std_report(per_dataset_summary_df, ["benchmark", "dataset_id", "clf_name"]).to_string(index=False),
+    )
+    LOGGER.info(
+        "Macro mean +- std across runs:\n%s",
+        build_mean_std_report(macro_summary_df, ["benchmark", "clf_name"]).to_string(index=False),
+    )
     LOGGER.info("Appended per-dataset metrics to %s", per_dataset_path)
     LOGGER.info("Appended macro-averaged metrics to %s", macro_path)
+    LOGGER.info("Appended per-dataset mean/std metrics to %s", per_dataset_summary_path)
+    LOGGER.info("Appended macro mean/std metrics to %s", macro_summary_path)
 
