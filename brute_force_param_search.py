@@ -2,7 +2,7 @@ import os
 from random import SystemRandom
 from itertools import product
 
-from basic_data_anomaly_detection import start_experiment, extend_argparse
+from anomaly_detection import start_experiment, extend_argparse
 from data.ad_provider import ADProvider
 from utils.parser import generic_parser
 

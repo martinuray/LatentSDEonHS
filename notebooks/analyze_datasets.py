@@ -10,7 +10,7 @@ from rich.table import Table
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
 
-from basic_data_anomaly_detection import logprob2f1s
+from anomaly_detection import logprob2f1s
 from scipy.stats import iqr
 
 from utils.scoring_functions import Evaluator

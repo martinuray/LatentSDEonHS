@@ -2,7 +2,7 @@ import logging
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from basic_data_anomaly_detection import extend_argparse, start_experiment
+from anomaly_detection import extend_argparse, start_experiment
 from utils.parser import generic_parser
 
 

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from argparse import Namespace
 
-from basic_data_anomaly_detection import calculate_z_normalization_values
+from anomaly_detection import calculate_z_normalization_values
 from data.ad_provider import ADProvider
 from data.aero_provider import AeroDataProvider
 from notebooks.utils.analyze import (get_modules, plot_stat,
