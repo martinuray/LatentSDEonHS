@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import logging
 import os
 import pickle
 import sys
@@ -23,6 +24,9 @@ if str(ROOT_DIR) not in sys.path:
 from anomaly_detection import get_ts_eval
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 CLASSIFIER_FACTORIES = {
     "KNN": lambda: KNN(),
     "PCA": lambda: PCA(n_components=3),
@@ -40,7 +44,6 @@ def _build_smd_datasets():
     
     # Discover all machine-x-n files and create specs for each
     train_dir = smd_base_dir / "train"
-    import glob
     train_files = sorted(glob.glob(str(train_dir / "machine-*.txt")))
     
     for train_file in train_files:
@@ -79,6 +82,15 @@ def _build_qad_datasets():
         })
     
     return qad_datasets
+
+
+def configure_logging(level_name: str):
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 BENCHMARK_DATASETS = {
@@ -136,6 +148,13 @@ def parse_args():
         default=None,
         help="Optional cap on test rows (and labels) for quick checks.",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity.",
+    )
     return parser.parse_args()
 
 
@@ -151,7 +170,8 @@ def _select_keys(available, requested_csv):
 
 def load_dataset(spec, max_train_samples=None, max_test_samples=None):
     data_dir = spec["data_dir"]
-    
+    dataset_id = spec.get("dataset_id", "unknown")
+
     # Handle pickle files (QAD)
     if spec.get("file_format") == "pickle":
         with open(data_dir / spec["train_file"], "rb") as f:
@@ -188,8 +208,12 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         for col_name in spec.get("drop_feature_columns", []):
             if col_name in x_train_df.columns:
                 x_train_df = x_train_df.drop(columns=[col_name])
+            else:
+                LOGGER.debug("[%s] train missing drop column '%s'", dataset_id, col_name)
             if col_name in x_test_df.columns:
                 x_test_df = x_test_df.drop(columns=[col_name])
+            else:
+                LOGGER.debug("[%s] test missing drop column '%s'", dataset_id, col_name)
 
         y_test_df = pd.read_csv(data_dir / spec["label_file"], sep=",", header=header)
         label_col = spec.get("label_column")
@@ -202,15 +226,28 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_test = x_test_df.to_numpy()
 
     if max_train_samples is not None:
+        if x_train.shape[0] > max_train_samples:
+            LOGGER.info("[%s] truncating train rows: %s -> %s", dataset_id, x_train.shape[0], max_train_samples)
         x_train = x_train[:max_train_samples]
     if max_test_samples is not None:
+        if x_test.shape[0] > max_test_samples:
+            LOGGER.info("[%s] truncating test rows: %s -> %s", dataset_id, x_test.shape[0], max_test_samples)
         x_test = x_test[:max_test_samples]
         y_test = y_test[:max_test_samples]
+
+    LOGGER.info(
+        "[%s] loaded dataset: train_shape=%s, test_shape=%s, labels_shape=%s",
+        dataset_id,
+        x_train.shape,
+        x_test.shape,
+        y_test.shape,
+    )
 
     return x_train, x_test, y_test
 
 
 def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, benchmark_name, dataset_id):
+    LOGGER.info("[%s/%s] running %s", benchmark_name, dataset_id, clf_name)
     clf.fit(x_train)
     y_test_scores = clf.decision_function(x_test)
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
@@ -220,11 +257,14 @@ def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, bench
         "auprc": metric_results["auprc"],
         "f1": metric_results["f1"],
     }
-    print(
-        f"[{benchmark_name}/{dataset_id}] {clf_name}: "
-        f"auroc={selected_metrics['auroc']:.6f}, "
-        f"auprc={selected_metrics['auprc']:.6f}, "
-        f"f1={selected_metrics['f1']:.6f}"
+    LOGGER.info(
+        "[%s/%s] %s: auroc=%.6f, auprc=%.6f, f1=%.6f",
+        benchmark_name,
+        dataset_id,
+        clf_name,
+        selected_metrics["auroc"],
+        selected_metrics["auprc"],
+        selected_metrics["f1"],
     )
 
     return {
@@ -248,31 +288,61 @@ def macro_average(per_dataset_df):
 
 if __name__ == "__main__":
     args = parse_args()
+    configure_logging(args.log_level)
+
+    LOGGER.info("Starting baseline evaluation")
+    LOGGER.info(
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s",
+        args.benchmarks,
+        args.classifiers,
+        args.max_train_samples,
+        args.max_test_samples,
+    )
+
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
     selected_classifiers = _select_keys(CLASSIFIER_FACTORIES, args.classifiers)
 
+    LOGGER.info("Selected benchmarks: %s", selected_benchmarks)
+    LOGGER.info("Selected classifiers: %s", selected_classifiers)
+    for benchmark_name in selected_benchmarks:
+        dataset_count = len(BENCHMARK_DATASETS[benchmark_name])
+        if dataset_count == 0:
+            LOGGER.warning("Benchmark %s has no discovered datasets", benchmark_name)
+        else:
+            LOGGER.info("Benchmark %s has %d dataset(s)", benchmark_name, dataset_count)
+
     per_dataset_rows = []
+    failed_runs = []
     for benchmark_name in selected_benchmarks:
         dataset_specs = BENCHMARK_DATASETS[benchmark_name]
         for clf_name in selected_classifiers:
             clf_factory = CLASSIFIER_FACTORIES[clf_name]
             for dataset_spec in dataset_specs:
-                x_train, x_test, y_test = load_dataset(
-                    dataset_spec,
-                    max_train_samples=args.max_train_samples,
-                    max_test_samples=args.max_test_samples,
-                )
-                clf = clf_factory()
-                row = evaluate_classifier_on_dataset(
-                    clf_name,
-                    clf,
-                    x_train,
-                    x_test,
-                    y_test,
-                    benchmark_name,
-                    dataset_spec["dataset_id"],
-                )
-                per_dataset_rows.append(row)
+                dataset_id = dataset_spec["dataset_id"]
+                try:
+                    x_train, x_test, y_test = load_dataset(
+                        dataset_spec,
+                        max_train_samples=args.max_train_samples,
+                        max_test_samples=args.max_test_samples,
+                    )
+                    clf = clf_factory()
+                    row = evaluate_classifier_on_dataset(
+                        clf_name,
+                        clf,
+                        x_train,
+                        x_test,
+                        y_test,
+                        benchmark_name,
+                        dataset_id,
+                    )
+                    per_dataset_rows.append(row)
+                except Exception:
+                    failed_runs.append((benchmark_name, dataset_id, clf_name))
+                    LOGGER.exception("[%s/%s] %s failed", benchmark_name, dataset_id, clf_name)
+
+    if not per_dataset_rows:
+        LOGGER.error("No successful runs. Failed runs: %d", len(failed_runs))
+        sys.exit(1)
 
     per_dataset_df = pd.DataFrame(per_dataset_rows)
     macro_df = macro_average(per_dataset_df)
@@ -286,10 +356,12 @@ if __name__ == "__main__":
     per_dataset_df.to_csv(per_dataset_path, index=False)
     macro_df.to_csv(macro_path, index=True)
 
-    print("\nPer-dataset metrics:")
-    print(per_dataset_df)
-    print("\nMacro-averaged benchmark metrics:")
-    print(macro_df)
-    print(f"\nSaved per-dataset metrics to {per_dataset_path}")
-    print(f"Saved macro-averaged metrics to {macro_path}")
+    LOGGER.info("Completed %d successful run(s)", len(per_dataset_rows))
+    if failed_runs:
+        LOGGER.warning("Encountered %d failed run(s); continuing with successful results", len(failed_runs))
+
+    LOGGER.info("Per-dataset metrics:\n%s", per_dataset_df.to_string(index=False))
+    LOGGER.info("Macro-averaged benchmark metrics:\n%s", macro_df.to_string())
+    LOGGER.info("Saved per-dataset metrics to %s", per_dataset_path)
+    LOGGER.info("Saved macro-averaged metrics to %s", macro_path)
 
