@@ -1,7 +1,7 @@
 import logging
 import os
-import pickle
 import glob
+import re
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,7 @@ class QADData:
             window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
             data_normalization_strategy: str = "none",
-            raw_subdir: str = "qad_clean_pkl_100Hz"
+            raw_subdir: str = "qad_clean_txt_100Hz"
     ):
 
         self.scaler = normalizer
@@ -58,13 +58,13 @@ class QADData:
         os.makedirs(self.processed_folder, exist_ok=True)
 
         required_files = [
-            os.path.join(self.raw_folder, f'train_{self.dataset_number}.pkl'),
-            os.path.join(self.raw_folder, f'test_{self.dataset_number}.pkl'),
-            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl')
+            os.path.join(self.raw_folder, f'train_{self.dataset_number}.txt'),
+            os.path.join(self.raw_folder, f'test_{self.dataset_number}.txt'),
+            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.txt')
         ]
 
         return all(os.path.isfile(f) for f in required_files)
-                
+
     def _check_exists(self):
         return os.path.isfile(os.path.join(
             self.processed_folder, f'{self.mode}_{self.dataset_number}.pt')
@@ -75,7 +75,7 @@ class QADData:
         if os.path.isdir(requested):
             return self.raw_subdir
 
-        fallback = "qad_clean_pkl_100Hz"
+        fallback = "qad_clean_txt_100Hz"
         fallback_path = os.path.join(self.root_path, "QAD", "raw", fallback)
         if os.path.isdir(fallback_path):
             logging.warning(
@@ -145,11 +145,14 @@ class QADData:
 
     def _process_QAD_data(self, n_samples=None):
         logging.warning("Processing QAD Data")
-        raw_data = load_pickl(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.pkl'))
+        raw_data = load_qad_txt(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.txt'))
         raw_data = reshape_data(raw_data, self.window_length)
 
         if self.mode == 'test':
-            self.targets = load_pickl(os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl'))
+            self.targets = load_qad_txt(
+                os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.txt'),
+                is_label=True,
+            )
             self.targets = reshape_data(self.targets, self.window_length)
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
@@ -199,7 +202,7 @@ class QADDataset(Dataset):
     
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
-                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_pkl_100Hz"):
+                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz"):
 
         self.mode = mode
         self.subsample = subsample
@@ -307,15 +310,15 @@ class QADDataset(Dataset):
         if dataset_number is None:
             raw_folder = os.path.join(data_dir, "QAD", "raw", raw_subdir)
             if not os.path.isdir(raw_folder):
-                fallback = os.path.join(data_dir, "QAD", "raw", "qad_clean_pkl_100Hz")
+                fallback = os.path.join(data_dir, "QAD", "raw", "qad_clean_txt_100Hz")
                 raw_folder = fallback if os.path.isdir(fallback) else raw_folder
 
-            train_files = glob.glob(os.path.join(raw_folder, "train_*.pkl"))
+            train_files = glob.glob(os.path.join(raw_folder, "train_*.txt"))
             ids = []
             for file_ in train_files:
-                stem = os.path.basename(file_).replace("train_", "").replace(".pkl", "")
-                if stem.isdigit():
-                    ids.append(int(stem))
+                match = re.match(r"^train_(\d+)\.txt$", os.path.basename(file_))
+                if match is not None:
+                    ids.append(int(match.group(1)))
 
             ids = sorted(set(ids))
             if len(ids) == 0:
@@ -396,7 +399,7 @@ class QADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset_number=None, window_length: int = 100,
                  window_overlap: float = 0.0,
                  data_normalization_strategy: str = "none", subsample: float = 1.0,
-                 raw_subdir: str = "qad_clean_pkl_100Hz"):
+                 raw_subdir: str = "qad_clean_txt_100Hz"):
         super().__init__()
 
         self._dataset = dataset_number
@@ -463,9 +466,15 @@ class QADProvider(DatasetProvider):
         return DataLoader(self._ds_val, **kwargs)
 
 
-def load_pickl(dataset_path):
-    with open(dataset_path, 'rb') as f:
-        data = pickle.load(f)
+def load_qad_txt(dataset_path, is_label: bool = False):
+    # sep=None lets pandas infer comma/tab separators from converted TXT files.
+    data = pd.read_csv(dataset_path, sep=None, engine='python')
+
     if isinstance(data, pd.Series):
         data = data.to_frame(name='labels')
+
+    # Label files should always expose a canonical `labels` column.
+    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and 'labels' not in data.columns:
+        data.columns = ['labels']
+
     return data
