@@ -6,6 +6,7 @@ import ast
 import glob
 import logging
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ from anomaly_detection import get_ts_eval
 LOGGER = logging.getLogger(__name__)
 
 
-def build_classifier_factories(device: str = "cpu"):
+def build_classifier_factories(device: str = "cpu", random_state: int | None = None):
     # Import deepod models lazily so GPU visibility can be configured first.
     from pyod.models.copod import COPOD
     from pyod.models.iforest import IForest
@@ -48,22 +49,35 @@ def build_classifier_factories(device: str = "cpu"):
 
     return {
         "KNN": lambda: KNN(),
-        "PCA": lambda: PCA(n_components=3),
+        "PCA": lambda: PCA(n_components=3, random_state=random_state),
         "COPOD": lambda: COPOD(),
-        "IForest": lambda: IForest(),
+        "IForest": lambda: IForest(random_state=random_state),
         "LOF": lambda: LOF(),
         "OCSVM": lambda: OCSVM(),
-        "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device),
-        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device),
-        "USAD": lambda: USAD(seq_len=100, stride=100, device=device),
-        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device),
-        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device),
-        "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device),
-        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device),
-        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device),
+        "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device, random_state=random_state),
+        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device, random_state=random_state),
+        "USAD": lambda: USAD(seq_len=100, stride=100, device="cpu", random_state=random_state),
+        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device, random_state=random_state),
+        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, random_state=random_state),
+        "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
+        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device, random_state=random_state),
+        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=1, random_state=random_state),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        LOGGER.debug("Torch seed setup failed for seed=%s", seed, exc_info=True)
 
 
 def configure_gpu(gpu_id):
@@ -319,6 +333,12 @@ def parse_args():
         type=positive_int,
         default=1,
         help="How many repeated evaluation runs to execute per benchmark/classifier/dataset combination.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base random seed; run i uses seed + i.",
     )
     return parser.parse_args()
 
@@ -672,7 +692,7 @@ if __name__ == "__main__":
     configure_logging(args.log_level)
     runtime_device = configure_gpu(args.gpu_id)
 
-    classifier_factories = build_classifier_factories(device=runtime_device)
+    classifier_factories = build_classifier_factories(device=runtime_device, random_state=args.seed)
 
     output_dir = ROOT_DIR / "out"
     os.makedirs(output_dir, exist_ok=True)
@@ -683,12 +703,13 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, device=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
         args.max_test_samples,
         args.runs,
+        args.seed,
         runtime_device,
     )
 
@@ -709,7 +730,10 @@ if __name__ == "__main__":
     failed_runs = []
     for run_idx in range(args.runs):
         run_number = run_idx + 1
-        LOGGER.info("Starting run %d/%d", run_number, args.runs)
+        run_seed = args.seed + run_idx
+        set_global_seed(run_seed)
+        classifier_factories = build_classifier_factories(device=runtime_device, random_state=run_seed)
+        LOGGER.info("Starting run %d/%d with seed=%d", run_number, args.runs, run_seed)
         for benchmark_name in selected_benchmarks:
             dataset_specs = BENCHMARK_DATASETS[benchmark_name]
             for clf_name in selected_classifiers:
@@ -733,11 +757,18 @@ if __name__ == "__main__":
                             dataset_id,
                         )
                         per_dataset_rows.append(row)
-                        per_run_rows.append({**row, "run": run_number})
+                        per_run_rows.append({**row, "run": run_number, "seed": run_seed})
                         append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
                     except Exception:
-                        failed_runs.append((run_number, benchmark_name, dataset_id, clf_name))
-                        LOGGER.exception("[run=%d][%s/%s] %s failed", run_number, benchmark_name, dataset_id, clf_name)
+                        failed_runs.append((run_number, run_seed, benchmark_name, dataset_id, clf_name))
+                        LOGGER.exception(
+                            "[run=%d][seed=%d][%s/%s] %s failed",
+                            run_number,
+                            run_seed,
+                            benchmark_name,
+                            dataset_id,
+                            clf_name,
+                        )
 
     if not per_dataset_rows:
         LOGGER.error("No successful runs. Failed runs: %d", len(failed_runs))
