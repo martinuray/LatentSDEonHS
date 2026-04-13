@@ -6,7 +6,7 @@ import ast
 import glob
 import logging
 import os
-import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -24,7 +24,7 @@ from anomaly_detection import get_ts_eval
 LOGGER = logging.getLogger(__name__)
 
 
-def build_classifier_factories():
+def build_classifier_factories(device: str = "cpu"):
     # Import deepod models lazily so GPU visibility can be configured first.
     from pyod.models.copod import COPOD
     from pyod.models.iforest import IForest
@@ -53,14 +53,14 @@ def build_classifier_factories():
         "IForest": lambda: IForest(),
         "LOF": lambda: LOF(),
         "OCSVM": lambda: OCSVM(),
-        "TimesNet": lambda: TimesNet(seq_len=100, stride=100),
-        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100),
-        "USAD": lambda: USAD(seq_len=100, stride=100),
-        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100),
-        "TcnED": lambda: TcnED(seq_len=100, stride=100),
-        "TranAD": lambda: TranAD(seq_len=100, stride=100),
-        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100),
-        "COUTA": lambda: COUTA(seq_len=100, stride=100),
+        "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device),
+        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device),
+        "USAD": lambda: USAD(seq_len=100, stride=100, batch_size=128, device=device),
+        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device),
+        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device),
+        "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device),
+        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device),
+        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
@@ -68,8 +68,9 @@ def build_classifier_factories():
 
 def configure_gpu(gpu_id):
     if gpu_id is None:
-        LOGGER.info("No --gpu-id provided; keeping CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"))
-        return
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        LOGGER.info("No --gpu-id provided; forcing CPU-only mode (CUDA_VISIBLE_DEVICES hidden)")
+        return "cpu"
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     LOGGER.info("Configured single GPU visibility: CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
@@ -81,21 +82,24 @@ def configure_gpu(gpu_id):
             # After CUDA_VISIBLE_DEVICES remapping, the selected GPU is index 0.
             torch.cuda.set_device(0)
             LOGGER.info("Pinned torch CUDA device to cuda:0 (mapped from physical GPU %s)", gpu_id)
+            return "cuda"
         else:
             LOGGER.warning("--gpu-id=%s set, but torch.cuda is not available; running without CUDA", gpu_id)
+            return "cpu"
     except Exception:
         LOGGER.exception("Failed to pin torch device for --gpu-id=%s", gpu_id)
+        return "cpu"
 
 # One benchmark can contain one or multiple independent datasets.
 def _build_smd_datasets():
     """Build dataset specs for all SMD machines (machine-x-n)."""
     smd_base_dir = ROOT_DIR / "data_dir" / "SMD" / "raw"
     smd_datasets = []
-    
+
     # Discover all machine-x-n files and create specs for each
     train_dir = smd_base_dir / "train"
     train_files = sorted(glob.glob(str(train_dir / "machine-*.txt")))
-    
+
     for train_file in train_files:
         machine_id = Path(train_file).stem  # e.g., "machine-1-1"
         smd_datasets.append({
@@ -114,24 +118,65 @@ def _build_smd_datasets():
 
 def _build_qad_datasets():
     """Build dataset specs for all QAD 100Hz datasets (qad_*_1 to qad_*_16)."""
-    qad_base_dir = ROOT_DIR / "data_dir" / "QAD" / "raw" / "qad_clean_pkl_100Hz"
+    qad_base_dir = _resolve_qad_raw_subdir()
     qad_datasets = []
-    
-    # Discover all train_*.pkl files and create specs for each
-    train_files = sorted(glob.glob(str(qad_base_dir / "train_*.pkl")))
-    
+
+    # Discover all train_*.txt files and create specs for each.
+    train_files = sorted(glob.glob(str(qad_base_dir / "train_*.txt")))
+
     for train_file in train_files:
-        dataset_num = Path(train_file).stem.replace("train_", "")  # e.g., "1", "10", etc.
+        file_name = Path(train_file).name
+        match = re.match(r"^train_(\d+)\.txt$", file_name)
+        if match is None:
+            continue
+
+        dataset_num = match.group(1)
         qad_datasets.append({
             "dataset_id": f"qad_{dataset_num}",
             "data_dir": qad_base_dir,
-            "train_file": f"train_{dataset_num}.pkl",
-            "test_file": f"test_{dataset_num}.pkl",
-            "label_file": f"test_label_{dataset_num}.pkl",
-            "file_format": "pickle",
+            "train_file": f"train_{dataset_num}.txt",
+            "test_file": f"test_{dataset_num}.txt",
+            "label_file": f"test_label_{dataset_num}.txt",
+            "file_format": "qad_txt",
         })
-    
+
     return qad_datasets
+
+
+def _resolve_qad_raw_subdir(raw_subdir: str = "qad_clean_txt_100Hz"):
+    requested = ROOT_DIR / "data_dir" / "QAD" / "raw" / raw_subdir
+    if requested.is_dir():
+        return requested
+
+    fallback = ROOT_DIR / "data_dir" / "QAD" / "raw" / "qad_clean_txt_100Hz"
+    if fallback.is_dir():
+        LOGGER.warning(
+            "Requested QAD folder '%s' not found. Falling back to '%s'.",
+            raw_subdir,
+            fallback.name,
+        )
+        return fallback
+
+    return requested
+
+
+def _load_qad_txt(dataset_path: Path, is_label: bool = False):
+    # sep=None lets pandas infer comma/tab separators from converted TXT files.
+    kwargs = {}
+    if not is_label:
+        kwargs["sep"] = None
+        kwargs["engine"] = "python"
+
+    data = pd.read_csv(dataset_path, **kwargs)
+
+    if isinstance(data, pd.Series):
+        data = data.to_frame(name="labels")
+
+    # Label files should always expose a canonical `labels` column.
+    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and "labels" not in data.columns:
+        data.columns = ["labels"]
+
+    return data
 
 
 def _build_nasa_datasets(spacecraft: str):
@@ -346,22 +391,40 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_test_df = test_df[common_cols].apply(pd.to_numeric, errors="coerce")
         x_train = x_train_df.to_numpy(dtype=float)
         x_test = x_test_df.to_numpy(dtype=float)
-    # Handle pickle files (QAD)
-    elif spec.get("file_format") == "pickle":
-        with open(data_dir / spec["train_file"], "rb") as f:
-            x_train_df = pickle.load(f)
-        with open(data_dir / spec["test_file"], "rb") as f:
-            x_test_df = pickle.load(f)
-        with open(data_dir / spec["label_file"], "rb") as f:
-            y_test = pickle.load(f)
-        
-        if isinstance(y_test, pd.Series):
-            y_test = y_test.to_numpy().ravel()
-        elif isinstance(y_test, pd.DataFrame):
-            y_test = y_test.to_numpy().ravel()
-        
-        x_train = x_train_df.to_numpy() if isinstance(x_train_df, pd.DataFrame) else x_train_df
-        x_test = x_test_df.to_numpy() if isinstance(x_test_df, pd.DataFrame) else x_test_df
+    # Handle QAD TXT files.
+    elif spec.get("file_format") == "qad_txt":
+        x_train_df = _load_qad_txt(data_dir / spec["train_file"])
+        x_test_df = _load_qad_txt(data_dir / spec["test_file"])
+        y_test_df = _load_qad_txt(data_dir / spec["label_file"], is_label=True)
+
+        x_train = x_train_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        x_test = x_test_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+        if isinstance(y_test_df, pd.DataFrame):
+            if y_test_df.shape[1] > 1:
+                LOGGER.warning(
+                    "[%s] QAD label file has %d columns; using only first column '%s'",
+                    dataset_id,
+                    y_test_df.shape[1],
+                    y_test_df.columns[0],
+                )
+            y_test_series = y_test_df.iloc[:, 0]
+        else:
+            y_test_series = y_test_df
+
+        y_test = pd.to_numeric(y_test_series, errors="coerce").to_numpy(dtype=float).ravel()
+
+        if x_test.shape[0] != y_test.shape[0]:
+            aligned_len = min(x_test.shape[0], y_test.shape[0])
+            LOGGER.warning(
+                "[%s] QAD test/label length mismatch (x_test=%d, y_test=%d); truncating both to %d",
+                dataset_id,
+                x_test.shape[0],
+                y_test.shape[0],
+                aligned_len,
+            )
+            x_test = x_test[:aligned_len]
+            y_test = y_test[:aligned_len]
     elif spec.get("file_format") == "nasa_npy":
         x_train = np.load(data_dir / spec["train_file"])
         x_test = np.load(data_dir / spec["test_file"])
@@ -477,12 +540,32 @@ def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, bench
         clf.train_val_pc,
     )
 
-    LOGGER.info("[%s/%s] running %s", benchmark_name, dataset_id, clf_name)
+    LOGGER.info(
+        "[%s/%s] running %s (device=%s, batch_size=%s)",
+        benchmark_name,
+        dataset_id,
+        clf_name,
+        getattr(clf, "device", "n/a"),
+        getattr(clf, "batch_size", "n/a"),
+    )
     clf.fit(x_train)
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
 
     y_test_scores = clf.decision_function(x_test)
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
+
+    del clf
+    import gc
+    gc.collect()
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        LOGGER.debug("[%s/%s] torch cleanup skipped", benchmark_name, dataset_id, exc_info=True)
+
 
     selected_metrics = {
         "auroc": metric_results["auroc"],
@@ -587,9 +670,9 @@ def build_mean_std_report(df, group_cols):
 if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
-    configure_gpu(args.gpu_id)
+    runtime_device = configure_gpu(args.gpu_id)
 
-    classifier_factories = build_classifier_factories()
+    classifier_factories = build_classifier_factories(device=runtime_device)
 
     output_dir = ROOT_DIR / "out"
     os.makedirs(output_dir, exist_ok=True)
@@ -600,12 +683,13 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, device=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
         args.max_test_samples,
         args.runs,
+        runtime_device,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)

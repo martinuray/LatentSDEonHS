@@ -142,7 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("data/QAD/raw/qad_clean_txt_100Hz"),
+        default=Path("../data_dir/QAD/raw/qad_clean_txt_100Hz"),
         help="Folder where converted files are written (default matches qad_provider.py raw_subdir)."
     )
     parser.add_argument(
