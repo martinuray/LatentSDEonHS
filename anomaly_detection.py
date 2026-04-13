@@ -60,6 +60,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
+    group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
     return parser
 
 
@@ -276,6 +277,43 @@ def compute_macro_metrics(per_dataset_stats):
             macro[f"macro_{key}"] = float(np.mean(values))
     return macro
 
+
+def _is_numeric_scalar(value):
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool)
+
+
+def _flatten_numeric_metrics(metrics, prefix="", out=None):
+    if out is None:
+        out = {}
+
+    if not isinstance(metrics, dict):
+        return out
+
+    for key, value in metrics.items():
+        flat_key = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            _flatten_numeric_metrics(value, flat_key, out)
+        elif _is_numeric_scalar(value):
+            out[flat_key] = float(value)
+    return out
+
+
+def aggregate_run_metrics(run_results):
+    values_by_key = defaultdict(list)
+    for result in run_results:
+        flat_metrics = _flatten_numeric_metrics(result)
+        for key, value in flat_metrics.items():
+            values_by_key[key].append(value)
+
+    aggregated = {}
+    for key, values in values_by_key.items():
+        arr = np.asarray(values, dtype=float)
+        aggregated[f"{key}_mean"] = float(arr.mean())
+        aggregated[f"{key}_std"] = float(arr.std(ddof=0))
+
+    aggregated["num_runs"] = len(run_results)
+    return aggregated
+
 def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     f1, f1_ts = 0, 0
     for ep_dict in stats[::-1]:
@@ -435,7 +473,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
     return stats
 
 
-def start_experiment(args, provider=None):
+def start_experiment(args, provider=None, store_final_metrics=True):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
@@ -592,7 +630,8 @@ def start_experiment(args, provider=None):
             )
             logging.shutdown()
             writer.close()
-            _store_final_metrics(stats2pass[0])
+            if store_final_metrics:
+                _store_final_metrics(stats2pass[0])
             logging.info(f"Final metrics across {provider.num_datasets} datasets: {stats2pass[0]}")
             return per_dataset_stats[only_id]
 
@@ -610,7 +649,8 @@ def start_experiment(args, provider=None):
             save_stats(args, combined_stats, fname)
 
         logging.info(f"Macro metrics across {provider.num_datasets} datasets: {macro_stats}")
-        _store_final_metrics(combined_stats)
+        if store_final_metrics:
+            _store_final_metrics(combined_stats)
         logging.shutdown()
         writer.close()
         return combined_stats
@@ -652,7 +692,8 @@ def start_experiment(args, provider=None):
     )
 
     finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
-    _store_final_metrics(tst_stats)
+    if store_final_metrics:
+        _store_final_metrics(tst_stats)
     logging.shutdown()
     writer.close()
     return tst_stats
@@ -760,8 +801,29 @@ def evaluate(
 def main():
     parser = extend_argparse(generic_parser)
     args_ = parser.parse_args()
+    if args_.runs < 1:
+        parser.error("--runs must be >= 1")
+
     print(args_)
-    _ = start_experiment(args_, provider=None)
+    if args_.runs == 1:
+        _ = start_experiment(args_, provider=None, store_final_metrics=True)
+        return
+
+    run_results = []
+    for run_idx in range(args_.runs):
+        logging.info("Starting run %d/%d", run_idx + 1, args_.runs)
+        run_result = start_experiment(args_, provider=None, store_final_metrics=False)
+        run_results.append(run_result)
+
+    aggregated_metrics = aggregate_run_metrics(run_results)
+    append_final_metrics_csv(
+        csv_path=getattr(args_, "final_metrics_csv", "logs/final_metrics.csv"),
+        benchmark=args_.dataset,
+        run_datetime=datetime.datetime.now().strftime('%y%m%d-%H:%M:%S'),
+        metrics=aggregated_metrics,
+    )
+    logging.info("Aggregated metrics over %d run(s): %s", args_.runs, aggregated_metrics)
+    print(aggregated_metrics)
 
 
 if __name__ == "__main__":
