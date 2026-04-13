@@ -55,7 +55,7 @@ def build_classifier_factories(device: str = "cpu"):
         "OCSVM": lambda: OCSVM(),
         "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device),
         "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device),
-        "USAD": lambda: USAD(seq_len=100, stride=100, batch_size=128, device=device),
+        "USAD": lambda: USAD(seq_len=100, stride=100, device=device),
         "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device),
         "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device),
         "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device),
