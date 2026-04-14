@@ -468,13 +468,18 @@ class QADProvider(DatasetProvider):
 
 def load_qad_txt(dataset_path, is_label: bool = False):
     # sep=None lets pandas infer comma/tab separators from converted TXT files.
-    data = pd.read_csv(dataset_path, sep=None, engine='python')
+    kwargs = {}
+    if not is_label:
+        kwargs["sep"] = None
+        kwargs["engine"] = "python"
+
+    data = pd.read_csv(dataset_path, **kwargs)
 
     if isinstance(data, pd.Series):
-        data = data.to_frame(name='labels')
+        data = data.to_frame(name="labels")
 
     # Label files should always expose a canonical `labels` column.
-    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and 'labels' not in data.columns:
-        data.columns = ['labels']
+    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and "labels" not in data.columns:
+        data.columns = ["labels"]
 
     return data

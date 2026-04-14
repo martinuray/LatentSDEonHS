@@ -540,7 +540,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 window_length=args.data_window_length,
                 subsample=args.subsample,
                 data_normalization_strategy=args.data_normalization_strategy,
-                raw_subdir="qad_clean_pkl_100Hz",
+                raw_subdir="qad_clean_txt_100Hz",
             )
         elif args.dataset in ['SMAP', 'MSL']:
             provider = NASAProvider(
