@@ -80,14 +80,11 @@ def get_parser():
         choices=["SWaT", "WaDiv1", "WaDiv2"],
         help="Dataset to process"
     )
-    parser.add_argument("--downsample-factor", type=int, default=5)
-    parser.add_argument("--savgol-polyorder", type=int, default=2)
-    parser.add_argument("--savgol-window-length", type=int, default=300)
+
     parser.add_argument("--window-length", type=int, default=100)
     parser.add_argument("--window-overlap", type=float, default=0)
     parser.add_argument("--validation-split", type=float, default=0.1)
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--smoothen", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--make-validation-set", action=argparse.BooleanOptionalAction, default=False)
     arguments_ = parser.parse_args()
     return arguments_
@@ -176,13 +173,19 @@ def main(args):
     # what normalize?
     train_df_normalized, test_df_normalized = norm(train_df_filtered, test_df_filtered)
 
-    train_df_filtered, _ = downsample(train_df_normalized, down_len=args.downsample_factor)
+    #train_df_filtered, _ = downsample(train_df_normalized, down_len=args.downsample_factor)
+    train_df_filtered = train_df_normalized
 
-    test_df_filtered, test_labels = downsample(test_df_normalized, test_labels,
-                                                    down_len=args.downsample_factor)
+    #test_df_filtered, test_labels = downsample(test_df_normalized, test_labels,
+    #                                                down_len=args.downsample_factor)
+    test_df_filtered, test_labels = test_df_normalized, test_labels
 
-    df_test_labels = pd.DataFrame(test_labels, columns=['labels'])
-    #train_df_filtered = train_df_filtered.reset_index()
+    if "WaDi" in args.dataset:
+        df_test_labels = pd.DataFrame(test_labels)
+        df_test_labels.columns = ['labels']
+    else:
+        df_test_labels = pd.DataFrame(test_labels, columns=['labels'])
+#train_df_filtered = train_df_filtered.reset_index()
 
     if args_.debug:
         df_comparison_num_critical_features = pd.DataFrame({

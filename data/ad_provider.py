@@ -153,7 +153,7 @@ class ADData(object):
         indcs = np.arange(0, raw_data.shape[1])
 
         if self.mode == 'test':
-            self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'))
+            self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'), allow_pickle=True)
             #start_idcs_tgt, self.targets = create_win_periods(self.targets, self.max_signal_length,
             #                                  int(self.max_signal_length * (1 - self.overlapping_windows)))
         else:
