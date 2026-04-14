@@ -23,6 +23,31 @@ from anomaly_detection import get_ts_eval
 
 
 LOGGER = logging.getLogger(__name__)
+CURRENT_ROUND = "-"
+_ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
+
+
+class RoundContextFilter(logging.Filter):
+    """Inject current run/round context into every log record."""
+
+    def filter(self, record):
+        record.round = CURRENT_ROUND
+        return True
+
+
+def round_log_record_factory(*args, **kwargs):
+    record = _ORIGINAL_LOG_RECORD_FACTORY(*args, **kwargs)
+    if not hasattr(record, "round"):
+        record.round = CURRENT_ROUND
+    return record
+
+
+def set_round_context(run_number: int | None = None, total_runs: int | None = None):
+    global CURRENT_ROUND
+    if run_number is None or total_runs is None:
+        CURRENT_ROUND = "-"
+    else:
+        CURRENT_ROUND = f"{run_number}/{total_runs}"
 
 
 def build_classifier_factories(device: str = "cpu", random_state: int | None = None):
@@ -233,9 +258,16 @@ def configure_logging(level_name: str):
     level = getattr(logging, level_name.upper(), logging.INFO)
     logging.basicConfig(
         level=level,
-        format="%(asctime)s | %(levelname)s | %(message)s",
+        format="%(asctime)s | %(levelname)s | round=%(round)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
+
+    root_logger = logging.getLogger()
+    logging.setLogRecordFactory(round_log_record_factory)
+    for handler in root_logger.handlers:
+        handler.addFilter(RoundContextFilter())
+    set_round_context()
 
 
 BENCHMARK_DATASETS = {
@@ -731,6 +763,7 @@ if __name__ == "__main__":
     for run_idx in range(args.runs):
         run_number = run_idx + 1
         run_seed = args.seed + run_idx
+        set_round_context(run_number, args.runs)
         set_global_seed(run_seed)
         classifier_factories = build_classifier_factories(device=runtime_device, random_state=run_seed)
         LOGGER.info("Starting run %d/%d with seed=%d", run_number, args.runs, run_seed)
@@ -762,13 +795,14 @@ if __name__ == "__main__":
                     except Exception:
                         failed_runs.append((run_number, run_seed, benchmark_name, dataset_id, clf_name))
                         LOGGER.exception(
-                            "[run=%d][seed=%d][%s/%s] %s failed",
-                            run_number,
+                            "[seed=%d][%s/%s] %s failed",
                             run_seed,
                             benchmark_name,
                             dataset_id,
                             clf_name,
                         )
+
+    set_round_context()
 
     if not per_dataset_rows:
         LOGGER.error("No successful runs. Failed runs: %d", len(failed_runs))
