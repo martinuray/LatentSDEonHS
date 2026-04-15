@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, auc
 from typing import List, Any, Dict, Tuple, Callable, Optional
 
@@ -626,3 +627,20 @@ class Evaluator:
             precision that produced the maximal score.
         """
         return self.best_ts_fbeta_score_classic(labels, scores, 1)
+
+
+def get_ts_eval(scores, targets):
+    ts_evalator = Evaluator()
+    # targets = torch.from_numpy(targets)
+    # scores = torch.from_numpy(scores)
+
+    results = ts_evalator.best_f1_score(targets, scores)
+
+    ## dataframe to display
+    metrics_name = ['F1', 'Precision', 'Recall', 'AUPRC', 'AUROC']
+    raw = [results['f1'], results['precision'], results['recall'],
+           results['auprc'], results['auroc']]
+    score_dict = {'': metrics_name, 'point_wise': raw}
+
+    df = pd.DataFrame(score_dict)
+    return results, df

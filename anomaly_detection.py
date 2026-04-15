@@ -12,7 +12,6 @@ import os
 from collections import defaultdict
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -35,6 +34,7 @@ from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
 from data.smd_provider import SMDProvider
 from data.psm_provider import PSMProvider
+from utils.scoring_functions import get_ts_eval
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
@@ -44,7 +44,6 @@ from utils.misc import (
     save_stats,
     append_final_metrics_csv)
 from utils.parser import generic_parser
-from utils.scoring_functions import Evaluator
 
 
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -406,23 +405,6 @@ def get_results_for_all_score_normalizations(
     #logging.debug(f"Best score through {best_strategy[0]} and {best_strategy[1]}: {agg_scores[best_strategy]}")
     best_idx = next(i for i, (n, (s, _)) in enumerate(df_list) if (s, n) == best_strategy)
     return dict(df_list), df_list[best_idx][1][1]
-
-
-def get_ts_eval(scores, targets):
-    ts_evalator = Evaluator()
-    # targets = torch.from_numpy(targets)
-    # scores = torch.from_numpy(scores)
-
-    results = ts_evalator.best_f1_score(targets, scores)
-
-    ## dataframe to display
-    metrics_name = ['F1', 'Precision', 'Recall', 'AUPRC', 'AUROC']
-    raw = [results['f1'], results['precision'], results['recall'],
-           results['auprc'], results['auroc']]
-    score_dict = {'': metrics_name, 'point_wise': raw}
-
-    df = pd.DataFrame(score_dict)
-    return results, df
 
 
 def logprob2f1s(scores, true_labels):

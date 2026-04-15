@@ -19,8 +19,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from anomaly_detection import get_ts_eval
-
+from utils.scoring_functions import get_ts_eval
 
 LOGGER = logging.getLogger(__name__)
 CURRENT_ROUND = "-"
