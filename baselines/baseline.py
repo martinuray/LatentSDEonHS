@@ -25,6 +25,8 @@ from anomaly_detection import get_ts_eval
 LOGGER = logging.getLogger(__name__)
 CURRENT_ROUND = "-"
 _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
+WADI_REDUCED_BATCH_SIZE = 16
+TCNED_DECISION_CHUNK_SIZE = 5000
 
 
 class RoundContextFilter(logging.Filter):
@@ -372,6 +374,15 @@ def parse_args():
         default=42,
         help="Base random seed; run i uses seed + i.",
     )
+    parser.add_argument(
+        "--tcned-decision-chunk-size",
+        type=int,
+        default=TCNED_DECISION_CHUNK_SIZE,
+        help=(
+            "Chunk size for TcnED decision_function during testing to reduce memory. "
+            "Use 0 to disable chunking."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -581,7 +592,56 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
     return x_train, x_test, y_test
 
 
-def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, benchmark_name, dataset_id):
+def _decision_function_with_chunking(clf, x_test, chunk_size, clf_name, benchmark_name, dataset_id):
+    if chunk_size is None or chunk_size <= 0 or x_test.shape[0] <= chunk_size:
+        return clf.decision_function(x_test)
+
+    LOGGER.info(
+        "[%s/%s] %s decision_function chunked: chunk_size=%d, total_rows=%d",
+        benchmark_name,
+        dataset_id,
+        clf_name,
+        chunk_size,
+        x_test.shape[0],
+    )
+    score_chunks = []
+    for start_idx in range(0, x_test.shape[0], chunk_size):
+        end_idx = min(start_idx + chunk_size, x_test.shape[0])
+        score_chunk = np.asarray(clf.decision_function(x_test[start_idx:end_idx])).ravel()
+        score_chunks.append(score_chunk)
+
+    y_test_scores = np.concatenate(score_chunks, axis=0)
+    if y_test_scores.shape[0] != x_test.shape[0]:
+        raise ValueError(
+            f"[{benchmark_name}/{dataset_id}] {clf_name} decision_function returned {y_test_scores.shape[0]} "
+            f"scores for {x_test.shape[0]} test rows"
+        )
+    return y_test_scores
+
+
+def evaluate_classifier_on_dataset(
+    clf_name,
+    clf,
+    x_train,
+    x_test,
+    y_test,
+    benchmark_name,
+    dataset_id,
+    tcned_decision_chunk_size=TCNED_DECISION_CHUNK_SIZE,
+):
+    if benchmark_name == "WaDi" and hasattr(clf, "batch_size"):
+        original_batch_size = getattr(clf, "batch_size", None)
+        if original_batch_size is None or original_batch_size > WADI_REDUCED_BATCH_SIZE:
+            clf.batch_size = WADI_REDUCED_BATCH_SIZE
+            LOGGER.info(
+                "[%s/%s] %s batch size reduced for WaDi: %s -> %s",
+                benchmark_name,
+                dataset_id,
+                clf_name,
+                original_batch_size,
+                clf.batch_size,
+            )
+
     clf.train_val_pc = 0.1 # hard setting validation part to 10%
     LOGGER.info(
         "[%s/%s] %s validation split set to %.0f%% (train_val_pc=%.2f)",
@@ -600,14 +660,26 @@ def evaluate_classifier_on_dataset(clf_name, clf, x_train, x_test, y_test, bench
         getattr(clf, "device", "n/a"),
         getattr(clf, "batch_size", "n/a"),
     )
+
+    import gc
     clf.fit(x_train)
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
+    gc.collect()
 
-    y_test_scores = clf.decision_function(x_test)
+    decision_chunk_size = None
+    if clf_name == "TcnED":
+        decision_chunk_size = tcned_decision_chunk_size
+    y_test_scores = _decision_function_with_chunking(
+        clf,
+        x_test,
+        decision_chunk_size,
+        clf_name,
+        benchmark_name,
+        dataset_id,
+    )
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
 
     del clf
-    import gc
     gc.collect()
 
     try:
@@ -735,7 +807,7 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s, tcned_decision_chunk_size=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
@@ -743,6 +815,7 @@ if __name__ == "__main__":
         args.runs,
         args.seed,
         runtime_device,
+        args.tcned_decision_chunk_size,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
@@ -788,6 +861,7 @@ if __name__ == "__main__":
                             y_test,
                             benchmark_name,
                             dataset_id,
+                            tcned_decision_chunk_size=args.tcned_decision_chunk_size,
                         )
                         per_dataset_rows.append(row)
                         per_run_rows.append({**row, "run": run_number, "seed": run_seed})
