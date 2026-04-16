@@ -82,7 +82,7 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         "OCSVM": lambda: OCSVM(),
         "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device, random_state=random_state),
         "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "USAD": lambda: USAD(seq_len=100, stride=100, device="cpu", random_state=random_state),
+        "USAD": lambda: USAD(seq_len=100, stride=100, device=device, random_state=random_state),
         "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device, random_state=random_state),
         "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, random_state=random_state),
         "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
@@ -628,7 +628,7 @@ def evaluate_classifier_on_dataset(
     dataset_id,
     tcned_decision_chunk_size=TCNED_DECISION_CHUNK_SIZE,
 ):
-    if benchmark_name == "WaDi" and hasattr(clf, "batch_size"):
+    if benchmark_name in ["WaDi", "SWaT"] and hasattr(clf, "batch_size"):
         original_batch_size = getattr(clf, "batch_size", None)
         if original_batch_size is None or original_batch_size > WADI_REDUCED_BATCH_SIZE:
             clf.batch_size = WADI_REDUCED_BATCH_SIZE
