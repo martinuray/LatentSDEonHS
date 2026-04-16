@@ -197,7 +197,6 @@ def train_one_dataset(
     }
 
     pm = ProgressMessage(stats_mask)
-    best_auc = 0.0
     best_stats = None
     es_counter = 0
     best_es_loss = np.inf
@@ -223,13 +222,10 @@ def train_one_dataset(
             normalization_stats=normalization_scores, epoch=epoch, test=False
         )
 
-        if tst_stats["auc"] > best_auc:
-            best_auc = tst_stats["auc"]
-            best_stats = tst_stats
-
         es_loss = val_stats["loss"]
         if es_loss < best_es_loss - args.early_stopping_min_delta:
             best_es_loss = es_loss
+            best_stats = tst_stats
             es_counter = 0
         else:
             es_counter += 1
