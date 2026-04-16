@@ -372,7 +372,7 @@ def get_results_for_all_score_normalizations(
 
     # Options
     #normalisations = ["median-iqr", "mean-std", None] # TODO: then for better performance in the end ?
-    normalisations = ["median-iqr"]
+    normalisations = [None]
     #aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"] # TODO: then for better performance in the end
     aggregation_strategies = ["l1"]
 
