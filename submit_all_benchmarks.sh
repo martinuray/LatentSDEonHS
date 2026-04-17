@@ -10,8 +10,8 @@
 ################################################################################
 
 # SLURM Configuration - Modify as needed
-PARTITION="gpu"              # Partition to submit to
-TIMEOUT="02:00:00"           # Timeout per job (HH:MM:SS)
+PARTITION="rtx2080ti"              # Partition to submit to
+TIMEOUT="48:00:00"           # Timeout per job (HH:MM:SS)
 NUM_GPUS=1                   # Number of GPUs per job
 NUM_CPUS=8                   # Number of CPUs per job
 MEMORY="40GB"                # Memory per job
@@ -39,7 +39,7 @@ COMMON_ARGS="\
 --pxz-weight 10.0 \
 --seed -1 \
 --restart 30 \
---device cuda:2 \
+--device cuda \
 --z-dim 16 \
 --h-dim 512 \
 --n-deg 12 \
@@ -61,16 +61,27 @@ COMMON_ARGS="\
 --early-stopping-patience 10 \
 --early-stopping-min-delta 0 \
 --non-linear-decoder \
---delete-processed-data"
+--delete-processed-data \
+--fixed-subsample-mask"
 
 # Benchmarks to run (from anomaly_detection.py)
 BENCHMARKS=("SWaT" "WaDi" "SMD" "QAD" "MSL" "SMAP" "PSM")
 
-# Script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- Load modules ----
+module load anaconda
+
+# ---- Initialize conda ----
+source $(conda info --base)/etc/profile.d/conda.sh
+
+# ---- Activate environment ----
+conda activate baseline-latent
+
+# ---- Move to project directory ----
+cd /home2/muray/Code/LatentSDEonHS
 
 # Log directory for SLURM output
-LOG_DIR="${SCRIPT_DIR}/slurm_logs"
+LOG_DIR="slurm_logs"
 mkdir -p "${LOG_DIR}"
 
 echo "=================================="
@@ -102,7 +113,7 @@ for BENCHMARK in "${BENCHMARKS[@]}"; do
         --job-name="${JOB_NAME_PREFIX}_${BENCHMARK}" \
         --output="${LOG_FILE}" \
         --error="${LOG_FILE}" \
-        --wrap="cd ${SCRIPT_DIR} && python anomaly_detection.py \
+        --wrap="python anomaly_detection.py \
             --dataset ${BENCHMARK} \
             --runs ${RUNS} \
             ${COMMON_ARGS}"
