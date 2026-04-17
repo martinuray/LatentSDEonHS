@@ -8,7 +8,6 @@ Authors: Sebastian Zeng, Florian Graf, Roland Kwitt (2023)
 import glob
 import logging
 import os
-from typing import DefaultDict
 
 import numpy as np
 import pandas as pd
@@ -18,7 +17,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
-from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
+from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 
     
@@ -76,10 +75,18 @@ class ADData(object):
         if self.data_kind == "SMD": # TODO: maybe a bit more love
             return os.path.isdir(os.path.join(self.raw_folder, self.mode))
 
-        return os.path.isfile(os.path.join(self.raw_folder, 'train.npy')) and \
-            os.path.isfile(os.path.join(self.raw_folder, 'test.npy')) and \
-            os.path.isfile(os.path.join(self.raw_folder, 'labels.npy'))
-                
+        # Check for CSV files (original raw data)
+        csv_exists = os.path.isfile(os.path.join(self.raw_folder, 'train.csv')) and \
+                     os.path.isfile(os.path.join(self.raw_folder, 'test.csv')) and \
+                     os.path.isfile(os.path.join(self.raw_folder, 'labels.csv'))
+
+        # Check for NPY files (pre-preprocessed)
+        npy_exists = os.path.isfile(os.path.join(self.raw_folder, 'train.npy')) and \
+                     os.path.isfile(os.path.join(self.raw_folder, 'test.npy')) and \
+                     os.path.isfile(os.path.join(self.raw_folder, 'labels.npy'))
+
+        return csv_exists or npy_exists
+
     def _check_exists(self):
         if self.data_kind == "SMD": # TODO: maybe a bit more love
             return os.path.isfile(os.path.join(self.processed_folder,
@@ -144,22 +151,42 @@ class ADData(object):
 
     def _process_water_treatment_data(self, columns=None, n_samples=None):
         logging.warning("Processing Water Treatment Data")
-        raw_data = np.load(os.path.join(self.raw_folder, f'{self.mode}.npy'))
 
-        # temp stuff
-        #raw_data = raw_data_df.copy()
-        #indcs, raw_data = create_win_periods(raw_data, self.max_signal_length,
-        #                                     int(self.max_signal_length * (1 - self.overlapping_windows)))
+        # Check if CSV files are available and preprocess them
+        csv_path = os.path.join(self.raw_folder, 'train.csv')
+        test_labels = None
+
+        if os.path.isfile(csv_path):
+            # Load and preprocess from CSV files
+            train_df, test_df, test_labels = self._load_and_preprocess_water_treatment_csv()
+
+            # Store column names as params
+            if columns is None:
+                self.params = train_df.columns
+            else:
+                self.params = columns
+
+            # Reshape data into windows
+            train_np = self._reshape_data_to_windows(train_df, self.max_signal_length)
+            test_np = self._reshape_data_to_windows(test_df, self.max_signal_length)
+
+            raw_data = train_np if self.mode == 'train' else test_np
+        else:
+            # Load from pre-processed NPY files
+            raw_data = np.load(os.path.join(self.raw_folder, f'{self.mode}.npy'))
+
         indcs = np.arange(0, raw_data.shape[1])
 
         if self.mode == 'test':
-            self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'), allow_pickle=True)
-            #start_idcs_tgt, self.targets = create_win_periods(self.targets, self.max_signal_length,
-            #                                  int(self.max_signal_length * (1 - self.overlapping_windows)))
+            if test_labels is not None:
+                # Use preprocessed labels from CSV
+                self.targets = self._reshape_data_to_windows(test_labels, self.max_signal_length)
+            else:
+                # Load from NPY file
+                self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'), allow_pickle=True)
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
 
-        #self.params_dict = {k: i for i, k in enumerate(self.params)}
         indcs = torch.Tensor(indcs)
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
@@ -167,9 +194,6 @@ class ADData(object):
         # handle nan values in the dataset
         mask[data_tensor.isnan()] = 0
         data_tensor[data_tensor.isnan()] = 0
-
-        #if self.mode == 'test':
-        #    mask[-1, -added_.shape[0]:, :] = 0
 
         if n_samples is not None:
             logging.warning(f"Limiting dataset to {n_samples} samples")
@@ -265,6 +289,82 @@ class ADData(object):
         if self.mode == 'test':
             torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
 
+    def _load_and_preprocess_water_treatment_csv(self):
+        """Load and preprocess water treatment data from CSV files."""
+        logging.warning(f"Loading and preprocessing {self.data_kind} data from CSV files")
+
+        # Load CSV files
+        if "WaDi" in self.data_kind:
+            train_df = pd.read_csv(os.path.join(self.raw_folder, 'train.csv'))
+            test_df = pd.read_csv(os.path.join(self.raw_folder, 'test.csv'))
+            test_labels = pd.read_csv(os.path.join(self.raw_folder, 'labels.csv'))
+            test_labels = test_labels.iloc[:, 0]  # Get first column
+        else:
+            train_df = pd.read_csv(os.path.join(self.raw_folder, 'train.csv'))
+            test_df = pd.read_csv(os.path.join(self.raw_folder, 'test.csv'))
+            test_labels = pd.read_csv(os.path.join(self.raw_folder, 'labels.csv'))
+            test_labels = test_labels.iloc[:, 0]  # Get first column
+
+        # Handle missing values
+        train_df = train_df.fillna(train_df.mean())
+        test_df = test_df.fillna(test_df.mean())
+        train_df = train_df.fillna(0)
+        test_df = test_df.fillna(0)
+
+        # Trim column names
+        train_df = train_df.rename(columns=lambda x: x.strip())
+        test_df = test_df.rename(columns=lambda x: x.strip())
+
+        # Handle WaDi column name prefixes
+        if self.data_kind == "WaDi":
+            cols = [x[46:] for x in train_df.columns]  # Remove column name prefixes
+            train_df.columns = cols
+            test_df.columns = cols
+
+        # Remove columns where there is only one unique value
+        train_col_set = set(train_df.columns[train_df.nunique() == 1].tolist())
+        test_col_set = set(test_df.columns[test_df.nunique() == 1].tolist())
+        common_set = list(train_col_set.union(test_col_set))
+
+        train_df = train_df.drop(common_set, axis=1)
+        test_df = test_df.drop(common_set, axis=1)
+
+        # Normalize data using MinMaxScaler
+        normalizer = MinMaxScaler(feature_range=(0, 1))
+        normalizer.fit(train_df)
+
+        train_df_normalized = train_df.copy()
+        test_df_normalized = test_df.copy()
+        train_df_normalized[train_df.columns] = normalizer.transform(train_df)
+        test_df_normalized[test_df.columns] = normalizer.transform(test_df)
+
+        # Remove first 2160 samples (stabilization period) for SWaT/WaDi
+        train_df_normalized = train_df_normalized.iloc[2160:]
+
+        return train_df_normalized, test_df_normalized, test_labels
+
+    def _reshape_data_to_windows(self, data, window_length, remove_zero_column=False):
+        """Reshape data into windows."""
+        if isinstance(data, pd.DataFrame):
+            data_np = data.to_numpy()
+        else:
+            data_np = np.array(data)
+
+        if data_np.ndim == 1:
+            data_np = data_np.reshape(-1, 1)
+
+        mod = data_np.shape[0] % window_length
+
+        if mod > 0:
+            data_np = data_np[:-mod]
+
+        if remove_zero_column and data_np.ndim > 1:
+            data_np = data_np[:, 1:]  # Remove first column (index)
+
+        shaped = data_np.reshape(-1, window_length, data_np.shape[1])
+        return shaped
+
+
     def get_all_dfs(self):
         all_files = glob.glob(os.path.join(self.raw_folder, self.mode, '*.txt'))
 
@@ -289,9 +389,9 @@ class ADData(object):
 
 
 class ADDataset(Dataset):
-    
+
     input_dim = None  # nr. of different measurements per time point
-    
+
     def __init__(self, data_dir: str, mode: str='train', data_kind: str=None,
                  window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
                  n_samples: int=None, data_normalization_strategy:str="none"):
