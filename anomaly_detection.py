@@ -1,14 +1,8 @@
-"""Pendulum angle regression from Sec. 4.1 of
-
-    Zeng S., Graf F. and Kwitt, R.
-    Latent SDEs on Homogeneous Spaces
-    NeurIPS 2023
-"""
-
 import argparse
 import datetime
 import logging
 import os
+import shutil
 from collections import defaultdict
 
 import numpy as np
@@ -60,6 +54,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
+    group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
     return parser
 
 
@@ -611,6 +606,10 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             if store_final_metrics:
                 _store_final_metrics(stats2pass[0])
             logging.info(f"Final metrics across {provider.num_datasets} datasets: {stats2pass[0]}")
+            
+            if args.delete_processed_data:
+                delete_processed_data(args.dataset, data_dir='data_dir')
+            
             return per_dataset_stats[only_id]
 
         macro_stats = compute_macro_metrics(per_dataset_stats)
@@ -631,6 +630,10 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             _store_final_metrics(combined_stats)
         logging.shutdown()
         writer.close()
+        
+        if args.delete_processed_data:
+            delete_processed_data(args.dataset, data_dir='data_dir')
+        
         return combined_stats
 
     # Fallback path for providers without hybrid layout.
@@ -674,6 +677,10 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         _store_final_metrics(tst_stats)
     logging.shutdown()
     writer.close()
+    
+    if args.delete_processed_data:
+        delete_processed_data(args.dataset, data_dir='data_dir')
+    
     return tst_stats
 
 
@@ -776,6 +783,41 @@ def evaluate(
     return stats
 
 
+def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
+    """Delete processed data directory for a given dataset.
+    
+    Args:
+        dataset_name: Name of the dataset (e.g., 'SWaT', 'SMD', 'QAD')
+        data_dir: Base data directory (default: 'data_dir')
+    """
+    processed_dirs = []
+    
+    # Map dataset names to their processed directories
+    if dataset_name in ['SWaT', 'WaDi']:
+        processed_dirs.append(os.path.join(data_dir, dataset_name, 'processed'))
+    elif dataset_name == 'SMD':
+        processed_dirs.append(os.path.join(data_dir, 'SMD', 'processed'))
+    elif dataset_name == 'aero':
+        processed_dirs.append(os.path.join(data_dir, 'aero', 'processed'))
+    elif dataset_name == 'QAD':
+        processed_dirs.append(os.path.join(data_dir, 'QAD', 'processed'))
+    elif dataset_name in ['SMAP', 'MSL']:
+        processed_dirs.append(os.path.join(data_dir, dataset_name, 'processed'))
+    elif dataset_name == 'PSM':
+        processed_dirs.append(os.path.join(data_dir, 'PSM', 'processed'))
+    
+    # Delete each processed directory if it exists
+    for processed_dir in processed_dirs:
+        if os.path.exists(processed_dir):
+            try:
+                shutil.rmtree(processed_dir)
+                logging.info(f"Deleted processed data at: {processed_dir}")
+            except Exception as e:
+                logging.warning(f"Failed to delete processed data at {processed_dir}: {e}")
+        else:
+            logging.debug(f"Processed data directory not found: {processed_dir}")
+
+
 def main():
     parser = extend_argparse(generic_parser)
     args_ = parser.parse_args()
@@ -789,6 +831,7 @@ def main():
 
     run_results = []
     for run_idx in range(args_.runs):
+        delete_processed_data(args_.dataset, data_dir='data_dir')
         logging.info("Starting run %d/%d", run_idx + 1, args_.runs)
         run_result = start_experiment(args_, provider=None, store_final_metrics=False)
         run_results.append(run_result)
