@@ -394,10 +394,12 @@ class ADDataset(Dataset):
 
     def __init__(self, data_dir: str, mode: str='train', data_kind: str=None,
                  window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
-                 n_samples: int=None, data_normalization_strategy:str="none"):
+                 n_samples: int=None, data_normalization_strategy:str="none",
+                 fixed_subsample_mask: bool = False):
 
         self.mode = mode
         self.subsample=subsample
+        self.fixed_subsample_mask = fixed_subsample_mask
 
         objs = dict()
         objs['train'] = ADData(
@@ -466,6 +468,11 @@ class ADDataset(Dataset):
             'dataset_id': data_kind,
         }]
 
+        if self.mode in ('train', 'val') and self.fixed_subsample_mask:
+            self.datasets[0]['fixed_inp_msk'] = (
+                torch.rand(self.datasets[0]['inp_msk'].shape) < self.subsample
+            ).to(torch.int).long()
+
         self._lengths = [n_samples]
         self._cumulative = [0]
 
@@ -518,8 +525,11 @@ class ADDataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode == 'train':
-            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
+        if self.mode in ('train', 'val'):
+            if self.fixed_subsample_mask:
+                msk = ds['fixed_inp_msk'][local_idx].long()
+            else:
+                msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
         else:
             msk = ds['inp_msk'][local_idx].long()
 
@@ -553,7 +563,8 @@ class ADDataset(Dataset):
 class ADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset=None, window_length:int = 100,
                  window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None,
-                 data_normalization_strategy:str="none", subsample=1.0):
+                 data_normalization_strategy:str="none", subsample=1.0,
+                 fixed_subsample_mask: bool = False):
         DatasetProvider.__init__(self)
 
         if dataset not in ["SWaT", "WaDi", "SMD"]:
@@ -566,7 +577,8 @@ class ADProvider(DatasetProvider):
             data_dir, 'train', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples, subsample=subsample,
-            data_normalization_strategy=data_normalization_strategy)
+            data_normalization_strategy=data_normalization_strategy,
+            fixed_subsample_mask=fixed_subsample_mask)
 
         self._ds_tst = ADDataset(
             data_dir, 'test', data_kind=dataset,
@@ -577,7 +589,8 @@ class ADProvider(DatasetProvider):
         self._ds_val = ADDataset(data_dir, 'val', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples, subsample=subsample,
-            data_normalization_strategy=data_normalization_strategy)
+            data_normalization_strategy=data_normalization_strategy,
+            fixed_subsample_mask=fixed_subsample_mask)
 
         #scaler = self._ds_trn.fit_normalizer()
         #self._ds_trn.normalizer_transform(scaler)
