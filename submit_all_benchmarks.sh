@@ -20,6 +20,49 @@ JOB_NAME_PREFIX="anomaly"    # Prefix for job names
 # Number of runs per benchmark
 RUNS=5
 
+# Common anomaly_detection.py parameters (dataset and runs are set per benchmark below)
+COMMON_ARGS="\
+--data-dir data_dir \
+--enable-file-logging \
+--log-dir logs \
+--enable-checkpointing \
+--checkpoint-dir checkpoints \
+--checkpoint-at 1 2 3 4 5 6 90 150 190 210 390 590 990 1350 2100 \
+--final-metrics-csv logs/final_metrics.csv \
+--data-window-length 100 \
+--data-window-overlap 0.0 \
+--batch-size 512 \
+--lr 0.001 \
+--n-epochs 211 \
+--kl0-weight 0.0001 \
+--klp-weight 100.0 \
+--pxz-weight 10.0 \
+--seed -1 \
+--restart 30 \
+--device cuda:2 \
+--z-dim 16 \
+--h-dim 512 \
+--n-deg 12 \
+--no-learnable-prior \
+--freeze-sigma \
+--initial-sigma 0.15 \
+--mc-eval-samples 1 \
+--mc-train-samples 1 \
+--num-max-cpu-worker 10 \
+--eval-every-n-epochs 30 \
+--loglevel debug \
+--no-use-atanh \
+--no-debug \
+--subsample 0.2 \
+--no-normalize-score \
+--data-normalization-strategy none \
+--dec-hidden-dim 512 \
+--n-dec-layers 2 \
+--early-stopping-patience 10 \
+--early-stopping-min-delta 0 \
+--non-linear-decoder \
+--delete-processed-data"
+
 # Benchmarks to run (from anomaly_detection.py)
 BENCHMARKS=("SWaT" "WaDi" "SMD" "QAD" "MSL" "SMAP" "PSM")
 
@@ -62,8 +105,8 @@ for BENCHMARK in "${BENCHMARKS[@]}"; do
         --wrap="cd ${SCRIPT_DIR} && python anomaly_detection.py \
             --dataset ${BENCHMARK} \
             --runs ${RUNS} \
-            --delete-processed-data \
-            --debug"
+            ${COMMON_ARGS}"
+
 
     # Small delay to avoid overwhelming the scheduler
     sleep 0.5
