@@ -63,7 +63,7 @@ for BENCHMARK in "${BENCHMARKS[@]}"; do
             --dataset ${BENCHMARK} \
             --runs ${RUNS} \
             --delete-processed-data \
-            --seed 42"
+            --debug"
 
     # Small delay to avoid overwhelming the scheduler
     sleep 0.5
