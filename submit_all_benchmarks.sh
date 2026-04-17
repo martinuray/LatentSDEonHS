@@ -21,7 +21,7 @@ JOB_NAME_PREFIX="anomaly"    # Prefix for job names
 RUNS=5
 
 # Benchmarks to run (from anomaly_detection.py)
-BENCHMARKS=("SWaT" "WaDi" "SMD" "aero" "QAD" "MSL" "SMAP" "PSM")
+BENCHMARKS=("SWaT" "WaDi" "SMD" "QAD" "MSL" "SMAP" "PSM")
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

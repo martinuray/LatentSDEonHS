@@ -23,7 +23,6 @@ from core.models import (
 )
 from core.training import generic_train
 from data.ad_provider import ADProvider
-from data.aero_provider import AeroDataProvider
 from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
 from data.smd_provider import SMDProvider
@@ -52,7 +51,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
     group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
     return parser
@@ -504,8 +503,6 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 subsample=args.subsample,
                 data_normalization_strategy=args.data_normalization_strategy,
             )
-        elif args.dataset == 'aero':
-            provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
         elif args.dataset == 'QAD':
             provider = QADProvider(
                 data_dir="data_dir/",
@@ -797,8 +794,6 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
         processed_dirs.append(os.path.join(data_dir, dataset_name, 'processed'))
     elif dataset_name == 'SMD':
         processed_dirs.append(os.path.join(data_dir, 'SMD', 'processed'))
-    elif dataset_name == 'aero':
-        processed_dirs.append(os.path.join(data_dir, 'aero', 'processed'))
     elif dataset_name == 'QAD':
         processed_dirs.append(os.path.join(data_dir, 'QAD', 'processed'))
     elif dataset_name in ['SMAP', 'MSL']:
