@@ -23,7 +23,6 @@ from core.models import (
 )
 from core.training import generic_train
 from data.ad_provider import ADProvider
-from data.aero_provider import AeroDataProvider
 from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
 from data.smd_provider import SMDProvider
@@ -52,9 +51,15 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "aero", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
+    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
     group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
+    group.add_argument(
+        "--fixed-subsample-mask",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If set, sample subsampling masks once at dataset load time for train/val instead of resampling every iteration.",
+    )
     return parser
 
 
@@ -494,6 +499,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
                 n_samples=1000 if args.debug else None,
                 subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy
             )
         elif args.dataset == 'SMD':
@@ -502,16 +508,16 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
             )
-        elif args.dataset == 'aero':
-            provider = AeroDataProvider(data_dir="data_dir/aero", subsample=2)
         elif args.dataset == 'QAD':
             provider = QADProvider(
                 data_dir="data_dir/",
                 dataset_number=None,
                 window_length=args.data_window_length,
                 subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
                 raw_subdir="qad_clean_txt_100Hz",
             )
@@ -519,13 +525,15 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             provider = NASAProvider(
                 data_dir="data_dir/", dataset=args.dataset,
                 window_length=args.data_window_length,
-                subsample=args.subsample)
+                subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask)
         elif args.dataset == 'PSM':
             provider = PSMProvider(
                 data_dir='data_dir',
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
             )
         else:
@@ -797,8 +805,6 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
         processed_dirs.append(os.path.join(data_dir, dataset_name, 'processed'))
     elif dataset_name == 'SMD':
         processed_dirs.append(os.path.join(data_dir, 'SMD', 'processed'))
-    elif dataset_name == 'aero':
-        processed_dirs.append(os.path.join(data_dir, 'aero', 'processed'))
     elif dataset_name == 'QAD':
         processed_dirs.append(os.path.join(data_dir, 'QAD', 'processed'))
     elif dataset_name in ['SMAP', 'MSL']:

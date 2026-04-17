@@ -202,10 +202,12 @@ class QADDataset(Dataset):
     
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
-                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz"):
+                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz",
+                 fixed_subsample_mask: bool = False):
 
         self.mode = mode
         self.subsample = subsample
+        self.fixed_subsample_mask = fixed_subsample_mask
 
         self.datasets = []
         self._lengths = []
@@ -278,6 +280,11 @@ class QADDataset(Dataset):
                 'num_timepoints': n_time,
                 'dataset_id': dataset_id,
             })
+
+            if self.mode in ('train', 'val') and self.fixed_subsample_mask:
+                self.datasets[-1]['fixed_inp_msk'] = (
+                    torch.rand(self.datasets[-1]['inp_msk'].shape) < self.subsample
+                ).long()
 
         csum = 0
         for length in self._lengths:
@@ -364,8 +371,11 @@ class QADDataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode == 'train':
-            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).long()
+        if self.mode in ('train', 'val'):
+            if self.fixed_subsample_mask:
+                msk = ds['fixed_inp_msk'][local_idx].long()
+            else:
+                msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).long()
         else:
             msk = ds['inp_msk'][local_idx].long()
 
@@ -399,7 +409,8 @@ class QADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset_number=None, window_length: int = 100,
                  window_overlap: float = 0.0,
                  data_normalization_strategy: str = "none", subsample: float = 1.0,
-                 raw_subdir: str = "qad_clean_txt_100Hz"):
+                 raw_subdir: str = "qad_clean_txt_100Hz",
+                 fixed_subsample_mask: bool = False):
         super().__init__()
 
         self._dataset = dataset_number
@@ -412,9 +423,13 @@ class QADProvider(DatasetProvider):
             'raw_subdir': raw_subdir,
         }
 
-        self._ds_trn = QADDataset(data_dir, 'train', subsample=subsample, **common_kwargs)
+        self._ds_trn = QADDataset(
+            data_dir, 'train', subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
         self._ds_tst = QADDataset(data_dir, 'test', **common_kwargs)
-        self._ds_val = QADDataset(data_dir, 'val', subsample=subsample, **common_kwargs)
+        self._ds_val = QADDataset(
+            data_dir, 'val', subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
 
     @property 
     def input_dim(self):

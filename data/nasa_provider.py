@@ -207,10 +207,12 @@ class NASADataset(Dataset):
     def __init__(self, data_dir: str, mode: str = 'train', data_kind: str = None,
                  dataset: str = None, window_length: int = 100,
                  window_overlap: float = 0.0, subsample: float = 1.0,
-                 data_normalization_strategy: str = "none"):
+                 data_normalization_strategy: str = "none",
+                 fixed_subsample_mask: bool = False):
 
         self.mode = mode
         self.subsample = subsample
+        self.fixed_subsample_mask = fixed_subsample_mask
 
         label_data = pd.read_csv(
             os.path.join(data_dir, 'nasa', 'raw', 'labeled_anomalies.csv'))
@@ -298,6 +300,11 @@ class NASADataset(Dataset):
                 'dataset_id':     dataset_id,
             })
 
+            if self.mode in ('train', 'val') and self.fixed_subsample_mask:
+                self.datasets[-1]['fixed_inp_msk'] = (
+                    torch.rand(self.datasets[-1]['inp_msk'].shape) < self.subsample
+                ).to(torch.int).long()
+
         # Build cumulative offsets for flat indexing
         cumsum = 0
         for length in self._lengths:
@@ -351,9 +358,12 @@ class NASADataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode == 'train':
-            msk = (torch.rand(ds['inp_msk'][local_idx].shape)
-                   < self.subsample).to(torch.int).long()
+        if self.mode in ('train', 'val'):
+            if self.fixed_subsample_mask:
+                msk = ds['fixed_inp_msk'][local_idx].long()
+            else:
+                msk = (torch.rand(ds['inp_msk'][local_idx].shape)
+                       < self.subsample).to(torch.int).long()
         else:
             msk = ds['inp_msk'][local_idx].long()
 
@@ -398,7 +408,8 @@ class NASADataset(Dataset):
 class NASAProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset=None,
                  window_length: int = 100, window_overlap: float = 0.0,
-                 data_normalization_strategy: str = "none", subsample=1.0):
+                 data_normalization_strategy: str = "none", subsample=1.0,
+                 fixed_subsample_mask: bool = False):
         DatasetProvider.__init__(self)
 
         if dataset not in ["SMAP", "MSL"]:
@@ -413,9 +424,13 @@ class NASAProvider(DatasetProvider):
             'data_normalization_strategy': data_normalization_strategy
         }
 
-        self._ds_trn = NASADataset(data_dir, 'train', subsample=subsample, **common_kwargs)
+        self._ds_trn = NASADataset(
+            data_dir, 'train', subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
         self._ds_tst = NASADataset(data_dir, 'test', **common_kwargs)
-        self._ds_val = NASADataset(data_dir, 'val', subsample=subsample, **common_kwargs)
+        self._ds_val = NASADataset(
+            data_dir, 'val', subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
 
     @property
     def input_dims(self) -> list:

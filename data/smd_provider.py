@@ -193,9 +193,11 @@ class SMDDataset(Dataset):
         window_overlap: float = 0.0,
         subsample: float = 1.0,
         data_normalization_strategy: str = "none",
+        fixed_subsample_mask: bool = False,
     ):
         self.mode = mode
         self.subsample = subsample
+        self.fixed_subsample_mask = fixed_subsample_mask
 
         self.datasets = []
         self._lengths = []
@@ -282,6 +284,11 @@ class SMDDataset(Dataset):
                 }
             )
 
+            if self.mode in ("train", "val") and self.fixed_subsample_mask:
+                self.datasets[-1]["fixed_inp_msk"] = (
+                    torch.rand(self.datasets[-1]["inp_msk"].shape) < self.subsample
+                ).to(torch.int).long()
+
         csum = 0
         for length in self._lengths:
             self._cumulative.append(csum)
@@ -345,8 +352,11 @@ class SMDDataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode == "train":
-            msk = (torch.rand(ds["inp_msk"][local_idx].shape) < self.subsample).to(torch.int).long()
+        if self.mode in ("train", "val"):
+            if self.fixed_subsample_mask:
+                msk = ds["fixed_inp_msk"][local_idx].long()
+            else:
+                msk = (torch.rand(ds["inp_msk"][local_idx].shape) < self.subsample).to(torch.int).long()
         else:
             msk = ds["inp_msk"][local_idx].long()
 
@@ -374,6 +384,7 @@ class SMDProvider(DatasetProvider):
         window_overlap: float = 0.0,
         data_normalization_strategy: str = "none",
         subsample: float = 1.0,
+        fixed_subsample_mask: bool = False,
     ):
         super().__init__()
 
@@ -384,9 +395,13 @@ class SMDProvider(DatasetProvider):
             "data_normalization_strategy": data_normalization_strategy,
         }
 
-        self._ds_trn = SMDDataset(data_dir, "train", subsample=subsample, **common_kwargs)
+        self._ds_trn = SMDDataset(
+            data_dir, "train", subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
         self._ds_tst = SMDDataset(data_dir, "test", **common_kwargs)
-        self._ds_val = SMDDataset(data_dir, "val", subsample=subsample, **common_kwargs)
+        self._ds_val = SMDDataset(
+            data_dir, "val", subsample=subsample,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
 
     @property
     def input_dim(self):
