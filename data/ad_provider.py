@@ -45,6 +45,8 @@ class ADData(object):
 
         self.overlapping_windows = window_overlap
 
+        self._processed_root = tempfile.mkdtemp(prefix=f"LatentSDEonHS_{self.data_kind}_processed_")
+
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
 
@@ -100,7 +102,7 @@ class ADData(object):
 
     @property
     def processed_folder(self):
-        return os.path.join(self.root, self.data_kind, 'processed')
+        return self._processed_root
 
     @property
     def training_file(self):
