@@ -8,6 +8,7 @@ Authors: Sebastian Zeng, Florian Graf, Roland Kwitt (2023)
 import glob
 import logging
 import os
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -29,7 +30,7 @@ class ADData(object):
     params_dict, labels_dict = None, None
 
     def __init__(
-            self, root, data_kind="SWaT", mode='train',
+            self, root, processed_root, data_kind="SWaT", mode='train',
             window_length:int = 100, window_overlap: float = 0.75,
             n_samples = None, columns = None,
             normalizer=None,
@@ -45,7 +46,7 @@ class ADData(object):
 
         self.overlapping_windows = window_overlap
 
-        self._processed_root = tempfile.mkdtemp(prefix=f"LatentSDEonHS_{self.data_kind}_processed_")
+        self._processed_root = processed_root
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -394,7 +395,7 @@ class ADDataset(Dataset):
 
     input_dim = None  # nr. of different measurements per time point
 
-    def __init__(self, data_dir: str, mode: str='train', data_kind: str=None,
+    def __init__(self, data_dir: str, processed_root: str, mode: str='train', data_kind: str=None,
                  window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
                  n_samples: int=None, data_normalization_strategy:str="none",
                  fixed_subsample_mask: bool = False):
@@ -405,19 +406,19 @@ class ADDataset(Dataset):
 
         objs = dict()
         objs['train'] = ADData(
-            data_dir, mode='train', data_kind=data_kind,
+            data_dir, processed_root=processed_root, mode='train', data_kind=data_kind,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples,
             data_normalization_strategy=data_normalization_strategy)
 
         objs['test'] = ADData(
-            data_dir, mode='test', data_kind=data_kind,
+            data_dir, processed_root=processed_root, mode='test', data_kind=data_kind,
             window_length=window_length, window_overlap=window_overlap,
             columns=objs['train'].params, n_samples=n_samples,
             normalizer=objs['train'].scaler)
 
         objs['val'] = ADData(
-            data_dir, mode='val', data_kind=data_kind,
+            data_dir, processed_root=processed_root, mode='val', data_kind=data_kind,
             window_length=window_length, window_overlap=window_overlap,
             columns=objs['train'].params, n_samples=n_samples,
             normalizer=objs['train'].scaler)
@@ -574,21 +575,23 @@ class ADProvider(DatasetProvider):
 
         self._dataset = dataset
 
+        processed_root = tempfile.mkdtemp(prefix=f"LatentSDEonHS_{dataset}_processed_")
+
         self._sample_tp = sample_tp
         self._ds_trn = ADDataset(
-            data_dir, 'train', data_kind=dataset,
+            data_dir, processed_root, 'train', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples, subsample=subsample,
             data_normalization_strategy=data_normalization_strategy,
             fixed_subsample_mask=fixed_subsample_mask)
 
         self._ds_tst = ADDataset(
-            data_dir, 'test', data_kind=dataset,
+            data_dir, processed_root, 'test', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples,
             data_normalization_strategy=data_normalization_strategy)
 
-        self._ds_val = ADDataset(data_dir, 'val', data_kind=dataset,
+        self._ds_val = ADDataset(data_dir, processed_root, 'val', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
             n_samples=n_samples, subsample=subsample,
             data_normalization_strategy=data_normalization_strategy,
