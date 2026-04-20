@@ -8,9 +8,6 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 
-# ---- Load modules ----
-module load anaconda
-
 # ---- Initialize conda ----
 source $(conda info --base)/etc/profile.d/conda.sh
 

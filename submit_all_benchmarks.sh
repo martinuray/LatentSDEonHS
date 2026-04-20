@@ -68,9 +68,6 @@ COMMON_ARGS="\
 BENCHMARKS=("SWaT" "WaDi" "SMD" "QAD" "MSL" "SMAP" "PSM")
 
 
-# ---- Load modules ----
-module load anaconda
-
 # ---- Initialize conda ----
 source $(conda info --base)/etc/profile.d/conda.sh
 
