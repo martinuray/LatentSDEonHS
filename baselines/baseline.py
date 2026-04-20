@@ -275,7 +275,7 @@ BENCHMARK_DATASETS = {
     "SWaT": [
         {
             "dataset_id": "SWaT",
-            "data_dir": ROOT_DIR / "data_dir" / "SWaT" / "rawraw",
+            "data_dir": ROOT_DIR / "data_dir" / "SWaT" / "raw",
             "train_file": "train.csv",
             "test_file": "test.csv",
             "label_file": "labels.csv",
@@ -286,7 +286,7 @@ BENCHMARK_DATASETS = {
     "WaDi": [
         {
             "dataset_id": "WaDi",
-            "data_dir": ROOT_DIR / "data_dir" / "WaDi" / "rawraw" / "v2",
+            "data_dir": ROOT_DIR / "data_dir" / "WaDi" / "raw" / "v2",
             "train_file": "WADI_14days.csv",
             "test_file_candidates": ["attackdata_labbelled.csv", "WADI_attackdata_labelled.csv"],
             "file_format": "wadi_v2",
