@@ -199,7 +199,7 @@ def train_one_dataset(
     pm = ProgressMessage(stats_mask)
     best_stats = None
     es_counter = 0
-    best_es_loss = np.inf
+    best_val_loss = np.inf
 
     for epoch in range(1, args.n_epochs + 1):
         trn_stats = generic_train(
@@ -222,9 +222,9 @@ def train_one_dataset(
             normalization_stats=normalization_scores, epoch=epoch, test=False
         )
 
-        es_loss = val_stats["loss"]
-        if es_loss < best_es_loss - args.early_stopping_min_delta:
-            best_es_loss = es_loss
+        val_loss = val_stats["loss"]
+        if val_loss < (best_val_loss - args.early_stopping_min_delta):
+            best_val_loss = val_loss
             best_stats = tst_stats
             es_counter = 0
         else:
@@ -603,6 +603,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         if provider.num_datasets == 1:
             only_id = next(iter(per_dataset_stats.keys()))
             stats2pass = per_dataset_histories[only_id]["tst"]
+            best_stats2pass = per_dataset_stats[only_id]
             finalstats2tensorboard(
                 writer_=writer,
                 params_=vars(args),
@@ -613,7 +614,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             writer.close()
             if store_final_metrics:
                 _store_final_metrics(stats2pass[0])
-            logging.info(f"Final metrics across {provider.num_datasets} datasets: {stats2pass[0]}")
+            logging.info(f"Final metrics across {provider.num_datasets} datasets: {best_stats2pass}")
             
             if args.delete_processed_data:
                 delete_processed_data(args.dataset, data_dir='data_dir')
