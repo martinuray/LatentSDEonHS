@@ -38,8 +38,6 @@ def generic_train(args,
         qzx, pz = modules['qzx_net'](h, desired_t)
         zis = qzx.rsample((args.mc_train_samples,))
         pxz = modules['pxz_net'](zis)
-        if dl.dataset.has_aux: 
-            aux = modules['aux_net'](zis)
 
         elbo_val, elbo_parts = elbo_loss(
             qzx,
@@ -54,11 +52,7 @@ def generic_train(args,
                 "pxz_weight": args.pxz_weight,
             },
         )
-        if dl.dataset.has_aux:
-            aux_val = aux_loss(aux, parts['aux_obs'], parts['aux_tid'])
-            loss = elbo_val + args.aux_weight*aux_weight_mul*aux_val
-        else:
-            loss = elbo_val
+        loss = elbo_val
         
         optimizer.zero_grad()
         loss.backward()
@@ -69,8 +63,6 @@ def generic_train(args,
         stats['kl0'].append(elbo_parts['kl0'].item()*batch_len)
         stats['klp'].append(elbo_parts['klp'].item()*batch_len)
         stats['log_pxz'].append(elbo_parts['log_pxz'].item()*batch_len)  
-        if dl.dataset.has_aux:
-            stats['aux_val'].append(aux_val.item()*batch_len)
 
     stats = {key: np.sum(val)/len(dl.dataset) for key, val in stats.items()}
     return stats
