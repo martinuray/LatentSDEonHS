@@ -440,14 +440,15 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
                 aux_log_prob = aux_log_prob[None, :, :]
 
             # aux_log_prob = aux_log_prob.mean(dim=0)
-
-            aux_log_prob = aux_log_prob.mean(dim=2)
+            #aux_log_prob = aux_log_prob.mean(dim=2)
 
             all_scores.append(aux_log_prob)
 
-    all_scores = torch.cat(all_scores, dim=0)
+    all_scores = torch.cat(all_scores, dim=0).mean(dim=0)
     stats['mu'] = all_scores.mean(dim=0)
     stats['sigma'] = all_scores.std(dim=0)
+    stats['max'] = all_scores.max(dim=0).values
+    stats['min'] = all_scores.min(dim=0).values
     return stats
 
 
@@ -753,8 +754,9 @@ def evaluate(
 
             #aux_log_prob = aux_log_prob.mean(dim=0)
             if normalization_stats is not None:
-                aux_log_prob = (aux_log_prob - normalization_stats['mu']) / \
-                               normalization_stats['sigma']
+                #aux_log_prob = (aux_log_prob - normalization_stats['mu']) / \
+                #               normalization_stats['sigma']
+                aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
