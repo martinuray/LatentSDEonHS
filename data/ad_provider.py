@@ -60,9 +60,6 @@ class ADData(object):
                 if not self._check_exists():
                     self._process_water_treatment_data(
                         columns=columns, n_samples=n_samples)
-            elif self.data_kind in ["SMD"]:
-                self._process_server_machine_data(
-                    columns=columns, n_samples=n_samples)
             else:
                 raise NotImplementedError
 
@@ -176,8 +173,7 @@ class ADData(object):
 
             raw_data = train_np if self.mode == 'train' else test_np
         else:
-            # Load from pre-processed NPY files
-            raw_data = np.load(os.path.join(self.raw_folder, f'{self.mode}.npy'))
+            raise NotImplementedError("Data missing")
 
         indcs = np.arange(0, raw_data.shape[1])
 
@@ -186,8 +182,7 @@ class ADData(object):
                 # Use preprocessed labels from CSV
                 self.targets = self._reshape_data_to_windows(test_labels, self.max_signal_length)
             else:
-                # Load from NPY file
-                self.targets = np.load(os.path.join(self.raw_folder, f'labels.npy'), allow_pickle=True)
+                raise NotImplementedError("Data Labels missing")
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
 
@@ -213,81 +208,6 @@ class ADData(object):
 
         data = [(part_idx, indcs+(indcs.shape[0]*part_idx), data_tensor[part_idx, :, :],
                  mask[part_idx, :, :]) for part_idx in range(mask.shape[0])]
-
-        torch.save(data, os.path.join(self.processed_folder, self.destination_file))
-        if self.mode == 'test':
-            torch.save(self.targets, os.path.join(self.processed_folder, self.label_file))
-
-    def _process_server_machine_data(self, columns=None, n_samples=None):
-        logging.warning("Processing Server Machine Data")
-
-        all_dfs = self.get_all_dfs()
-
-        if columns is None:
-            self.params = next(iter(all_dfs.values()))[self.mode].columns
-        else:
-            self.params = columns
-
-        if self.mode == 'test':
-            raw_data_list, raw_targets_list, masks_list = [], [], []
-            for _, values in all_dfs.items():
-                test_data = values['test']
-                added_ = np.zeros(((self.max_signal_length - test_data.shape[
-                    0]) % self.max_signal_length, test_data.shape[1]))
-                raw_data = np.vstack((test_data, added_)).copy()
-                raw_data = raw_data.reshape(-1, self.max_signal_length,
-                                            raw_data.shape[1])
-                raw_data_list.append(raw_data)
-                msk = np.ones_like(raw_data)
-                msk[-1, -added_.shape[0]:, :] = 0
-                masks_list.append(msk)
-
-                # TODO take care that no overlapping windows are taken
-                targets = values['labels']
-                targets = np.array(targets)
-                targets = np.hstack((targets.squeeze(), added_[:, 0]))
-                targets = targets.reshape(-1, self.max_signal_length)
-                raw_targets_list.append(targets)
-
-            raw_data = np.vstack(raw_data_list)
-            self.targets = np.vstack(raw_targets_list)
-            data_tensor = torch.Tensor(raw_data)
-            mask = torch.Tensor(np.vstack(masks_list))
-
-        else:
-            raw_dfs = []
-            for _, values in all_dfs.items():
-                rd = values['train'].to_numpy().copy()
-                raw_dfs.append(create_win_periods(rd, self.max_signal_length,
-                                                  int(self.max_signal_length * self.overlapping_windows)))
-
-            raw_data = np.vstack(raw_dfs)
-            self.targets = np.zeros(raw_data.shape[0:2])
-            data_tensor = torch.Tensor(raw_data)
-            mask = torch.ones_like(data_tensor)
-
-        self.params_dict = {k: i for i, k in enumerate(self.params)}
-        indcs = torch.arange(0, raw_data.shape[1])
-
-        # handle nan values in the dataset
-        mask[data_tensor.isnan()] = 0
-        data_tensor[data_tensor.isnan()] = 0
-
-        if n_samples is not None:
-            logging.warning(f"Limiting dataset to {n_samples} samples")
-            data_tensor = data_tensor[:n_samples]
-            mask = mask[:n_samples]
-            indcs = indcs[:n_samples]
-            if self.mode == 'test':
-                self.targets = self.targets[:n_samples]
-        else:
-            logging.debug("No limit on the dataset size")
-
-        #assert data_tensor.shape[0] == mask.shape[0]
-
-        data = [(part_idx, indcs, data_tensor[part_idx, :, :],
-                 mask[part_idx, :, :]) for part_idx in
-                range(mask.shape[0])]
 
         torch.save(data, os.path.join(self.processed_folder, self.destination_file))
         if self.mode == 'test':
@@ -326,12 +246,12 @@ class ADData(object):
             test_df.columns = cols
 
         # Remove columns where there is only one unique value
-        train_col_set = set(train_df.columns[train_df.nunique() == 1].tolist())
-        test_col_set = set(test_df.columns[test_df.nunique() == 1].tolist())
-        common_set = list(train_col_set.union(test_col_set))
+        #train_col_set = set(train_df.columns[train_df.nunique() == 1].tolist())
+        #test_col_set = set(test_df.columns[test_df.nunique() == 1].tolist())
+        #common_set = list(train_col_set.union(test_col_set))
 
-        train_df = train_df.drop(common_set, axis=1)
-        test_df = test_df.drop(common_set, axis=1)
+        #train_df = train_df.drop(common_set, axis=1)
+        #test_df = test_df.drop(common_set, axis=1)
 
         # Normalize data using MinMaxScaler
         normalizer = MinMaxScaler(feature_range=(0, 1))
