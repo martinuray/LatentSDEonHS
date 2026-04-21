@@ -617,6 +617,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             
             if args.delete_processed_data:
                 delete_processed_data(args.dataset, data_dir='data_dir')
+                provider.cleanup()
             
             return per_dataset_stats[only_id]
 
@@ -641,6 +642,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         
         if args.delete_processed_data:
             delete_processed_data(args.dataset, data_dir='data_dir')
+            provider.cleanup()
         
         return combined_stats
 
@@ -688,6 +690,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
     
     if args.delete_processed_data:
         delete_processed_data(args.dataset, data_dir='data_dir')
+        provider.cleanup()
     
     return tst_stats
 
@@ -831,9 +834,9 @@ def main():
         parser.error("--runs must be >= 1")
 
     print(args_)
-    if args_.runs == 1:
-        _ = start_experiment(args_, provider=None, store_final_metrics=True)
-        return
+    #if args_.runs == 1:
+    #    _ = start_experiment(args_, provider=None, store_final_metrics=True)
+    #    return
 
     run_results = []
     for run_idx in range(args_.runs):

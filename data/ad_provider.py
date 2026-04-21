@@ -8,6 +8,7 @@ Authors: Sebastian Zeng, Florian Graf, Roland Kwitt (2023)
 import glob
 import logging
 import os
+import shutil
 import tempfile
 
 import numpy as np
@@ -403,6 +404,7 @@ class ADDataset(Dataset):
         self.mode = mode
         self.subsample=subsample
         self.fixed_subsample_mask = fixed_subsample_mask
+        self.processed_root = processed_root
 
         objs = dict()
         objs['train'] = ADData(
@@ -653,6 +655,9 @@ class ADProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._ds_trn.processed_root)
 
 
 def create_win_periods(data_, win_size_, win_stride_):
