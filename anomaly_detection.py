@@ -542,159 +542,156 @@ def start_experiment(args, provider=None, store_final_metrics=True):
     else:
         logging.info("Using provided data provider")
 
-    has_hybrid_layout = all(
-        hasattr(provider, attr) for attr in ["num_datasets", "input_dims", "num_timepoints_list"]
-    ) and all(hasattr(provider, attr) for attr in ["_ds_trn", "_ds_tst", "_ds_val"])
+    def _run_with_provider(active_provider):
+        has_hybrid_layout = all(
+            hasattr(active_provider, attr) for attr in ["num_datasets", "input_dims", "num_timepoints_list"]
+        ) and all(hasattr(active_provider, attr) for attr in ["_ds_trn", "_ds_tst", "_ds_val"])
 
-    if has_hybrid_layout:
-        per_dataset_stats = {}
-        per_dataset_histories = {}
+        if has_hybrid_layout:
+            per_dataset_stats = {}
+            per_dataset_histories = {}
 
-        for ds_idx in range(provider.num_datasets):
-            trn_slice = DatasetSlice(provider._ds_trn, ds_idx)
-            tst_slice = DatasetSlice(provider._ds_tst, ds_idx)
-            val_slice = DatasetSlice(provider._ds_val, ds_idx)
+            for ds_idx in range(active_provider.num_datasets):
+                trn_slice = DatasetSlice(active_provider._ds_trn, ds_idx)
+                tst_slice = DatasetSlice(active_provider._ds_tst, ds_idx)
+                val_slice = DatasetSlice(active_provider._ds_val, ds_idx)
 
-            dataset_id = str(trn_slice.dataset_id)
-            logging.info(
-                f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{provider.num_datasets})"
-            )
+                dataset_id = str(trn_slice.dataset_id)
+                logging.info(
+                    f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{active_provider.num_datasets})"
+                )
 
-            dl_trn = DataLoader(
-                trn_slice,
-                batch_size=args.batch_size,
-                shuffle=True,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-                drop_last=False,
-            )
-            dl_tst = DataLoader(
-                tst_slice,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-            )
-            dl_val = DataLoader(
-                val_slice,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-            )
+                dl_trn = DataLoader(
+                    trn_slice,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                    drop_last=False,
+                )
+                dl_tst = DataLoader(
+                    tst_slice,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                )
+                dl_val = DataLoader(
+                    val_slice,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                )
 
-            tst_stats, hist_stats = train_one_dataset(
-                args=args,
-                dl_trn=dl_trn,
-                dl_tst=dl_tst,
-                dl_val=dl_val,
-                input_dim=provider.input_dims[ds_idx],
-                num_timepoints=provider.num_timepoints_list[ds_idx],
-                writer=writer,
-                stats_prefix=dataset_id,
-                experiment_id_str=experiment_id_str,
-            )
+                tst_stats, hist_stats = train_one_dataset(
+                    args=args,
+                    dl_trn=dl_trn,
+                    dl_tst=dl_tst,
+                    dl_val=dl_val,
+                    input_dim=active_provider.input_dims[ds_idx],
+                    num_timepoints=active_provider.num_timepoints_list[ds_idx],
+                    writer=writer,
+                    stats_prefix=dataset_id,
+                    experiment_id_str=experiment_id_str,
+                )
 
-            per_dataset_stats[dataset_id] = tst_stats
-            per_dataset_histories[dataset_id] = hist_stats
+                per_dataset_stats[dataset_id] = tst_stats
+                per_dataset_histories[dataset_id] = hist_stats
 
-        if provider.num_datasets == 1:
-            only_id = next(iter(per_dataset_stats.keys()))
-            stats2pass = per_dataset_histories[only_id]["tst"]
-            best_stats2pass = per_dataset_stats[only_id]
-            finalstats2tensorboard(
-                writer_=writer,
-                params_=vars(args),
-                stats=stats2pass,
-                args=args,
-            )
+            if active_provider.num_datasets == 1:
+                only_id = next(iter(per_dataset_stats.keys()))
+                stats2pass = per_dataset_histories[only_id]["tst"]
+                best_stats2pass = per_dataset_stats[only_id]
+                finalstats2tensorboard(
+                    writer_=writer,
+                    params_=vars(args),
+                    stats=stats2pass,
+                    args=args,
+                )
+                logging.shutdown()
+                writer.close()
+                if store_final_metrics:
+                    _store_final_metrics(stats2pass[0])
+                logging.info(f"Final metrics across {active_provider.num_datasets} datasets: {best_stats2pass}")
+                return per_dataset_stats[only_id]
+
+            macro_stats = compute_macro_metrics(per_dataset_stats)
+            for key, value in macro_stats.items():
+                writer.add_scalar(key, value, 0)
+
+            combined_stats = {
+                "per_dataset": per_dataset_stats,
+                **macro_stats,
+            }
+
+            if args.enable_file_logging:
+                fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
+                save_stats(args, combined_stats, fname)
+
+            logging.info(f"Macro metrics across {active_provider.num_datasets} datasets: {macro_stats}")
+            if store_final_metrics:
+                _store_final_metrics(combined_stats)
             logging.shutdown()
             writer.close()
-            if store_final_metrics:
-                _store_final_metrics(stats2pass[0])
-            logging.info(f"Final metrics across {provider.num_datasets} datasets: {best_stats2pass}")
-            
-            if args.delete_processed_data:
-                delete_processed_data(args.dataset, data_dir='data_dir')
-                provider.cleanup()
-            
-            return per_dataset_stats[only_id]
+            return combined_stats
 
-        macro_stats = compute_macro_metrics(per_dataset_stats)
-        for key, value in macro_stats.items():
-            writer.add_scalar(key, value, 0)
+        # Fallback path for providers without hybrid layout.
+        dl_trn = active_provider.get_train_loader(
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False,
+        )
+        dl_tst = active_provider.get_test_loader(
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+        )
+        dl_val = active_provider.get_val_loader(
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+        )
 
-        combined_stats = {
-            "per_dataset": per_dataset_stats,
-            **macro_stats,
-        }
+        tst_stats, stats = train_one_dataset(
+            args=args,
+            dl_trn=dl_trn,
+            dl_tst=dl_tst,
+            dl_val=dl_val,
+            input_dim=active_provider.input_dim,
+            num_timepoints=active_provider.num_timepoints,
+            writer=writer,
+            stats_prefix="",
+            experiment_id_str=experiment_id_str,
+        )
 
-        if args.enable_file_logging:
-            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
-            save_stats(args, combined_stats, fname)
-
-        logging.info(f"Macro metrics across {provider.num_datasets} datasets: {macro_stats}")
+        finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
         if store_final_metrics:
-            _store_final_metrics(combined_stats)
+            _store_final_metrics(tst_stats)
         logging.shutdown()
         writer.close()
-        
+        return tst_stats
+
+    try:
+        return _run_with_provider(provider)
+    finally:
         if args.delete_processed_data:
             delete_processed_data(args.dataset, data_dir='data_dir')
-            provider.cleanup()
-        
-        return combined_stats
-
-    # Fallback path for providers without hybrid layout.
-    dl_trn = provider.get_train_loader(
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=False,
-    )
-    dl_tst = provider.get_test_loader(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-    )
-    dl_val = provider.get_val_loader(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-    )
-
-    tst_stats, stats = train_one_dataset(
-        args=args,
-        dl_trn=dl_trn,
-        dl_tst=dl_tst,
-        dl_val=dl_val,
-        input_dim=provider.input_dim,
-        num_timepoints=provider.num_timepoints,
-        writer=writer,
-        stats_prefix="",
-        experiment_id_str=experiment_id_str,
-    )
-
-    finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
-    if store_final_metrics:
-        _store_final_metrics(tst_stats)
-    logging.shutdown()
-    writer.close()
-    
-    if args.delete_processed_data:
-        delete_processed_data(args.dataset, data_dir='data_dir')
-        provider.cleanup()
-    
-    return tst_stats
+        if provider is not None and hasattr(provider, "cleanup"):
+            try:
+                provider.cleanup()
+            except Exception as err:
+                logging.warning(f"Provider cleanup failed: {err}")
 
 
 def evaluate(

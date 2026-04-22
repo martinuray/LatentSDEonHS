@@ -40,3 +40,6 @@ class DatasetProvider():
     
     def decomposer(self):
         raise NotImplementedError()
+
+    def cleanup(self):
+        pass

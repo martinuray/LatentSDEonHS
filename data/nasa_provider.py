@@ -9,6 +9,8 @@ import ast
 import glob
 import logging
 import os
+import shutil
+import tempfile
 from typing import DefaultDict
 
 import numpy as np
@@ -33,7 +35,8 @@ class NASAData(object):
     def __init__(
             self, root, data_kind="MSL", mode='train', dataset_id="A-1",
             window_length:int = 100, window_overlap: float = 0.0,
-            normalizer=None, data_normalization_strategy:str="none"
+            normalizer=None, data_normalization_strategy:str="none",
+            processed_root: str = None,
     ):
 
         self.scaler = normalizer
@@ -44,6 +47,7 @@ class NASAData(object):
         self.window_length = window_length
 
         self.overlapping_windows = window_overlap
+        self._processed_root = processed_root
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -89,6 +93,8 @@ class NASAData(object):
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         return os.path.join(self.root, 'nasa', 'processed', self.data_kind)
 
     @property
@@ -208,7 +214,8 @@ class NASADataset(Dataset):
                  dataset: str = None, window_length: int = 100,
                  window_overlap: float = 0.0, subsample: float = 1.0,
                  data_normalization_strategy: str = "none",
-                 fixed_subsample_mask: bool = False):
+                 fixed_subsample_mask: bool = False,
+                 processed_root: str = None):
 
         self.mode = mode
         self.subsample = subsample
@@ -228,17 +235,18 @@ class NASADataset(Dataset):
             train_data = NASAData(
                 data_dir, mode='train', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                data_normalization_strategy=data_normalization_strategy)
+                data_normalization_strategy=data_normalization_strategy,
+                processed_root=processed_root)
 
             objs['train'].append(train_data)
             objs['test'].append(NASAData(
                 data_dir, mode='test', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler))
+                normalizer=train_data.scaler, processed_root=processed_root))
             objs['val'].append(NASAData(
                 data_dir, mode='val', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler))
+                normalizer=train_data.scaler, processed_root=processed_root))
 
         # ------------------------------------------------------------------
         # Process each dataset_id *separately* — keep as list entries
@@ -416,12 +424,14 @@ class NASAProvider(DatasetProvider):
             raise NotImplementedError
 
         self._dataset = dataset
+        self._processed_root = tempfile.mkdtemp(prefix=f"LatentSDEonHS_{dataset}_processed_")
 
         common_kwargs = {
             'dataset': dataset,
             'window_length': window_length,
             'window_overlap': window_overlap,
-            'data_normalization_strategy': data_normalization_strategy
+            'data_normalization_strategy': data_normalization_strategy,
+            'processed_root': self._processed_root,
         }
 
         self._ds_trn = NASADataset(
@@ -465,6 +475,9 @@ class NASAProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 
 
 def create_win_periods(data_, win_size_, win_stride_):

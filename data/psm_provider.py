@@ -1,6 +1,8 @@
 import glob
 import logging
 import os
+import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -56,6 +58,7 @@ class PSMData:
         window_overlap: float = 0.0,
         normalizer=None,
         data_normalization_strategy: str = "none",
+        processed_root: str = None,
     ):
         self.scaler = normalizer
         self.data_normalization_strategy = data_normalization_strategy
@@ -63,6 +66,7 @@ class PSMData:
         self.mode = mode
         self.window_length = window_length
         self.window_overlap = window_overlap
+        self._processed_root = processed_root
 
         if not self._check_exists():
             if not self._check_exist_raw_data():
@@ -79,6 +83,8 @@ class PSMData:
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         ov = str(self.window_overlap).replace(".", "p")
         return os.path.join(self.root_path, "PSM", "processed", f"wl{self.window_length}_ov{ov}")
 
@@ -186,6 +192,7 @@ class PSMDataset(Dataset):
         subsample: float = 1.0,
         data_normalization_strategy: str = "none",
         fixed_subsample_mask: bool = False,
+        processed_root: str = None,
     ):
         self.mode = mode
         self.subsample = subsample
@@ -201,6 +208,7 @@ class PSMDataset(Dataset):
             window_length=window_length,
             window_overlap=window_overlap,
             data_normalization_strategy=data_normalization_strategy,
+            processed_root=processed_root,
         )
 
         objs = {
@@ -209,11 +217,13 @@ class PSMDataset(Dataset):
                 data_dir, mode="test",
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler,
+                processed_root=processed_root,
             ),
             "val": PSMData(
                 data_dir, mode="val",
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler,
+                processed_root=processed_root,
             ),
         }
 
@@ -348,11 +358,13 @@ class PSMProvider(DatasetProvider):
         fixed_subsample_mask: bool = False,
     ):
         super().__init__()
+        self._processed_root = tempfile.mkdtemp(prefix="LatentSDEonHS_PSM_processed_")
 
         common_kwargs = {
             "window_length": window_length,
             "window_overlap": window_overlap,
             "data_normalization_strategy": data_normalization_strategy,
+            "processed_root": self._processed_root,
         }
 
         self._ds_trn = PSMDataset(
@@ -411,4 +423,7 @@ class PSMProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 

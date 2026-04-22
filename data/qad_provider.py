@@ -2,6 +2,8 @@ import logging
 import os
 import glob
 import re
+import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -26,7 +28,8 @@ class QADData:
             window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
             data_normalization_strategy: str = "none",
-            raw_subdir: str = "qad_clean_txt_100Hz"
+            raw_subdir: str = "qad_clean_txt_100Hz",
+            processed_root: str = None,
     ):
 
         self.scaler = normalizer
@@ -36,6 +39,7 @@ class QADData:
         self.mode = mode
         self.window_length = window_length
         self.raw_subdir = raw_subdir
+        self._processed_root = processed_root
 
         self.overlapping_windows = window_overlap
 
@@ -91,6 +95,8 @@ class QADData:
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         # Keep processed namespace aligned with the actual raw folder name.
         return os.path.join(self.root_path, "QAD", "processed", self._resolve_raw_subdir())
 
@@ -203,7 +209,7 @@ class QADDataset(Dataset):
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
                  data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz",
-                 fixed_subsample_mask: bool = False):
+                 fixed_subsample_mask: bool = False, processed_root: str = None):
 
         self.mode = mode
         self.subsample = subsample
@@ -220,18 +226,20 @@ class QADDataset(Dataset):
                 data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy,
-                raw_subdir=raw_subdir)
+                raw_subdir=raw_subdir, processed_root=processed_root)
 
             objs = {
                 'train': train_data,
                 'test': QADData(
                     data_dir, mode='test', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir),
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    processed_root=processed_root),
                 'val': QADData(
                     data_dir, mode='val', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir)
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    processed_root=processed_root)
             }
 
             data = objs[mode]
@@ -414,6 +422,7 @@ class QADProvider(DatasetProvider):
         super().__init__()
 
         self._dataset = dataset_number
+        self._processed_root = tempfile.mkdtemp(prefix="LatentSDEonHS_QAD_processed_")
 
         common_kwargs = {
             'dataset_number': dataset_number,
@@ -421,6 +430,7 @@ class QADProvider(DatasetProvider):
             'window_overlap': window_overlap,
             'data_normalization_strategy': data_normalization_strategy,
             'raw_subdir': raw_subdir,
+            'processed_root': self._processed_root,
         }
 
         self._ds_trn = QADDataset(
@@ -479,6 +489,9 @@ class QADProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 
 
 def load_qad_txt(dataset_path, is_label: bool = False):
