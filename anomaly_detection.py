@@ -757,6 +757,9 @@ def evaluate(
                 #               normalization_stats['sigma']
                 aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
 
+            if aux_log_prob.dim() == 4:
+                aux_log_prob = aux_log_prob.mean(axis=0)
+
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
 
