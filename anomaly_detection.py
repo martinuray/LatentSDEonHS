@@ -492,11 +492,13 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             metrics=final_metrics,
         )
 
+    data_dir = getattr(args, "data_dir", "data_dir")
+
     if provider is None:
         logging.info("Instantiating data provider")
         if args.dataset in ['SWaT', 'WaDi']:
             provider = ADProvider(
-                data_dir='data_dir', dataset=args.dataset,
+                data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
                 n_samples=1000 if args.debug else None,
                 subsample=args.subsample,
@@ -505,7 +507,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset == 'SMD':
             provider = SMDProvider(
-                data_dir='data_dir',
+                data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
@@ -514,7 +516,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset == 'QAD':
             provider = QADProvider(
-                data_dir="data_dir/",
+                data_dir=data_dir,
                 dataset_number=None,
                 window_length=args.data_window_length,
                 subsample=args.subsample,
@@ -524,13 +526,13 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset in ['SMAP', 'MSL']:
             provider = NASAProvider(
-                data_dir="data_dir/", dataset=args.dataset,
+                data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask)
         elif args.dataset == 'PSM':
             provider = PSMProvider(
-                data_dir='data_dir',
+                data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
@@ -686,7 +688,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         return _run_with_provider(provider)
     finally:
         if args.delete_processed_data:
-            delete_processed_data(args.dataset, data_dir='data_dir')
+            delete_processed_data(args.dataset, data_dir=data_dir)
         if provider is not None and hasattr(provider, "cleanup"):
             try:
                 provider.cleanup()
@@ -840,7 +842,7 @@ def main():
 
     run_results = []
     for run_idx in range(args_.runs):
-        delete_processed_data(args_.dataset, data_dir='data_dir')
+        delete_processed_data(args_.dataset, data_dir=args_.data_dir)
         logging.info("Starting run %d/%d", run_idx + 1, args_.runs)
         run_result = start_experiment(args_, provider=None, store_final_metrics=False)
         run_results.append(run_result)
