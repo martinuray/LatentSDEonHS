@@ -48,7 +48,6 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
     group.add_argument("--dec-hidden-dim", type=int, default=64)
     group.add_argument("--n-dec-layers", type=int, default=1)
-    group.add_argument("--early-stopping-patience", type=int, default=10)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
@@ -229,7 +228,7 @@ def train_one_dataset(
             es_counter = 0
         else:
             es_counter += 1
-            if es_counter >= args.early_stopping_patience:
+            if es_counter >= 2*args.restart: # early stopping patience shall be longer than one cosine sheduling
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
@@ -756,6 +755,9 @@ def evaluate(
                 #aux_log_prob = (aux_log_prob - normalization_stats['mu']) / \
                 #               normalization_stats['sigma']
                 aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
+
+            if aux_log_prob.dim() == 4:
+                aux_log_prob = aux_log_prob.mean(axis=0)
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
