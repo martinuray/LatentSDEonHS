@@ -419,7 +419,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
     modules.eval()
     with (torch.no_grad()):
-        all_labels, all_scores = [], []
+        all_labels, all_scores_list = [], []
         for _, batch in enumerate(dl):
             parts = {key: val.to(device) for key, val in batch.items()}
 
@@ -441,9 +441,15 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
             # aux_log_prob = aux_log_prob.mean(dim=0)
             #aux_log_prob = aux_log_prob.mean(dim=2)
 
-            all_scores.append(aux_log_prob)
+            all_scores_list.append(aux_log_prob)
 
-    all_scores = torch.cat(all_scores, dim=0).mean(dim=0)
+    try:
+        all_scores = torch.cat(all_scores_list, dim=0)
+        all_scores = all_scores.mean(dim=0)
+    except RuntimeError:
+        pass
+        raise RuntimeError
+
     stats['mu'] = all_scores.mean(dim=0)
     stats['sigma'] = all_scores.std(dim=0)
     stats['max'] = all_scores.max(dim=0).values
