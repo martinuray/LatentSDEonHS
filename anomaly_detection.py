@@ -19,7 +19,7 @@ from core.models import (
     PathToGaussianDecoder,
     ELBO,
     default_SOnPathDistributionEncoder,
-    PhysioNetRecogNetwork, GenericMLP,
+    PhysioNetRecogNetwork, GenericMLP, default_GLnPathDistributionEncoder,
 )
 from core.training import generic_train
 from data.ad_provider import ADProvider
@@ -43,11 +43,11 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--subsample", type=float, default=0.1)
-    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
-    group.add_argument("--dec-hidden-dim", type=int, default=64)
-    group.add_argument("--n-dec-layers", type=int, default=1)
+    group.add_argument("--subsample", type=float, default=0.4)
+    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=True)
+    group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
+    group.add_argument("--dec-hidden-dim", type=int, default=32)
+    group.add_argument("--n-dec-layers", type=int, default=2)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
@@ -58,6 +58,12 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="If set, sample subsampling masks once at dataset load time for train/val instead of resampling every iteration.",
+    )
+    group.add_argument(
+        "--sphere-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use SOn path-distribution encoder (sphere embedding). Disable to use GLn encoder.",
     )
     return parser
 
@@ -138,13 +144,26 @@ def build_modules_and_optim(args, input_dim, desired_t):
         sigma_map=None,
         initial_sigma=args.initial_sigma)
 
-    qzx_net = default_SOnPathDistributionEncoder(
-        h_dim=args.h_dim,
-        z_dim=args.z_dim,
-        n_deg=args.n_deg,
-        learnable_prior=args.learnable_prior,
-        time_min=0.0,
-        time_max=2.0 * desired_t[-1].item())
+    if args.sphere_embedding:
+        qzx_net = default_SOnPathDistributionEncoder(
+            h_dim=args.h_dim,
+            z_dim=args.z_dim,
+            n_deg=args.n_deg,
+            learnable_prior=args.learnable_prior,
+            time_min=0.0,
+            time_max=2.0 * desired_t[-1].item(),
+        )
+        logging.debug("Using default_SOnPathDistributionEncoder (sphere embedding)")
+    else:
+        qzx_net = default_GLnPathDistributionEncoder(
+            h_dim=args.h_dim,
+            z_dim=args.z_dim,
+            n_deg=args.n_deg,
+            learnable_prior=args.learnable_prior,
+            time_min=0.0,
+            time_max=2.0 * desired_t[-1].item(),
+        )
+        logging.debug("Using default_GLnPathDistributionEncoder")
 
     if args.freeze_sigma:
         logging.debug("Froze sigma when computing PathToGaussianDecoder")
@@ -318,7 +337,8 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
 
     param2store = ['lr', 'kl0_weight', 'klp_weight', 'pxz_weight', 'z_dim',
                    'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder',
-                   'dataset', 'n_dec_layers', 'subsample', 'freeze-sigma', 'initial_sigma']
+                   'dataset', 'n_dec_layers', 'subsample', 'freeze-sigma', 'initial_sigma',
+                   'sphere_embedding']
 
     params_ = {key: value for key, value in params_.items() if key in param2store}
 
@@ -445,7 +465,6 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
     try:
         all_scores = torch.cat(all_scores_list, dim=0)
-        all_scores = all_scores.mean(dim=0)
     except RuntimeError:
         pass
         raise RuntimeError
