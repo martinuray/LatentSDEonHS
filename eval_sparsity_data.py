@@ -54,8 +54,11 @@ def aggregate(out_dir: str):
     results_df.to_csv(csv_path, index=False)
     print(f"Saved aggregated CSV to {csv_path}")
 
-    metrics = ['f1', 'prec', 'rec', 'auprc', 'auc']
+    metrics = ['auc', 'auprc', 'f1', 'rec', 'prec']
     available = [m for m in metrics if m in results_df.columns]
+    if not available:
+        raise ValueError(f"None of the expected metrics {metrics} were found in aggregated results")
+
     agg = results_df.groupby('subsample')[available].agg(['mean', 'std'])
 
     n_cols = len(available)
@@ -64,19 +67,43 @@ def aggregate(out_dir: str):
         axes = [axes]
 
     for ax, col in zip(axes, available):
+        display_label = col.upper()
         mean = agg[col]['mean']
-        std  = agg[col]['std']
+        std  = agg[col]['std'].fillna(0.0)
         x    = mean.index
-        ax.plot(x, mean, marker='o', label=col)
-        ax.fill_between(x, mean - std, mean + std, alpha=0.25, label='±1 std')
-        ax.set_ylabel(col)
-        ax.set_title(col)
-        ax.legend(fontsize=8)
+        (line,) = ax.plot(x, mean, marker='o', color='k', label=display_label)
+        ax.fill_between(x, mean - std, mean + std, alpha=0.075, color='k', label='±std')
+
+        if mean.notna().any():
+            argmax_x = mean.idxmax()
+            argmax_y = mean.loc[argmax_x]
+            ax.scatter(
+                [argmax_x],
+                [argmax_y],
+                s=90,
+                color=line.get_color(),
+                edgecolors='black',
+                linewidths=1.0,
+                zorder=4,
+                #label='argmax',
+            )
+            ax.annotate(
+                f"MAX @ {argmax_x:.2f}\n{argmax_y:.3f}",
+                xy=(argmax_x, argmax_y),
+                xytext=(8, 8),
+                textcoords='offset points',
+                fontsize=8,
+                bbox={'boxstyle': 'round,pad=0.2', 'fc': 'white', 'alpha': 0.8, 'ec': 'none'},
+            )
+
+        ax.set_ylabel(display_label)
+        ax.set_title(display_label)
+        ax.legend(fontsize=8, loc="lower left")
 
     axes[-1].set_xlabel('subsample')
     plt.tight_layout()
     png_path = os.path.join(out_dir, 'sparsity_results.png')
-    plt.savefig(png_path, dpi=150)
+    plt.savefig(png_path, dpi=300)
     plt.close('all')
     print(f"Saved plot to {png_path}")
 
@@ -84,7 +111,7 @@ def aggregate(out_dir: str):
 def main():
     parser = extend_argparse(generic_parser)
     parser.add_argument(
-        '--mode', choices=['single', 'aggregate'], default='single',
+        '--mode', choices=['single', 'aggregate'], default='aggregate',
         help="'single': run one (seed,subsample) pair (requires --task-id); "
              "'aggregate': collect results and plot.")
     parser.add_argument(
@@ -98,6 +125,7 @@ def main():
 
     # important!
     args.fixed_subsample_mask = True
+    args.batch_size = 128
 
     if args.mode == 'single':
         if args.task_id is None:
