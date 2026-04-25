@@ -276,16 +276,21 @@ class PSMDataset(Dataset):
             "dataset_id": "PSM",
         })
 
-        if self.mode in ("train", "val") and self.fixed_subsample_mask:
-            masked_ratio = 1.0 - self.subsample
-            burst_mask = create_random_burst_mask(
-                n_features=n_samples,
-                x_len=n_time,
-                masked_ratio=masked_ratio
-            )
-            self.datasets[0]["fixed_inp_msk"] = torch.from_numpy(
-                burst_mask.astype(np.int64)
-            ).long()
+        if self.fixed_subsample_mask:
+            if self.mode == "train":
+                masked_ratio = 1.0 - self.subsample
+                n_features_data = obs.shape[-1]
+                burst_mask = create_random_burst_mask(
+                    n_features=n_samples * n_features_data,
+                    x_len=n_time,
+                    masked_ratio=masked_ratio,
+                )  # (n_samples * n_features_data, n_time)
+                burst_arr = burst_mask.reshape(n_samples, n_features_data, n_time).transpose(0, 2, 1)
+                self.datasets[0]["fixed_inp_msk"] = torch.from_numpy(
+                    burst_arr.astype(np.int64)
+                ).long()
+            else:  # val
+                self.datasets[0]["fixed_inp_msk"] = torch.ones_like(msk).long()
 
         self._cumulative.append(0)
 
@@ -335,7 +340,14 @@ class PSMDataset(Dataset):
             if self.fixed_subsample_mask:
                 msk = ds["fixed_inp_msk"][local_idx].long()
             else:
-                msk = (torch.rand(ds["inp_msk"][local_idx].shape) < self.subsample).to(torch.int).long()
+                masked_ratio = 1.0 - self.subsample
+                n_time_s, n_feat_s = ds["inp_msk"][local_idx].shape  # (n_time, n_features)
+                burst_mask = create_random_burst_mask(
+                    n_features=n_feat_s,
+                    x_len=n_time_s,
+                    masked_ratio=masked_ratio,
+                )  # (n_feat_s, n_time_s)
+                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
         else:
             msk = ds["inp_msk"][local_idx].long()
 
