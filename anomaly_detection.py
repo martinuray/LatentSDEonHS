@@ -440,7 +440,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
             # aux_log_prob = aux_log_prob.mean(dim=0)
             #aux_log_prob = aux_log_prob.mean(dim=2)
-
+            aux_log_prob = aux_log_prob.mean(dim=0)
             all_scores_list.append(aux_log_prob)
 
     try:
