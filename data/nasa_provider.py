@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 from data.process_water_treatment_datasets import reshape_data
+from utils.anomaly_detection import create_random_burst_mask
 
 
 class NASAData(object):
@@ -309,9 +310,15 @@ class NASADataset(Dataset):
             })
 
             if self.mode in ('train', 'val') and self.fixed_subsample_mask:
-                self.datasets[-1]['fixed_inp_msk'] = (
-                    torch.rand(self.datasets[-1]['inp_msk'].shape) < self.subsample
-                ).to(torch.int).long()
+                masked_ratio = 1.0 - self.subsample
+                burst_mask = create_random_burst_mask(
+                    n_features=n_samples,
+                    x_len=n_time,
+                    masked_ratio=masked_ratio
+                )
+                self.datasets[-1]['fixed_inp_msk'] = torch.from_numpy(
+                    burst_mask.astype(np.int64)
+                ).long()
 
         # Build cumulative offsets for flat indexing
         cumsum = 0
