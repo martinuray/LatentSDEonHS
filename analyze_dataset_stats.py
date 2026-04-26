@@ -10,7 +10,6 @@ import ast
 import glob
 import json
 import os
-import pickle
 from typing import Dict, List
 
 import numpy as np
@@ -31,14 +30,18 @@ def _safe_load_txt(path: str) -> np.ndarray:
     return data
 
 
-def _load_pickle_array(path: str) -> np.ndarray:
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    if isinstance(data, pd.Series):
-        return data.to_numpy()
-    if isinstance(data, pd.DataFrame):
-        return data.to_numpy()
-    return np.asarray(data)
+def _safe_load_qad_txt(path: str) -> np.ndarray:
+    """Load QAD txt robustly (headers/separators/non-numeric cells)."""
+    df = pd.read_csv(path, sep=r"[,\s]+", engine="python")
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if df.empty:
+        raise ValueError(f"QAD file has no numeric content: {path}")
+    data = df.fillna(0.0).to_numpy(dtype=float)
+    if data.ndim == 1:
+        data = data[:, None]
+    return data
 
 
 def _flatten_numeric(arr: np.ndarray) -> np.ndarray:
@@ -123,16 +126,16 @@ def analyze_qad(data_dir: str, qad_subdir: str) -> Dict:
     root = os.path.join(data_dir, "QAD", "raw", qad_subdir)
     rows = []
 
-    for train_path in sorted(glob.glob(os.path.join(root, "train_*.pkl"))):
-        dsid = os.path.basename(train_path).replace("train_", "").replace(".pkl", "")
-        test_path = os.path.join(root, f"test_{dsid}.pkl")
-        label_path = os.path.join(root, f"test_label_{dsid}.pkl")
+    for train_path in sorted(glob.glob(os.path.join(root, "train_*.txt"))):
+        dsid = os.path.basename(train_path).replace("train_", "").replace(".txt", "")
+        test_path = os.path.join(root, f"test_{dsid}.txt")
+        label_path = os.path.join(root, f"test_label_{dsid}.txt")
         if not (os.path.isfile(test_path) and os.path.isfile(label_path)):
             continue
 
-        train = _load_pickle_array(train_path)
-        test = _load_pickle_array(test_path)
-        labels = _load_pickle_array(label_path)
+        train = _safe_load_qad_txt(train_path)
+        test = _safe_load_qad_txt(test_path)
+        labels = _safe_load_qad_txt(label_path)
 
         num_features = int(train.shape[1]) if train.ndim > 1 else 1
         rows.append(
@@ -374,7 +377,7 @@ def main():
     parser.add_argument("--data-dir", default="data_dir", help="Root data directory.")
     parser.add_argument(
         "--qad-subdir",
-        default="qad_clean_pkl_100Hz",
+        default="qad_clean_txt_100Hz",
         help="QAD raw subfolder name under data_dir/QAD/raw/.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit printed rows per benchmark (0 = all).")
