@@ -258,6 +258,8 @@ def train_one_dataset(
         "val": ["log_pxz", "kl0", "klp", "loss"],
         "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
     }
+    if not args.freeze_sigma:
+        stats_mask["oth"].append("sig")
 
     pm = ProgressMessage(stats_mask)
     best_stats = None
@@ -300,8 +302,11 @@ def train_one_dataset(
                 stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
                 break
 
-        stats["oth"].append({"lr": scheduler.get_last_lr()[-1],
-                             "esc": es_counter})
+        to_append = {"lr": scheduler.get_last_lr()[-1],
+                     "esc": es_counter,
+                     "sig": modules['pxz_net'].sigma.item()}
+
+        stats["oth"].append(to_append)
         scheduler.step()
 
         stats["trn"].append(trn_stats)
