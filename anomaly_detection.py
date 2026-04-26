@@ -1,9 +1,12 @@
 import argparse
 import datetime
+import json
 import logging
 import os
 import shutil
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -39,6 +42,45 @@ from utils.misc import (
 from utils.parser import generic_parser
 
 
+DATASET_CHOICES = ["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"]
+DEFAULT_CFG_DIR = Path("cfg") / "anomaly_detection"
+
+
+def _extract_bootstrap_args(argv):
+    """Parse only args needed to resolve dataset-specific defaults."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--dataset", choices=DATASET_CHOICES, default="SWaT")
+    parser.add_argument("--config-file", type=str, default=None)
+    return parser.parse_known_args(argv)[0]
+
+
+def _load_dataset_config(dataset: str, config_file: str | None = None) -> dict:
+    """Load JSON config for a dataset; return empty dict when unavailable."""
+    cfg_path = Path(config_file) if config_file else (DEFAULT_CFG_DIR / f"{dataset}.json")
+    if not cfg_path.exists():
+        logging.warning("No config found at %s. Falling back to parser defaults.", cfg_path)
+        return {}
+
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must be a JSON object: {cfg_path}")
+
+    logging.info("Loaded dataset defaults from %s", cfg_path)
+    return cfg
+
+
+def _validate_config_keys(parser: argparse.ArgumentParser, cfg: dict, dataset: str):
+    valid_keys = {action.dest for action in parser._actions if action.dest != "help"}
+    unknown = sorted(set(cfg.keys()) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown config keys for dataset '{dataset}': {unknown}. "
+            f"Expected keys from parser destinations."
+        )
+
+
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
@@ -50,7 +92,16 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--n-dec-layers", type=int, default=2)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
+    group.add_argument("--dataset", choices=DATASET_CHOICES, default="SWaT")
+    group.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to dataset config JSON file. If omitted, "
+            "uses cfg/anomaly_detection/<dataset>.json."
+        ),
+    )
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
     group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
     group.add_argument(
@@ -857,8 +908,16 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
 
 
 def main():
+    argv = sys.argv[1:]
+    bootstrap_args = _extract_bootstrap_args(argv)
+
     parser = extend_argparse(generic_parser)
-    args_ = parser.parse_args()
+    dataset_cfg = _load_dataset_config(bootstrap_args.dataset, bootstrap_args.config_file)
+    _validate_config_keys(parser, dataset_cfg, bootstrap_args.dataset)
+    parser.set_defaults(**dataset_cfg)
+
+    # Final parse: explicit CLI values override dataset config defaults.
+    args_ = parser.parse_args(argv)
     if args_.runs < 1:
         parser.error("--runs must be >= 1")
 
