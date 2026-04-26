@@ -229,13 +229,7 @@ def build_modules_and_optim(args, input_dim, desired_t):
         }
     ).to(args.device)
 
-    param_groups = [
-        {"params": recon_net.parameters(), "weight_decay": 1e-4},
-        {"params": recog_net.parameters()},
-        {"params": qzx_net.parameters()},
-    ]
-
-    optimizer = optim.Adam(param_groups, lr=args.lr)
+    optimizer = optim.Adam(modules.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
     elbo_loss = ELBO(reduction="mean")
 
