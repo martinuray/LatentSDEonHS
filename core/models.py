@@ -1396,14 +1396,14 @@ class GLnPathDistributionEncoder(nn.Module):
         loc = self._loc_map(h)
         scl = self._scl_map(h).square()
         scl = torch.minimum(scl, torch.tensor(100.0, device=scl.device))
-        p0 = torch.distributions.Normal(loc, scl.squeeze(dim=1))
+        p0 = torch.distributions.MultivariateNormal(loc, torch.diag_embed(scl.squeeze(dim=1)))
 
         def K(arg_t: Tensor) -> Tensor: return self._time_fn(h, arg_t)
         posterior = GLnPathDistribution(p0, K, self._sigma, t)
 
-        prior_p0 = torch.distributions.Normal(
+        prior_p0 = torch.distributions.MultivariateNormal(
                 torch.zeros_like(loc),
-                torch.ones_like(scl.squeeze(dim=1))
+                torch.diag_embed(torch.ones_like(scl.squeeze(dim=1)))
                 )
         if self._learnable_prior:
             def prior_K(arg_t: Tensor) -> Tensor:
@@ -1421,7 +1421,7 @@ def default_GLnPathDistributionEncoder(
     learnable_prior: bool = False,
     time_min: float = 0.0,
     time_max: float = 1.0,
-) -> SOnPathDistributionEncoder:
+) -> GLnPathDistributionEncoder:
     """Implements the default SOnPathDistributionEncoder encoder we use
     throughout all experiments, where the time function is parametrized
     via Chebyshev polynomials and the modules that map representations to
@@ -1449,7 +1449,7 @@ def default_GLnPathDistributionEncoder(
     group_dim = int(z_dim * z_dim)
 
     loc_map = nn.Linear(h_dim, z_dim)
-    scl_map = nn.Linear(h_dim, 1)
+    scl_map = nn.Linear(h_dim, z_dim)
     time_fn = Chebyshev(h_dim, n_deg, group_dim, time_min=time_min, time_max=time_max)
     return GLnPathDistributionEncoder(
         loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim
