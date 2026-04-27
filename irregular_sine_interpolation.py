@@ -25,6 +25,7 @@ from core.models import (
     PathToGaussianDecoder,
     ELBO,
     default_SOnPathDistributionEncoder,
+    default_GLnPathDistributionEncoder,
 )
 from core.training import generic_train
 from core.training import evaluate_interpolation as evaluate
@@ -82,6 +83,14 @@ def main():
         time_min=0.0,                         # cheb
         time_max=2.0 * desired_t[-1].item(),  # cheb
     )
+    # qzx_net = default_GLnPathDistributionEncoder(
+    #     h_dim=args.h_dim,
+    #     z_dim=args.z_dim,
+    #     n_deg=args.n_deg,
+    #     learnable_prior=args.learnable_prior,
+    #     time_min=0.0,                         # cheb
+    #     time_max=2.0 * desired_t[-1].item(),  # cheb
+    # )
     if args.freeze_sigma:
         logging.debug("Froze sigma when computing PathToGaussianDecoder")
         pxz_net.sigma.requires_grad = False

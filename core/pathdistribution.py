@@ -289,7 +289,7 @@ class GLnPathDistribution(PathDistribution):
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         group_dim = self.dim * self.dim
-        basis = torch.eye(group_dim, group_dim).view(group_dim, self.dim, self.dim)
+        basis = torch.eye(group_dim, group_dim, device=self.device).view(group_dim, self.dim, self.dim)
         return group_dim, basis
 
 
