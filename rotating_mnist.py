@@ -173,7 +173,7 @@ def main():
 
     optimizer = optim.AdamW(modules.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, args.restart, eta_min=0, last_epoch=-1, verbose=False
+        optimizer, args.restart, eta_min=0, last_epoch=-1
     )
 
     logging.debug(f"Number of model parameters={count_parameters(modules)}")
