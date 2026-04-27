@@ -1,9 +1,12 @@
 import argparse
 import datetime
+import json
 import logging
 import os
 import shutil
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,7 +22,7 @@ from core.models import (
     PathToGaussianDecoder,
     ELBO,
     default_SOnPathDistributionEncoder,
-    PhysioNetRecogNetwork, GenericMLP,
+    PhysioNetRecogNetwork, GenericMLP, default_GLnPathDistributionEncoder,
 )
 from core.training import generic_train
 from data.ad_provider import ADProvider
@@ -39,19 +42,66 @@ from utils.misc import (
 from utils.parser import generic_parser
 
 
+DATASET_CHOICES = ["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"]
+DEFAULT_CFG_DIR = Path("cfg") / "anomaly_detection"
+
+
+def _extract_bootstrap_args(argv):
+    """Parse only args needed to resolve dataset-specific defaults."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--dataset", choices=DATASET_CHOICES, default="SWaT")
+    parser.add_argument("--config-file", type=str, default=None)
+    return parser.parse_known_args(argv)[0]
+
+
+def _load_dataset_config(dataset: str, config_file: str | None = None) -> dict:
+    """Load JSON config for a dataset; return empty dict when unavailable."""
+    cfg_path = Path(config_file) if config_file else (DEFAULT_CFG_DIR / f"{dataset}.json")
+    if not cfg_path.exists():
+        logging.warning("No config found at %s. Falling back to parser defaults.", cfg_path)
+        return {}
+
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must be a JSON object: {cfg_path}")
+
+    logging.info("Loaded dataset defaults from %s", cfg_path)
+    return cfg
+
+
+def _validate_config_keys(parser: argparse.ArgumentParser, cfg: dict, dataset: str):
+    valid_keys = {action.dest for action in parser._actions if action.dest != "help"}
+    unknown = sorted(set(cfg.keys()) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"Unknown config keys for dataset '{dataset}': {unknown}. "
+            f"Expected keys from parser destinations."
+        )
+
+
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--subsample", type=float, default=0.1)
-    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="none")
-    group.add_argument("--dec-hidden-dim", type=int, default=64)
-    group.add_argument("--n-dec-layers", type=int, default=1)
-    group.add_argument("--early-stopping-patience", type=int, default=10)
+    group.add_argument("--subsample", type=float, default=0.4)
+    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=True)
+    group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
+    group.add_argument("--dec-hidden-dim", type=int, default=32)
+    group.add_argument("--n-dec-layers", type=int, default=2)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
-    group.add_argument("--dataset", choices=["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"], default="SWaT")
+    group.add_argument("--dataset", choices=DATASET_CHOICES, default="SWaT")
+    group.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to dataset config JSON file. If omitted, "
+            "uses cfg/anomaly_detection/<dataset>.json."
+        ),
+    )
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
     group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
     group.add_argument(
@@ -59,6 +109,12 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="If set, sample subsampling masks once at dataset load time for train/val instead of resampling every iteration.",
+    )
+    group.add_argument(
+        "--sphere-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use SOn path-distribution encoder (sphere embedding). Disable to use GLn encoder.",
     )
     return parser
 
@@ -139,13 +195,26 @@ def build_modules_and_optim(args, input_dim, desired_t):
         sigma_map=None,
         initial_sigma=args.initial_sigma)
 
-    qzx_net = default_SOnPathDistributionEncoder(
-        h_dim=args.h_dim,
-        z_dim=args.z_dim,
-        n_deg=args.n_deg,
-        learnable_prior=args.learnable_prior,
-        time_min=0.0,
-        time_max=2.0 * desired_t[-1].item())
+    if args.sphere_embedding:
+        qzx_net = default_SOnPathDistributionEncoder(
+            h_dim=args.h_dim,
+            z_dim=args.z_dim,
+            n_deg=args.n_deg,
+            learnable_prior=args.learnable_prior,
+            time_min=0.0,
+            time_max=2.0 * desired_t[-1].item(),
+        )
+        logging.debug("Using default_SOnPathDistributionEncoder (sphere embedding)")
+    else:
+        qzx_net = default_GLnPathDistributionEncoder(
+            h_dim=args.h_dim,
+            z_dim=args.z_dim,
+            n_deg=args.n_deg,
+            learnable_prior=args.learnable_prior,
+            time_min=0.0,
+            time_max=2.0 * desired_t[-1].item(),
+        )
+        logging.debug("Using default_GLnPathDistributionEncoder")
 
     if args.freeze_sigma:
         logging.debug("Froze sigma when computing PathToGaussianDecoder")
@@ -160,13 +229,7 @@ def build_modules_and_optim(args, input_dim, desired_t):
         }
     ).to(args.device)
 
-    param_groups = [
-        {"params": recon_net.parameters(), "weight_decay": 1e-4},
-        {"params": recog_net.parameters()},
-        {"params": qzx_net.parameters()},
-    ]
-
-    optimizer = optim.Adam(param_groups, lr=args.lr)
+    optimizer = optim.Adam(modules.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1)
     elbo_loss = ELBO(reduction="mean")
 
@@ -195,6 +258,8 @@ def train_one_dataset(
         "val": ["log_pxz", "kl0", "klp", "loss"],
         "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
     }
+    if not args.freeze_sigma:
+        stats_mask["oth"].append("sig")
 
     pm = ProgressMessage(stats_mask)
     best_stats = None
@@ -229,7 +294,7 @@ def train_one_dataset(
             es_counter = 0
         else:
             es_counter += 1
-            if es_counter >= args.early_stopping_patience:
+            if es_counter >= 2*args.restart: # early stopping patience shall be longer than one cosine sheduling
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
@@ -237,8 +302,11 @@ def train_one_dataset(
                 stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
                 break
 
-        stats["oth"].append({"lr": scheduler.get_last_lr()[-1],
-                             "esc": es_counter})
+        to_append = {"lr": scheduler.get_last_lr()[-1],
+                     "esc": es_counter,
+                     "sig": modules['pxz_net'].sigma.item()}
+
+        stats["oth"].append(to_append)
         scheduler.step()
 
         stats["trn"].append(trn_stats)
@@ -319,7 +387,8 @@ def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
 
     param2store = ['lr', 'kl0_weight', 'klp_weight', 'pxz_weight', 'z_dim',
                    'h_dim', 'n_deg', 'use_atanh', 'non_linear_decoder',
-                   'dataset', 'n_dec_layers', 'subsample', 'freeze-sigma', 'initial_sigma']
+                   'dataset', 'n_dec_layers', 'subsample', 'freeze-sigma', 'initial_sigma',
+                   'sphere_embedding']
 
     params_ = {key: value for key, value in params_.items() if key in param2store}
 
@@ -420,7 +489,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
     modules.eval()
     with (torch.no_grad()):
-        all_labels, all_scores = [], []
+        all_labels, all_scores_list = [], []
         for _, batch in enumerate(dl):
             parts = {key: val.to(device) for key, val in batch.items()}
 
@@ -441,10 +510,15 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
             # aux_log_prob = aux_log_prob.mean(dim=0)
             #aux_log_prob = aux_log_prob.mean(dim=2)
+            aux_log_prob = aux_log_prob.mean(dim=0)
+            all_scores_list.append(aux_log_prob)
 
-            all_scores.append(aux_log_prob)
+    try:
+        all_scores = torch.cat(all_scores_list, dim=0)
+    except RuntimeError:
+        pass
+        raise RuntimeError
 
-    all_scores = torch.cat(all_scores, dim=0).mean(dim=0)
     stats['mu'] = all_scores.mean(dim=0)
     stats['sigma'] = all_scores.std(dim=0)
     stats['max'] = all_scores.max(dim=0).values
@@ -492,11 +566,13 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             metrics=final_metrics,
         )
 
+    data_dir = getattr(args, "data_dir", "data_dir")
+
     if provider is None:
         logging.info("Instantiating data provider")
         if args.dataset in ['SWaT', 'WaDi']:
             provider = ADProvider(
-                data_dir='data_dir', dataset=args.dataset,
+                data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
                 n_samples=1000 if args.debug else None,
                 subsample=args.subsample,
@@ -505,7 +581,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset == 'SMD':
             provider = SMDProvider(
-                data_dir='data_dir',
+                data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
@@ -514,7 +590,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset == 'QAD':
             provider = QADProvider(
-                data_dir="data_dir/",
+                data_dir=data_dir,
                 dataset_number=None,
                 window_length=args.data_window_length,
                 subsample=args.subsample,
@@ -524,13 +600,13 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             )
         elif args.dataset in ['SMAP', 'MSL']:
             provider = NASAProvider(
-                data_dir="data_dir/", dataset=args.dataset,
+                data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask)
         elif args.dataset == 'PSM':
             provider = PSMProvider(
-                data_dir='data_dir',
+                data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
                 subsample=args.subsample,
@@ -542,159 +618,156 @@ def start_experiment(args, provider=None, store_final_metrics=True):
     else:
         logging.info("Using provided data provider")
 
-    has_hybrid_layout = all(
-        hasattr(provider, attr) for attr in ["num_datasets", "input_dims", "num_timepoints_list"]
-    ) and all(hasattr(provider, attr) for attr in ["_ds_trn", "_ds_tst", "_ds_val"])
+    def _run_with_provider(active_provider):
+        has_hybrid_layout = all(
+            hasattr(active_provider, attr) for attr in ["num_datasets", "input_dims", "num_timepoints_list"]
+        ) and all(hasattr(active_provider, attr) for attr in ["_ds_trn", "_ds_tst", "_ds_val"])
 
-    if has_hybrid_layout:
-        per_dataset_stats = {}
-        per_dataset_histories = {}
+        if has_hybrid_layout:
+            per_dataset_stats = {}
+            per_dataset_histories = {}
 
-        for ds_idx in range(provider.num_datasets):
-            trn_slice = DatasetSlice(provider._ds_trn, ds_idx)
-            tst_slice = DatasetSlice(provider._ds_tst, ds_idx)
-            val_slice = DatasetSlice(provider._ds_val, ds_idx)
+            for ds_idx in range(active_provider.num_datasets):
+                trn_slice = DatasetSlice(active_provider._ds_trn, ds_idx)
+                tst_slice = DatasetSlice(active_provider._ds_tst, ds_idx)
+                val_slice = DatasetSlice(active_provider._ds_val, ds_idx)
 
-            dataset_id = str(trn_slice.dataset_id)
-            logging.info(
-                f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{provider.num_datasets})"
-            )
+                dataset_id = str(trn_slice.dataset_id)
+                logging.info(
+                    f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{active_provider.num_datasets})"
+                )
 
-            dl_trn = DataLoader(
-                trn_slice,
-                batch_size=args.batch_size,
-                shuffle=True,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-                drop_last=False,
-            )
-            dl_tst = DataLoader(
-                tst_slice,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-            )
-            dl_val = DataLoader(
-                val_slice,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=None,
-                num_workers=8,
-                pin_memory=True,
-            )
+                dl_trn = DataLoader(
+                    trn_slice,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                    drop_last=False,
+                )
+                dl_tst = DataLoader(
+                    tst_slice,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                )
+                dl_val = DataLoader(
+                    val_slice,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=None,
+                    num_workers=8,
+                    pin_memory=True,
+                )
 
-            tst_stats, hist_stats = train_one_dataset(
-                args=args,
-                dl_trn=dl_trn,
-                dl_tst=dl_tst,
-                dl_val=dl_val,
-                input_dim=provider.input_dims[ds_idx],
-                num_timepoints=provider.num_timepoints_list[ds_idx],
-                writer=writer,
-                stats_prefix=dataset_id,
-                experiment_id_str=experiment_id_str,
-            )
+                tst_stats, hist_stats = train_one_dataset(
+                    args=args,
+                    dl_trn=dl_trn,
+                    dl_tst=dl_tst,
+                    dl_val=dl_val,
+                    input_dim=active_provider.input_dims[ds_idx],
+                    num_timepoints=active_provider.num_timepoints_list[ds_idx],
+                    writer=writer,
+                    stats_prefix=dataset_id,
+                    experiment_id_str=experiment_id_str,
+                )
 
-            per_dataset_stats[dataset_id] = tst_stats
-            per_dataset_histories[dataset_id] = hist_stats
+                per_dataset_stats[dataset_id] = tst_stats
+                per_dataset_histories[dataset_id] = hist_stats
 
-        if provider.num_datasets == 1:
-            only_id = next(iter(per_dataset_stats.keys()))
-            stats2pass = per_dataset_histories[only_id]["tst"]
-            best_stats2pass = per_dataset_stats[only_id]
-            finalstats2tensorboard(
-                writer_=writer,
-                params_=vars(args),
-                stats=stats2pass,
-                args=args,
-            )
+            if active_provider.num_datasets == 1:
+                only_id = next(iter(per_dataset_stats.keys()))
+                stats2pass = per_dataset_histories[only_id]["tst"]
+                best_stats2pass = per_dataset_stats[only_id]
+                finalstats2tensorboard(
+                    writer_=writer,
+                    params_=vars(args),
+                    stats=stats2pass,
+                    args=args,
+                )
+                logging.shutdown()
+                writer.close()
+                if store_final_metrics:
+                    _store_final_metrics(stats2pass[0])
+                logging.info(f"Final metrics across {active_provider.num_datasets} datasets: {best_stats2pass}")
+                return per_dataset_stats[only_id]
+
+            macro_stats = compute_macro_metrics(per_dataset_stats)
+            for key, value in macro_stats.items():
+                writer.add_scalar(key, value, 0)
+
+            combined_stats = {
+                "per_dataset": per_dataset_stats,
+                **macro_stats,
+            }
+
+            if args.enable_file_logging:
+                fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
+                save_stats(args, combined_stats, fname)
+
+            logging.info(f"Macro metrics across {active_provider.num_datasets} datasets: {macro_stats}")
+            if store_final_metrics:
+                _store_final_metrics(combined_stats)
             logging.shutdown()
             writer.close()
-            if store_final_metrics:
-                _store_final_metrics(stats2pass[0])
-            logging.info(f"Final metrics across {provider.num_datasets} datasets: {best_stats2pass}")
-            
-            if args.delete_processed_data:
-                delete_processed_data(args.dataset, data_dir='data_dir')
-                provider.cleanup()
-            
-            return per_dataset_stats[only_id]
+            return combined_stats
 
-        macro_stats = compute_macro_metrics(per_dataset_stats)
-        for key, value in macro_stats.items():
-            writer.add_scalar(key, value, 0)
+        # Fallback path for providers without hybrid layout.
+        dl_trn = active_provider.get_train_loader(
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False,
+        )
+        dl_tst = active_provider.get_test_loader(
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+        )
+        dl_val = active_provider.get_val_loader(
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=None,
+            num_workers=8,
+            pin_memory=True,
+        )
 
-        combined_stats = {
-            "per_dataset": per_dataset_stats,
-            **macro_stats,
-        }
+        tst_stats, stats = train_one_dataset(
+            args=args,
+            dl_trn=dl_trn,
+            dl_tst=dl_tst,
+            dl_val=dl_val,
+            input_dim=active_provider.input_dim,
+            num_timepoints=active_provider.num_timepoints,
+            writer=writer,
+            stats_prefix="",
+            experiment_id_str=experiment_id_str,
+        )
 
-        if args.enable_file_logging:
-            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
-            save_stats(args, combined_stats, fname)
-
-        logging.info(f"Macro metrics across {provider.num_datasets} datasets: {macro_stats}")
+        finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
         if store_final_metrics:
-            _store_final_metrics(combined_stats)
+            _store_final_metrics(tst_stats)
         logging.shutdown()
         writer.close()
-        
+        return tst_stats
+
+    try:
+        return _run_with_provider(provider)
+    finally:
         if args.delete_processed_data:
-            delete_processed_data(args.dataset, data_dir='data_dir')
-            provider.cleanup()
-        
-        return combined_stats
-
-    # Fallback path for providers without hybrid layout.
-    dl_trn = provider.get_train_loader(
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=False,
-    )
-    dl_tst = provider.get_test_loader(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-    )
-    dl_val = provider.get_val_loader(
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=None,
-        num_workers=8,
-        pin_memory=True,
-    )
-
-    tst_stats, stats = train_one_dataset(
-        args=args,
-        dl_trn=dl_trn,
-        dl_tst=dl_tst,
-        dl_val=dl_val,
-        input_dim=provider.input_dim,
-        num_timepoints=provider.num_timepoints,
-        writer=writer,
-        stats_prefix="",
-        experiment_id_str=experiment_id_str,
-    )
-
-    finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
-    if store_final_metrics:
-        _store_final_metrics(tst_stats)
-    logging.shutdown()
-    writer.close()
-    
-    if args.delete_processed_data:
-        delete_processed_data(args.dataset, data_dir='data_dir')
-        provider.cleanup()
-    
-    return tst_stats
+            delete_processed_data(args.dataset, data_dir=data_dir)
+        if provider is not None and hasattr(provider, "cleanup"):
+            try:
+                provider.cleanup()
+            except Exception as err:
+                logging.warning(f"Provider cleanup failed: {err}")
 
 
 def evaluate(
@@ -757,6 +830,9 @@ def evaluate(
                 #aux_log_prob = (aux_log_prob - normalization_stats['mu']) / \
                 #               normalization_stats['sigma']
                 aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
+
+            if aux_log_prob.dim() == 4:
+                aux_log_prob = aux_log_prob.mean(axis=0)
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
@@ -831,8 +907,16 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
 
 
 def main():
+    argv = sys.argv[1:]
+    bootstrap_args = _extract_bootstrap_args(argv)
+
     parser = extend_argparse(generic_parser)
-    args_ = parser.parse_args()
+    dataset_cfg = _load_dataset_config(bootstrap_args.dataset, bootstrap_args.config_file)
+    _validate_config_keys(parser, dataset_cfg, bootstrap_args.dataset)
+    parser.set_defaults(**dataset_cfg)
+
+    # Final parse: explicit CLI values override dataset config defaults.
+    args_ = parser.parse_args(argv)
     if args_.runs < 1:
         parser.error("--runs must be >= 1")
 
@@ -843,7 +927,7 @@ def main():
 
     run_results = []
     for run_idx in range(args_.runs):
-        delete_processed_data(args_.dataset, data_dir='data_dir')
+        delete_processed_data(args_.dataset, data_dir=args_.data_dir)
         logging.info("Starting run %d/%d", run_idx + 1, args_.runs)
         run_result = start_experiment(args_, provider=None, store_final_metrics=False)
         run_results.append(run_result)

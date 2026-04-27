@@ -1,6 +1,8 @@
 import glob
 import logging
 import os
+import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
+from utils.anomaly_detection import create_random_burst_mask
 
 
 def _load_psm_csv(path: str) -> np.ndarray:
@@ -56,6 +59,7 @@ class PSMData:
         window_overlap: float = 0.0,
         normalizer=None,
         data_normalization_strategy: str = "none",
+        processed_root: str = None,
     ):
         self.scaler = normalizer
         self.data_normalization_strategy = data_normalization_strategy
@@ -63,6 +67,7 @@ class PSMData:
         self.mode = mode
         self.window_length = window_length
         self.window_overlap = window_overlap
+        self._processed_root = processed_root
 
         if not self._check_exists():
             if not self._check_exist_raw_data():
@@ -79,6 +84,8 @@ class PSMData:
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         ov = str(self.window_overlap).replace(".", "p")
         return os.path.join(self.root_path, "PSM", "processed", f"wl{self.window_length}_ov{ov}")
 
@@ -186,6 +193,7 @@ class PSMDataset(Dataset):
         subsample: float = 1.0,
         data_normalization_strategy: str = "none",
         fixed_subsample_mask: bool = False,
+        processed_root: str = None,
     ):
         self.mode = mode
         self.subsample = subsample
@@ -201,6 +209,7 @@ class PSMDataset(Dataset):
             window_length=window_length,
             window_overlap=window_overlap,
             data_normalization_strategy=data_normalization_strategy,
+            processed_root=processed_root,
         )
 
         objs = {
@@ -209,11 +218,13 @@ class PSMDataset(Dataset):
                 data_dir, mode="test",
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler,
+                processed_root=processed_root,
             ),
             "val": PSMData(
                 data_dir, mode="val",
                 window_length=window_length, window_overlap=window_overlap,
                 normalizer=train_data.scaler,
+                processed_root=processed_root,
             ),
         }
 
@@ -265,10 +276,21 @@ class PSMDataset(Dataset):
             "dataset_id": "PSM",
         })
 
-        if self.mode in ("train", "val") and self.fixed_subsample_mask:
-            self.datasets[0]["fixed_inp_msk"] = (
-                torch.rand(self.datasets[0]["inp_msk"].shape) < self.subsample
-            ).to(torch.int).long()
+        if self.fixed_subsample_mask:
+            if self.mode == "train":
+                masked_ratio = 1.0 - self.subsample
+                n_features_data = obs.shape[-1]
+                burst_mask = create_random_burst_mask(
+                    n_features=n_samples * n_features_data,
+                    x_len=n_time,
+                    masked_ratio=masked_ratio,
+                )  # (n_samples * n_features_data, n_time)
+                burst_arr = burst_mask.reshape(n_samples, n_features_data, n_time).transpose(0, 2, 1)
+                self.datasets[0]["fixed_inp_msk"] = torch.from_numpy(
+                    burst_arr.astype(np.int64)
+                ).long()
+            else:  # val
+                self.datasets[0]["fixed_inp_msk"] = torch.ones_like(msk).long()
 
         self._cumulative.append(0)
 
@@ -318,7 +340,14 @@ class PSMDataset(Dataset):
             if self.fixed_subsample_mask:
                 msk = ds["fixed_inp_msk"][local_idx].long()
             else:
-                msk = (torch.rand(ds["inp_msk"][local_idx].shape) < self.subsample).to(torch.int).long()
+                masked_ratio = 1.0 - self.subsample
+                n_time_s, n_feat_s = ds["inp_msk"][local_idx].shape  # (n_time, n_features)
+                burst_mask = create_random_burst_mask(
+                    n_features=n_feat_s,
+                    x_len=n_time_s,
+                    masked_ratio=masked_ratio,
+                )  # (n_feat_s, n_time_s)
+                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
         else:
             msk = ds["inp_msk"][local_idx].long()
 
@@ -348,11 +377,13 @@ class PSMProvider(DatasetProvider):
         fixed_subsample_mask: bool = False,
     ):
         super().__init__()
+        self._processed_root = tempfile.mkdtemp(prefix="LatentSDEonHS_PSM_processed_")
 
         common_kwargs = {
             "window_length": window_length,
             "window_overlap": window_overlap,
             "data_normalization_strategy": data_normalization_strategy,
+            "processed_root": self._processed_root,
         }
 
         self._ds_trn = PSMDataset(
@@ -411,4 +442,7 @@ class PSMProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 

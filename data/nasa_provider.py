@@ -9,6 +9,8 @@ import ast
 import glob
 import logging
 import os
+import shutil
+import tempfile
 from typing import DefaultDict
 
 import numpy as np
@@ -22,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from data.common import get_data_min_max, variable_time_collate_fn, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 from data.process_water_treatment_datasets import reshape_data
+from utils.anomaly_detection import create_random_burst_mask
 
 
 class NASAData(object):
@@ -33,7 +36,8 @@ class NASAData(object):
     def __init__(
             self, root, data_kind="MSL", mode='train', dataset_id="A-1",
             window_length:int = 100, window_overlap: float = 0.0,
-            normalizer=None, data_normalization_strategy:str="none"
+            normalizer=None, data_normalization_strategy:str="none",
+            processed_root: str = None,
     ):
 
         self.scaler = normalizer
@@ -44,6 +48,7 @@ class NASAData(object):
         self.window_length = window_length
 
         self.overlapping_windows = window_overlap
+        self._processed_root = processed_root
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -89,6 +94,8 @@ class NASAData(object):
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         return os.path.join(self.root, 'nasa', 'processed', self.data_kind)
 
     @property
@@ -208,7 +215,8 @@ class NASADataset(Dataset):
                  dataset: str = None, window_length: int = 100,
                  window_overlap: float = 0.0, subsample: float = 1.0,
                  data_normalization_strategy: str = "none",
-                 fixed_subsample_mask: bool = False):
+                 fixed_subsample_mask: bool = False,
+                 processed_root: str = None):
 
         self.mode = mode
         self.subsample = subsample
@@ -228,17 +236,18 @@ class NASADataset(Dataset):
             train_data = NASAData(
                 data_dir, mode='train', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                data_normalization_strategy=data_normalization_strategy)
+                data_normalization_strategy=data_normalization_strategy,
+                processed_root=processed_root)
 
             objs['train'].append(train_data)
             objs['test'].append(NASAData(
                 data_dir, mode='test', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler))
+                normalizer=train_data.scaler, processed_root=processed_root))
             objs['val'].append(NASAData(
                 data_dir, mode='val', dataset_id=dataset_id, data_kind=dataset,
                 window_length=window_length, window_overlap=window_overlap,
-                normalizer=train_data.scaler))
+                normalizer=train_data.scaler, processed_root=processed_root))
 
         # ------------------------------------------------------------------
         # Process each dataset_id *separately* — keep as list entries
@@ -300,10 +309,21 @@ class NASADataset(Dataset):
                 'dataset_id':     dataset_id,
             })
 
-            if self.mode in ('train', 'val') and self.fixed_subsample_mask:
-                self.datasets[-1]['fixed_inp_msk'] = (
-                    torch.rand(self.datasets[-1]['inp_msk'].shape) < self.subsample
-                ).to(torch.int).long()
+            if self.fixed_subsample_mask:
+                if self.mode == 'train':
+                    masked_ratio = 1.0 - self.subsample
+                    n_features_data = obs.shape[-1]
+                    burst_mask = create_random_burst_mask(
+                        n_features=n_samples * n_features_data,
+                        x_len=n_time,
+                        masked_ratio=masked_ratio,
+                    )  # (n_samples * n_features_data, n_time)
+                    burst_arr = burst_mask.reshape(n_samples, n_features_data, n_time).transpose(0, 2, 1)
+                    self.datasets[-1]['fixed_inp_msk'] = torch.from_numpy(
+                        burst_arr.astype(np.int64)
+                    ).long()
+                else:  # val
+                    self.datasets[-1]['fixed_inp_msk'] = torch.ones_like(msk).long()
 
         # Build cumulative offsets for flat indexing
         cumsum = 0
@@ -362,8 +382,14 @@ class NASADataset(Dataset):
             if self.fixed_subsample_mask:
                 msk = ds['fixed_inp_msk'][local_idx].long()
             else:
-                msk = (torch.rand(ds['inp_msk'][local_idx].shape)
-                       < self.subsample).to(torch.int).long()
+                masked_ratio = 1.0 - self.subsample
+                n_time_s, n_feat_s = ds['inp_msk'][local_idx].shape  # (n_time, n_features)
+                burst_mask = create_random_burst_mask(
+                    n_features=n_feat_s,
+                    x_len=n_time_s,
+                    masked_ratio=masked_ratio,
+                )  # (n_feat_s, n_time_s)
+                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
         else:
             msk = ds['inp_msk'][local_idx].long()
 
@@ -416,12 +442,14 @@ class NASAProvider(DatasetProvider):
             raise NotImplementedError
 
         self._dataset = dataset
+        self._processed_root = tempfile.mkdtemp(prefix=f"LatentSDEonHS_{dataset}_processed_")
 
         common_kwargs = {
             'dataset': dataset,
             'window_length': window_length,
             'window_overlap': window_overlap,
-            'data_normalization_strategy': data_normalization_strategy
+            'data_normalization_strategy': data_normalization_strategy,
+            'processed_root': self._processed_root,
         }
 
         self._ds_trn = NASADataset(
@@ -465,6 +493,9 @@ class NASAProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 
 
 def create_win_periods(data_, win_size_, win_stride_):

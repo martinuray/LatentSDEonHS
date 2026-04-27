@@ -2,6 +2,8 @@ import logging
 import os
 import glob
 import re
+import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
 from data.process_water_treatment_datasets import reshape_data
+from utils.anomaly_detection import create_random_burst_mask
 
 
 class QADData:
@@ -26,7 +29,8 @@ class QADData:
             window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
             data_normalization_strategy: str = "none",
-            raw_subdir: str = "qad_clean_txt_100Hz"
+            raw_subdir: str = "qad_clean_txt_100Hz",
+            processed_root: str = None,
     ):
 
         self.scaler = normalizer
@@ -36,6 +40,7 @@ class QADData:
         self.mode = mode
         self.window_length = window_length
         self.raw_subdir = raw_subdir
+        self._processed_root = processed_root
 
         self.overlapping_windows = window_overlap
 
@@ -91,6 +96,8 @@ class QADData:
 
     @property
     def processed_folder(self):
+        if self._processed_root is not None:
+            return self._processed_root
         # Keep processed namespace aligned with the actual raw folder name.
         return os.path.join(self.root_path, "QAD", "processed", self._resolve_raw_subdir())
 
@@ -203,7 +210,7 @@ class QADDataset(Dataset):
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0,
                  data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz",
-                 fixed_subsample_mask: bool = False):
+                 fixed_subsample_mask: bool = False, processed_root: str = None):
 
         self.mode = mode
         self.subsample = subsample
@@ -220,18 +227,20 @@ class QADDataset(Dataset):
                 data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy,
-                raw_subdir=raw_subdir)
+                raw_subdir=raw_subdir, processed_root=processed_root)
 
             objs = {
                 'train': train_data,
                 'test': QADData(
                     data_dir, mode='test', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir),
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    processed_root=processed_root),
                 'val': QADData(
                     data_dir, mode='val', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir)
+                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    processed_root=processed_root)
             }
 
             data = objs[mode]
@@ -281,10 +290,21 @@ class QADDataset(Dataset):
                 'dataset_id': dataset_id,
             })
 
-            if self.mode in ('train', 'val') and self.fixed_subsample_mask:
-                self.datasets[-1]['fixed_inp_msk'] = (
-                    torch.rand(self.datasets[-1]['inp_msk'].shape) < self.subsample
-                ).long()
+            if self.fixed_subsample_mask:
+                if self.mode == 'train':
+                    masked_ratio = 1.0 - self.subsample
+                    n_features_data = obs.shape[-1]
+                    burst_mask = create_random_burst_mask(
+                        n_features=n_samples * n_features_data,
+                        x_len=n_time,
+                        masked_ratio=masked_ratio,
+                    )  # (n_samples * n_features_data, n_time)
+                    burst_arr = burst_mask.reshape(n_samples, n_features_data, n_time).transpose(0, 2, 1)
+                    self.datasets[-1]['fixed_inp_msk'] = torch.from_numpy(
+                        burst_arr.astype(np.int64)
+                    ).long()
+                else:  # val
+                    self.datasets[-1]['fixed_inp_msk'] = torch.ones_like(msk).long()
 
         csum = 0
         for length in self._lengths:
@@ -375,7 +395,14 @@ class QADDataset(Dataset):
             if self.fixed_subsample_mask:
                 msk = ds['fixed_inp_msk'][local_idx].long()
             else:
-                msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).long()
+                masked_ratio = 1.0 - self.subsample
+                n_time_s, n_feat_s = ds['inp_msk'][local_idx].shape  # (n_time, n_features)
+                burst_mask = create_random_burst_mask(
+                    n_features=n_feat_s,
+                    x_len=n_time_s,
+                    masked_ratio=masked_ratio,
+                )  # (n_feat_s, n_time_s)
+                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
         else:
             msk = ds['inp_msk'][local_idx].long()
 
@@ -414,6 +441,7 @@ class QADProvider(DatasetProvider):
         super().__init__()
 
         self._dataset = dataset_number
+        self._processed_root = tempfile.mkdtemp(prefix="LatentSDEonHS_QAD_processed_")
 
         common_kwargs = {
             'dataset_number': dataset_number,
@@ -421,6 +449,7 @@ class QADProvider(DatasetProvider):
             'window_overlap': window_overlap,
             'data_normalization_strategy': data_normalization_strategy,
             'raw_subdir': raw_subdir,
+            'processed_root': self._processed_root,
         }
 
         self._ds_trn = QADDataset(
@@ -479,6 +508,9 @@ class QADProvider(DatasetProvider):
 
     def get_val_loader(self, **kwargs):
         return DataLoader(self._ds_val, **kwargs)
+
+    def cleanup(self):
+        shutil.rmtree(self._processed_root, ignore_errors=True)
 
 
 def load_qad_txt(dataset_path, is_label: bool = False):

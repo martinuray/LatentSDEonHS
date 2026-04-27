@@ -21,10 +21,21 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
+from utils.anomaly_detection import create_random_burst_mask
 
     
 
 class ADData(object):
+
+    WADI_TEST_FILE_CANDIDATES = [
+        'WADI_attackdata_labelled.csv',
+        'attackdata_labbelled.csv',
+    ]
+    WADI_LABEL_COLUMN_CANDIDATES = [
+        'Arrack LABLE',
+        'Attack LABLE',
+        'Attack LABLE (1:No Attack, -1:Attack)',
+    ]
 
     params = None
     labels = None
@@ -76,6 +87,23 @@ class ADData(object):
         if self.data_kind == "SMD": # TODO: maybe a bit more love
             return os.path.isdir(os.path.join(self.raw_folder, self.mode))
 
+        if self.data_kind == "WaDi":
+            train_candidates = [
+                os.path.join(self.raw_folder, 'train.csv'),
+                os.path.join(self.raw_folder, 'WADI_14days.csv'),
+            ]
+            test_candidates = [
+                os.path.join(self.raw_folder, 'test.csv'),
+                *[os.path.join(self.raw_folder, fname) for fname in self.WADI_TEST_FILE_CANDIDATES],
+            ]
+            label_candidates = [
+                os.path.join(self.raw_folder, 'labels.csv'),
+                *[os.path.join(self.raw_folder, fname) for fname in self.WADI_TEST_FILE_CANDIDATES],
+            ]
+            return any(os.path.isfile(f) for f in train_candidates) and \
+                   any(os.path.isfile(f) for f in test_candidates) and \
+                   any(os.path.isfile(f) for f in label_candidates)
+
         # Check for CSV files (original raw data)
         csv_exists = os.path.isfile(os.path.join(self.raw_folder, 'train.csv')) and \
                      os.path.isfile(os.path.join(self.raw_folder, 'test.csv')) and \
@@ -97,6 +125,10 @@ class ADData(object):
 
     @property
     def raw_folder(self):
+        if self.data_kind == 'WaDi':
+            requested = os.path.join(self.root, self.data_kind, 'raw', 'v2')
+            if os.path.isdir(requested):
+                return requested
         return os.path.join(self.root, self.data_kind, 'raw')
 
     @property
@@ -154,10 +186,13 @@ class ADData(object):
         logging.warning("Processing Water Treatment Data")
 
         # Check if CSV files are available and preprocess them
-        csv_path = os.path.join(self.raw_folder, 'train.csv')
+        csv_candidates = [os.path.join(self.raw_folder, 'train.csv')]
+        if self.data_kind == 'WaDi':
+            csv_candidates.append(os.path.join(self.raw_folder, 'WADI_14days.csv'))
+        csv_path = next((path for path in csv_candidates if os.path.isfile(path)), None)
         test_labels = None
 
-        if os.path.isfile(csv_path):
+        if csv_path is not None:
             # Load and preprocess from CSV files
             train_df, test_df, test_labels = self._load_and_preprocess_water_treatment_csv()
 
@@ -219,10 +254,7 @@ class ADData(object):
 
         # Load CSV files
         if "WaDi" in self.data_kind:
-            train_df = pd.read_csv(os.path.join(self.raw_folder, 'train.csv'))
-            test_df = pd.read_csv(os.path.join(self.raw_folder, 'test.csv'))
-            test_labels = pd.read_csv(os.path.join(self.raw_folder, 'labels.csv'))
-            test_labels = test_labels.iloc[:, 0]  # Get first column
+            train_df, test_df, test_labels = self._load_and_preprocess_wadi_csv()
         else:
             train_df = pd.read_csv(os.path.join(self.raw_folder, 'train.csv'))
             test_df = pd.read_csv(os.path.join(self.raw_folder, 'test.csv'))
@@ -238,12 +270,6 @@ class ADData(object):
         # Trim column names
         train_df = train_df.rename(columns=lambda x: x.strip())
         test_df = test_df.rename(columns=lambda x: x.strip())
-
-        # Handle WaDi column name prefixes
-        if self.data_kind == "WaDi":
-            cols = [x[46:] for x in train_df.columns]  # Remove column name prefixes
-            train_df.columns = cols
-            test_df.columns = cols
 
         # Remove columns where there is only one unique value
         #train_col_set = set(train_df.columns[train_df.nunique() == 1].tolist())
@@ -266,6 +292,55 @@ class ADData(object):
         train_df_normalized = train_df_normalized.iloc[2160:]
 
         return train_df_normalized, test_df_normalized, test_labels
+
+    def _load_and_preprocess_wadi_csv(self):
+        train_path = next(
+            path for path in [
+                os.path.join(self.raw_folder, 'WADI_14days.csv'),
+                os.path.join(self.raw_folder, 'train.csv'),
+            ] if os.path.isfile(path)
+        )
+
+        test_path = next(
+            path for path in [
+                *[os.path.join(self.raw_folder, fname) for fname in self.WADI_TEST_FILE_CANDIDATES],
+                os.path.join(self.raw_folder, 'test.csv'),
+            ] if os.path.isfile(path)
+        )
+
+        train_df = pd.read_csv(train_path, header=0)
+        test_df = pd.read_csv(test_path, header=1)
+
+        train_df.columns = [str(col).strip() for col in train_df.columns]
+        test_df.columns = [str(col).strip() for col in test_df.columns]
+
+        label_col = None
+        label_candidates = {c.strip().upper() for c in self.WADI_LABEL_COLUMN_CANDIDATES}
+        for col in test_df.columns:
+            col_norm = str(col).strip().upper()
+            if col_norm in label_candidates or ("LABLE" in col_norm and "ATTACK" in col_norm):
+                label_col = col
+                break
+
+        if label_col is None:
+            raise ValueError(f"Could not find WaDi label column in {test_path}")
+
+        raw_labels = pd.to_numeric(test_df[label_col], errors='coerce')
+        test_labels = (raw_labels != 1).astype(float)
+
+        metadata_cols = {"ROW", "ROW ", "DATE", "DATE ", "TIME", "TIME "}
+        train_drop_cols = [c for c in train_df.columns if str(c).strip().upper() in metadata_cols]
+        test_drop_cols = [c for c in test_df.columns if str(c).strip().upper() in metadata_cols]
+        train_df = train_df.drop(columns=train_drop_cols, errors='ignore')
+        test_df = test_df.drop(columns=test_drop_cols + [label_col], errors='ignore')
+
+        common_cols = [c for c in train_df.columns if c in test_df.columns]
+        if len(common_cols) == 0:
+            raise ValueError("No common WaDi feature columns between train and test")
+
+        train_df = train_df[common_cols].apply(pd.to_numeric, errors='coerce')
+        test_df = test_df[common_cols].apply(pd.to_numeric, errors='coerce')
+        return train_df, test_df, test_labels
 
     def _reshape_data_to_windows(self, data, window_length, remove_zero_column=False):
         """Reshape data into windows."""
@@ -393,10 +468,20 @@ class ADDataset(Dataset):
             'dataset_id': data_kind,
         }]
 
-        if self.mode in ('train', 'val') and self.fixed_subsample_mask:
-            self.datasets[0]['fixed_inp_msk'] = (
-                torch.rand(self.datasets[0]['inp_msk'].shape) < self.subsample
-            ).to(torch.int).long()
+        if self.fixed_subsample_mask:
+            if self.mode == 'train':
+                masked_ratio = 1.0 - self.subsample
+                burst_mask = create_random_burst_mask(
+                    n_features=n_samples * input_dim,
+                    x_len=n_time,
+                    masked_ratio=masked_ratio,
+                )  # (n_samples * input_dim, n_time)
+                burst_arr = burst_mask.reshape(n_samples, input_dim, n_time).transpose(0, 2, 1)
+                self.datasets[0]['fixed_inp_msk'] = torch.from_numpy(
+                    burst_arr.astype(np.int64)
+                ).long()
+            else:  # val
+                self.datasets[0]['fixed_inp_msk'] = torch.ones_like(msk).long()
 
         self._lengths = [n_samples]
         self._cumulative = [0]
@@ -454,7 +539,14 @@ class ADDataset(Dataset):
             if self.fixed_subsample_mask:
                 msk = ds['fixed_inp_msk'][local_idx].long()
             else:
-                msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
+                masked_ratio = 1.0 - self.subsample
+                n_time_s, n_feat_s = ds['inp_msk'][local_idx].shape  # (n_time, n_features)
+                burst_mask = create_random_burst_mask(
+                    n_features=n_feat_s,
+                    x_len=n_time_s,
+                    masked_ratio=masked_ratio,
+                )  # (n_feat_s, n_time_s)
+                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
         else:
             msk = ds['inp_msk'][local_idx].long()
 
