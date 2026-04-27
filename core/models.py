@@ -27,7 +27,7 @@ from torch.distributions import (
 )
 
 from core.power_spherical.distributions import PowerSpherical, HypersphericalUniform
-from core.pathdistribution import SOnPathDistribution, BrownianMotionOnSphere, PathDistribution
+from core.pathdistribution import SOnPathDistribution, BrownianMotionOnSphere, PathDistribution, GLnPathDistribution
 from core.sde_solvers import geometric_euler
 from utils.misc import scatter_obs_and_msk
 
@@ -232,8 +232,8 @@ class EncMtanRnn(nn.Module):
         Returns:
             (Tensor): _description_
         """
-        time_steps = time_steps
-        mask = x[:, :, self.dim :]
+        # time_steps = time_steps.cpu()
+        mask = x[:, :, self.input_dim :]
         mask = torch.cat((mask, mask), 2)
         if self.learn_emb:
             key = self.learn_time_embedding(time_steps)
@@ -388,6 +388,11 @@ class Chebyshev(nn.Module):
         polynomial = F.linear(coefficients, monomials)
         polynomial = polynomial.permute(0, 2, 1)
         return polynomial
+
+class zeroChebyshev(Chebyshev):
+    def forward(self, out_encoder: Tensor, time_steps: Tensor) -> Tensor:
+        sup_out = super().forward(out_encoder, time_steps)
+        return torch.zeros_like(sup_out) 
 
 
 class RotatingMNISTRecogNetwork(nn.Module):
@@ -1184,6 +1189,47 @@ class ActivityRecogNetwork(nn.Module):
             h = h - h.sign() * eps
             h = h.atanh()
         return h
+    
+def default_GLnPathDistributionEncoder(
+    h_dim: int,
+    z_dim: int,
+    n_deg: int,
+    learnable_prior: bool = False,
+    time_min: float = 0.0,
+    time_max: float = 1.0,
+) -> SOnPathDistributionEncoder:
+    """Implements the default SOnPathDistributionEncoder encoder we use 
+    throughout all experiments, where the time function is parametrized 
+    via Chebyshev polynomials and the modules that map representations to 
+    the location and concentration parameter of the power spherical 
+    distribution are affine maps (i.e., nn.Linear).
+
+    Args:
+        h_dim (int): Dimension of the representations from which the 
+            PathDistribution objects are produced.
+        z_dim (int): Desired dimensionality of the latent space.
+        n_deg (int): Max. degree of Chebyshev polynomials used to 
+            parametrize the time function.
+        learnable_prior (bool, optional): If set to True, a learnable 
+            prior path distribution is used. Defaults to False.
+        time_min (float, optional): Left side of the interval 
+            [time_min, time_max] on which the Chebyshev polynomials are 
+            defined. Defaults to 0.0.
+        time_max (float, optional): Right side of the interval 
+            [time_min, time_max] on which the Chebyshev polynomials are 
+            defined. Defaults to 1.0.
+
+    Returns:
+        SOnPathDistributionEncoder: Parametrized SOnPathDistributionEncoder
+    """
+    group_dim = int(z_dim * z_dim)
+
+    loc_map = nn.Linear(h_dim, z_dim)
+    scl_map = nn.Linear(h_dim, 1)
+    time_fn = Chebyshev(h_dim, n_deg, group_dim, time_min=time_min, time_max=time_max)
+    return GLnPathDistributionEncoder(
+        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim
+    )
     
 PhysioNetRecogNetwork = ActivityRecogNetwork
 

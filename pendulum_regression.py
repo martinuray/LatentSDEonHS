@@ -182,7 +182,7 @@ def main():
     modules = modules.to(args.device)
 
     optimizer = optim.Adam(modules.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1, verbose=False
+    scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0, last_epoch=-1
     )
 
     logging.debug(f"Number of model parameters={count_parameters(modules)}")
