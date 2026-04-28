@@ -280,15 +280,15 @@ class PSMDataset(Dataset):
             if self.mode == "train":
                 masked_ratio = 1.0 - self.subsample
                 n_features_data = obs.shape[-1]
+                indcs_long = indcs.long()
+                full_len = int(indcs_long.max().item()) + 1
                 burst_mask = create_random_burst_mask(
-                    n_features=n_samples * n_features_data,
-                    x_len=n_time,
+                    n_features=n_features_data,
+                    x_len=full_len,
                     masked_ratio=masked_ratio,
-                )  # (n_samples * n_features_data, n_time)
-                burst_arr = burst_mask.reshape(n_samples, n_features_data, n_time).transpose(0, 2, 1)
-                self.datasets[0]["fixed_inp_msk"] = torch.from_numpy(
-                    burst_arr.astype(np.int64)
-                ).long()
+                )  # (n_features, full_len)
+                full_mask = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (full_len, n_features)
+                self.datasets[0]["fixed_inp_msk"] = full_mask[indcs_long]  # (n_samples, n_time, n_features)
             else:  # val
                 self.datasets[0]["fixed_inp_msk"] = torch.ones_like(msk).long()
 
