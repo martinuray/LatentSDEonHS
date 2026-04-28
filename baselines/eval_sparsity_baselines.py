@@ -147,6 +147,7 @@ def apply_burst_sparsity(
         burst_mask = create_random_burst_mask(
             n_features=n_features,
             x_len=n_time,
+            seed=seed,
             masked_ratio=masked_ratio,
         )  # (n_features, n_time), True = keep
         keep_mask = burst_mask
@@ -248,7 +249,7 @@ def run_single(args, subsamples: list[float]):
         for dataset_spec in dataset_specs:
             dataset_id = dataset_spec["dataset_id"]
             try:
-                x_train_full, x_test, y_test = load_dataset(
+                x_train_full, x_test_full, y_test = load_dataset(
                     dataset_spec,
                     max_train_samples=args.max_train_samples,
                     max_test_samples=args.max_test_samples,
@@ -256,8 +257,14 @@ def run_single(args, subsamples: list[float]):
 
                 # Apply burst-mask sparsity to training data only.
                 mask_seed = run_seed * 1000 + int(subsample * 1000)
-                x_train_sparse, keep_mask = apply_burst_sparsity(
+                x_train_sparse, keep_mask_train = apply_burst_sparsity(
                     x_train_full,
+                    subsample=subsample,
+                    seed=mask_seed,
+                )
+
+                x_test_sparse, keep_mask_test = apply_burst_sparsity(
+                    x_test_full,
                     subsample=subsample,
                     seed=mask_seed,
                 )
@@ -267,7 +274,7 @@ def run_single(args, subsamples: list[float]):
                     clf_name=clf_name,
                     clf=clf,
                     x_train=x_train_sparse,
-                    x_test=x_test,
+                    x_test=x_test_sparse,
                     y_test=y_test,
                     benchmark_name=benchmark_name,
                     dataset_id=dataset_id,
@@ -279,8 +286,11 @@ def run_single(args, subsamples: list[float]):
                     "seed_idx": seed_idx,
                     "run_seed": run_seed,
                     "n_train_full": x_train_full.shape[0],
-                    "n_train_sparse": int(keep_mask.sum()),
-                    "n_train_interpolated": int((~keep_mask).sum()),
+                    "n_train_sparse": int(keep_mask_train.sum()),
+                    "n_train_interpolated": int((~keep_mask_train).sum()),
+                    "n_test_full": x_test_full.shape[0],
+                    "n_test_sparse": int(keep_mask_test.sum()),
+                    "n_test_interpolated": int((~keep_mask_test).sum()),
                 })
             except Exception:
                 LOGGER.exception(
