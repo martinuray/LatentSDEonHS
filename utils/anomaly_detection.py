@@ -149,3 +149,28 @@ def create_random_burst_mask(n_features, x_len, masked_ratio=0.3):
         )
 
     return mask
+
+
+def create_random_burst_mask_geometric(n_features, x_len, masked_ratio=0.3, s=0.1, max_false_length = 90):
+
+    p = 1 - masked_ratio
+    out_mask = np.empty((n_features, x_len), dtype=bool)
+
+    true_lengths = np.random.geometric(s*p, size=(n_features,x_len))
+    false_lengths = np.random.geometric(s*(1 - p), size=(n_features,x_len))
+    false_lengths = np.minimum(false_lengths, max_false_length)
+    
+    state_changes = np.empty((n_features, 2 * x_len), dtype=int)
+    state_changes[:,0::2] = true_lengths
+    state_changes[:,1::2] = false_lengths
+
+    for i in range(n_features):
+        values = np.arange(len(state_changes[i])) % 2 == 0
+        mask = np.repeat(values, state_changes[i])  
+        start = np.random.randint(0, len(mask))
+        idx = (start + np.arange(x_len)) % len(mask)
+        out_mask[i] = mask[idx]
+    out_mask[:,0] = True
+    out_mask[:,1] = True
+
+    return out_mask
