@@ -233,7 +233,7 @@ def _load_existing_result_rows(path: str) -> list[dict]:
 # Single run
 # ---------------------------------------------------------------------------
 
-def run_single(args, subsamples: list[float]):
+def run_single(args, subsamples: list[float], device: str | None = None):
     """Run one ``(seed, subsample)`` pair and persist results as JSON."""
     out_dir = args.results_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -259,7 +259,8 @@ def run_single(args, subsamples: list[float]):
         subsample,
     )
 
-    device = configure_gpu(args.gpu_id)
+    if device is None:
+        device = configure_gpu(args.gpu_id)
     classifier_factories = build_classifier_factories(device=device, random_state=run_seed)
     selected_classifiers = _select_keys(classifier_factories, args.classifiers)
 
@@ -352,11 +353,16 @@ def run_all(args, subsamples: list[float]):
     total_tasks = _total_tasks(args.num_seeds, subsamples)
     LOGGER.info("Running full sweep across %d task(s)", total_tasks)
 
+    # Configure GPU once for the entire sweep so CUDA_VISIBLE_DEVICES is set
+    # consistently across all tasks rather than being reset each iteration.
+    device = configure_gpu(args.gpu_id)
+    LOGGER.info("Using device: %s (gpu_id=%s)", device, args.gpu_id)
+
     for task_id in range(total_tasks):
         task_args = argparse.Namespace(**vars(args))
         task_args.task_id = task_id
         task_args.subsample_value = None
-        all_rows.extend(run_single(task_args, subsamples))
+        all_rows.extend(run_single(task_args, subsamples, device=device))
 
     LOGGER.info("Completed full sweep across %d task(s)", total_tasks)
     return all_rows
