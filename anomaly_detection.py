@@ -575,6 +575,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length, window_overlap=args.data_window_overlap,
                 n_samples=1000 if args.debug else None,
+                seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy
@@ -584,6 +585,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
+                seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
@@ -593,6 +595,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_dir=data_dir,
                 dataset_number=None,
                 window_length=args.data_window_length,
+                seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
@@ -602,6 +605,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             provider = NASAProvider(
                 data_dir=data_dir, dataset=args.dataset,
                 window_length=args.data_window_length,
+                seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask)
         elif args.dataset == 'PSM':
@@ -609,6 +613,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_dir=data_dir,
                 window_length=args.data_window_length,
                 window_overlap=args.data_window_overlap,
+                seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,

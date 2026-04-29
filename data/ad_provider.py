@@ -392,14 +392,14 @@ class ADDataset(Dataset):
     input_dim = None  # nr. of different measurements per time point
 
     def __init__(self, data_dir: str, processed_root: str, mode: str='train', data_kind: str=None,
-                 window_length: int=100, window_overlap:float = 0.75, subsample=1.0,
+                 window_length: int=100, window_overlap:float = 0.75, subsample=1.0, seed=-1,
                  n_samples: int=None, data_normalization_strategy:str="none",
                  fixed_subsample_mask: bool = False):
 
         self.mode = mode
         self.subsample=subsample
         self.fixed_subsample_mask = fixed_subsample_mask
-        self.processed_root = processed_root
+        self.seed = seed
 
         objs = dict()
         objs['train'] = ADData(
@@ -469,21 +469,19 @@ class ADDataset(Dataset):
         }]
 
         if self.fixed_subsample_mask:
-            if self.mode == 'train':
-                masked_ratio = 1.0 - self.subsample
-                # Build one fixed mask on the full (pre-window) timeline per feature,
-                # then gather by window indices to match dataset window layout.
-                indcs_long = indcs.long()
-                full_len = int(indcs_long.max().item()) + 1
-                burst_mask = create_random_burst_mask(
-                    n_features=input_dim,
-                    x_len=full_len,
-                    masked_ratio=masked_ratio,
-                )  # (n_features, full_len)
-                full_mask = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (full_len, n_features)
-                self.datasets[0]['fixed_inp_msk'] = full_mask[indcs_long]  # (n_samples, n_time, n_features)
-            else:  # val
-                self.datasets[0]['fixed_inp_msk'] = torch.ones_like(msk).long()
+            masked_ratio = 1.0 - self.subsample
+            # Build one fixed mask on the full (pre-window) timeline per feature,
+            # then gather by window indices to match dataset window layout.
+            indcs_long = indcs.long()
+            full_len = int(indcs_long.max().item()) + 1
+            burst_mask = create_random_burst_mask(
+                n_features=input_dim,
+                x_len=full_len,
+                masked_ratio=masked_ratio,
+                seed=self.seed,
+            )  # (n_features, full_len)
+            full_mask = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (full_len, n_features)
+            self.datasets[0]['fixed_inp_msk'] = full_mask[indcs_long]  # (n_samples, n_time, n_features)
 
         self._lengths = [n_samples]
         self._cumulative = [0]
@@ -537,20 +535,10 @@ class ADDataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode in ('train', 'val'):
-            if self.fixed_subsample_mask:
-                msk = ds['fixed_inp_msk'][local_idx].long()
-            else:
-                masked_ratio = 1.0 - self.subsample
-                n_time_s, n_feat_s = ds['inp_msk'][local_idx].shape  # (n_time, n_features)
-                burst_mask = create_random_burst_mask(
-                    n_features=n_feat_s,
-                    x_len=n_time_s,
-                    masked_ratio=masked_ratio,
-                )  # (n_feat_s, n_time_s)
-                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
+        if self.fixed_subsample_mask:
+            msk = ds['fixed_inp_msk'][local_idx].long()
         else:
-            msk = ds['inp_msk'][local_idx].long()
+            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
 
         inp_and_evd = {
             'inp_obs' : ds['inp_obs'][local_idx].float(),
@@ -582,7 +570,7 @@ class ADDataset(Dataset):
 class ADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset=None, window_length:int = 100,
                  window_overlap:float = 0.75, sample_tp=0.5, n_samples:int=None,
-                 data_normalization_strategy:str="none", subsample=1.0,
+                 data_normalization_strategy:str="none", subsample=1.0, seed=-1,
                  fixed_subsample_mask: bool = False):
         DatasetProvider.__init__(self)
 
@@ -597,19 +585,20 @@ class ADProvider(DatasetProvider):
         self._ds_trn = ADDataset(
             data_dir, processed_root, 'train', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
-            n_samples=n_samples, subsample=subsample,
+            n_samples=n_samples, subsample=subsample, seed=seed,
             data_normalization_strategy=data_normalization_strategy,
             fixed_subsample_mask=fixed_subsample_mask)
 
         self._ds_tst = ADDataset(
             data_dir, processed_root, 'test', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
-            n_samples=n_samples,
-            data_normalization_strategy=data_normalization_strategy)
+            n_samples=n_samples, subsample=subsample, seed=seed,
+            data_normalization_strategy=data_normalization_strategy,
+            fixed_subsample_mask=fixed_subsample_mask)
 
         self._ds_val = ADDataset(data_dir, processed_root, 'val', data_kind=dataset,
             window_length=window_length, window_overlap=window_overlap,
-            n_samples=n_samples, subsample=subsample,
+            n_samples=n_samples, subsample=subsample, seed=seed,
             data_normalization_strategy=data_normalization_strategy,
             fixed_subsample_mask=fixed_subsample_mask)
 

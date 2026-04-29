@@ -199,6 +199,7 @@ class SMDDataset(Dataset):
         window_length: int = 100,
         window_overlap: float = 0.0,
         subsample: float = 1.0,
+        seed: int = -1,
         data_normalization_strategy: str = "none",
         fixed_subsample_mask: bool = False,
         processed_root: str = None,
@@ -206,6 +207,7 @@ class SMDDataset(Dataset):
         self.mode = mode
         self.subsample = subsample
         self.fixed_subsample_mask = fixed_subsample_mask
+        self.seed = seed
 
         self.datasets = []
         self._lengths = []
@@ -296,20 +298,18 @@ class SMDDataset(Dataset):
             )
 
             if self.fixed_subsample_mask:
-                if self.mode == "train":
-                    masked_ratio = 1.0 - self.subsample
-                    n_features_data = obs.shape[-1]
-                    indcs_long = indcs.long()
-                    full_len = int(indcs_long.max().item()) + 1
-                    burst_mask = create_random_burst_mask(
-                        n_features=n_features_data,
-                        x_len=full_len,
-                        masked_ratio=masked_ratio,
-                    )  # (n_features, full_len)
-                    full_mask = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (full_len, n_features)
-                    self.datasets[-1]["fixed_inp_msk"] = full_mask[indcs_long]  # (n_samples, n_time, n_features)
-                else:  # val — all observations available
-                    self.datasets[-1]["fixed_inp_msk"] = torch.ones_like(msk).long()
+                masked_ratio = 1.0 - self.subsample
+                n_features_data = obs.shape[-1]
+                indcs_long = indcs.long()
+                full_len = int(indcs_long.max().item()) + 1
+                burst_mask = create_random_burst_mask(
+                    n_features=n_features_data,
+                    x_len=full_len,
+                    masked_ratio=masked_ratio,
+                    seed=self.seed
+                )  # (n_features, full_len)
+                full_mask = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (full_len, n_features)
+                self.datasets[-1]["fixed_inp_msk"] = full_mask[indcs_long]  # (n_samples, n_time, n_features)
 
         csum = 0
         for length in self._lengths:
@@ -374,20 +374,10 @@ class SMDDataset(Dataset):
         ds_idx, local_idx = self._resolve_index(idx)
         ds = self.datasets[ds_idx]
 
-        if self.mode in ("train", "val"):
-            if self.fixed_subsample_mask:
-                msk = ds["fixed_inp_msk"][local_idx].long()
-            else:
-                masked_ratio = 1.0 - self.subsample
-                n_time_s, n_feat_s = ds["inp_msk"][local_idx].shape  # (n_time, n_features)
-                burst_mask = create_random_burst_mask(
-                    n_features=n_feat_s,
-                    x_len=n_time_s,
-                    masked_ratio=masked_ratio,
-                )  # (n_feat_s, n_time_s)
-                msk = torch.from_numpy(burst_mask.T.astype(np.int64)).long()  # (n_time_s, n_feat_s)
+        if self.fixed_subsample_mask:
+            msk = ds["fixed_inp_msk"][local_idx].long()
         else:
-            msk = ds["inp_msk"][local_idx].long()
+            msk = (torch.rand(ds['inp_msk'][local_idx].shape) < self.subsample).to(torch.int).long()
 
         return {
             "inp_obs": ds["inp_obs"][local_idx].float(),
@@ -413,6 +403,7 @@ class SMDProvider(DatasetProvider):
         window_overlap: float = 0.0,
         data_normalization_strategy: str = "none",
         subsample: float = 1.0,
+        seed: int = -1,
         fixed_subsample_mask: bool = False,
     ):
         super().__init__()
@@ -427,11 +418,13 @@ class SMDProvider(DatasetProvider):
         }
 
         self._ds_trn = SMDDataset(
-            data_dir, "train", subsample=subsample,
+            data_dir, "train", subsample=subsample, seed=seed,
             fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
-        self._ds_tst = SMDDataset(data_dir, "test", **common_kwargs)
+        self._ds_tst = SMDDataset(
+            data_dir, "test", subsample=subsample, seed=seed,
+            fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
         self._ds_val = SMDDataset(
-            data_dir, "val", subsample=subsample,
+            data_dir, "val", subsample=subsample, seed=seed,
             fixed_subsample_mask=fixed_subsample_mask, **common_kwargs)
 
     @property
