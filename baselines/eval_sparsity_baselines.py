@@ -10,7 +10,10 @@ Modes
 -----
 single
     Run one ``(seed, subsample)`` pair identified by ``--task-id`` (or explicitly
-    via ``--subsample`` + ``--seed``).  Saves a JSON file with the results.
+    via ``--subsample`` + ``--seed``). Saves a JSON file with the results.
+all
+    Run the full ``num_seeds × subsamples`` sweep and persist one JSON file per
+    task using the same layout as ``single`` mode.
 aggregate
     Collect all ``task_*.json`` files from ``--results-dir``, build a summary CSV,
     and produce a per-metric line plot.
@@ -34,6 +37,11 @@ python baselines/eval_sparsity_baselines.py \\
 # Aggregate results into CSV + plots:
 python baselines/eval_sparsity_baselines.py \\
     --mode aggregate --results-dir out/sparsity_SWaT
+
+# Run the full seed × subsample sweep:
+python baselines/eval_sparsity_baselines.py \
+    --mode all --benchmark SWaT --classifiers KNN \
+    --results-dir out/sparsity_SWaT
 """
 
 from __future__ import annotations
@@ -197,6 +205,30 @@ def _total_tasks(num_seeds: int, subsamples: list[float]) -> int:
     return num_seeds * len(subsamples)
 
 
+def _load_existing_result_rows(path: str) -> list[dict]:
+    """Load previously saved result rows from ``path``.
+
+    Returns an empty list when the file does not exist or is empty. Legacy
+    single-dict payloads are normalized to a one-element list.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+
+    with open(path) as fh:
+        payload = json.load(fh)
+
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return [payload]
+
+    raise ValueError(
+        f"Expected JSON list/dict in existing results file {path}, got {type(payload).__name__}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Single run
 # ---------------------------------------------------------------------------
@@ -301,10 +333,33 @@ def run_single(args, subsamples: list[float]):
     set_round_context()
 
     out_file = os.path.join(out_dir, f"{task_label}.json")
+    existing_rows = _load_existing_result_rows(out_file)
+    combined_rows = existing_rows + rows
     with open(out_file, "w") as fh:
-        json.dump(rows, fh, indent=2)
-    LOGGER.info("Saved %d result(s) to %s", len(rows), out_file)
+        json.dump(combined_rows, fh, indent=2)
+    LOGGER.info(
+        "Saved %d new result(s) to %s (%d total)",
+        len(rows),
+        out_file,
+        len(combined_rows),
+    )
     return rows
+
+
+def run_all(args, subsamples: list[float]):
+    """Run the full seed × subsample sweep and persist per-task JSON files."""
+    all_rows = []
+    total_tasks = _total_tasks(args.num_seeds, subsamples)
+    LOGGER.info("Running full sweep across %d task(s)", total_tasks)
+
+    for task_id in range(total_tasks):
+        task_args = argparse.Namespace(**vars(args))
+        task_args.task_id = task_id
+        task_args.subsample_value = None
+        all_rows.extend(run_single(task_args, subsamples))
+
+    LOGGER.info("Completed full sweep across %d task(s)", total_tasks)
+    return all_rows
 
 
 # ---------------------------------------------------------------------------
@@ -449,9 +504,10 @@ def parse_args():
 
     parser.add_argument(
         "--mode",
-        choices=["single", "aggregate"],
+        choices=["single", "all", "aggregate"],
         default="aggregate",
         help="'single': run one experiment (requires --task-id or --subsample-value + --seed); "
+             "'all': run the full seeds × subsamples sweep; "
              "'aggregate': collect all JSON results and plot.",
     )
     parser.add_argument(
@@ -459,7 +515,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "0-based task index encoding (seed_idx, subsample_idx). "
+            "0-based task index encoding (seed_idx, subsample_idx) for --mode single. "
             "Range: 0 .. num_seeds × len(subsamples) - 1."
         ),
     )
@@ -467,7 +523,7 @@ def parse_args():
         "--subsample-value",
         type=pos_float,
         default=None,
-        help="Explicit subsample fraction to keep (alternative to --task-id).",
+        help="Explicit subsample fraction to keep for --mode single (alternative to --task-id).",
     )
 
     # Benchmark / dataset selection
@@ -599,6 +655,13 @@ def main():
                 "In --mode single you must provide either --task-id or --subsample-value."
             )
         run_single(args, subsamples)
+
+    elif args.mode == "all":
+        if args.task_id is not None or args.subsample_value is not None:
+            raise SystemExit(
+                "In --mode all do not provide --task-id or --subsample-value; the full sweep is run automatically."
+            )
+        run_all(args, subsamples)
 
     elif args.mode == "aggregate":
         aggregate(args.results_dir)
