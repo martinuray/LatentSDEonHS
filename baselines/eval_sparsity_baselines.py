@@ -65,7 +65,6 @@ if str(ROOT_DIR) not in sys.path:
 # Re-use dataset registry and loading helpers from the main baseline module.
 from baselines.baseline import (
     BENCHMARK_DATASETS,
-    TCNED_DECISION_CHUNK_SIZE,
     WADI_REDUCED_BATCH_SIZE,
     _select_keys,
     aggregate_mean_std,
@@ -311,7 +310,6 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                     y_test=y_test,
                     benchmark_name=benchmark_name,
                     dataset_id=dataset_id,
-                    tcned_decision_chunk_size=args.tcned_decision_chunk_size,
                 )
                 rows.append({
                     **result,
@@ -659,12 +657,6 @@ def parse_args():
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
-    )
-    parser.add_argument(
-        "--tcned-decision-chunk-size",
-        type=int,
-        default=TCNED_DECISION_CHUNK_SIZE,
-        help="Chunk size for TcnED decision_function to limit memory usage.",
     )
 
     return parser.parse_args()
