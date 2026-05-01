@@ -372,8 +372,8 @@ def run_all(args, subsamples: list[float]):
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def aggregate(out_dir: str):
-    """Collect all task JSON files, build summary CSV, and produce plots."""
+def aggregate(out_dir: str, benchmark: str | None = None):
+    """Collect task JSON files, optionally filter by benchmark, and plot."""
     os.makedirs(out_dir, exist_ok=True)
     json_files = sorted(
         f for f in os.listdir(out_dir) if f.endswith(".json")
@@ -394,17 +394,26 @@ def aggregate(out_dir: str):
         raise ValueError("All JSON files were empty.")
 
     results_df = pd.DataFrame(all_rows)
+    if benchmark is not None:
+        if "benchmark" not in results_df.columns:
+            raise ValueError("Cannot filter aggregate results: 'benchmark' column is missing in input JSON rows.")
+        results_df = results_df[results_df["benchmark"] == benchmark].copy()
+        if results_df.empty:
+            raise ValueError(
+                f"No rows found for benchmark '{benchmark}' in {out_dir}. "
+                "Check --benchmark or results-dir contents."
+            )
+        LOGGER.info("Aggregate filter active: benchmark=%s (rows=%d)", benchmark, len(results_df))
     csv_path = os.path.join(out_dir, "sparsity_baselines_raw.csv")
     results_df.to_csv(csv_path, index=False)
     print(f"Saved raw results CSV to {csv_path}")
 
-    group_cols = ["benchmark", "clf_name", "subsample"]
-    optional_cols = ["dataset_id"]
-    for col in optional_cols:
-        if col in results_df.columns and results_df[col].nunique() > 1:
-            group_cols.append(col)
+    # For multi-trace benchmarks, first average metrics over traces per run
+    # (seed), then compute mean/std over these run-level means.
+    collapsed_df = _collapse_traces_to_run_means(results_df)
 
-    summary_df = aggregate_mean_std(results_df, group_cols)
+    group_cols = ["benchmark", "clf_name", "subsample"]
+    summary_df = aggregate_mean_std(collapsed_df, group_cols)
     summary_csv = os.path.join(out_dir, "sparsity_baselines_summary.csv")
     summary_df.to_csv(summary_csv, index=False)
     print(f"Saved summary CSV (mean ± std) to {summary_csv}")
@@ -414,25 +423,57 @@ def aggregate(out_dir: str):
         build_mean_std_report(summary_df, group_cols).to_string(index=False),
     )
 
-    _plot_results(results_df, out_dir, group_cols)
+    _plot_results(collapsed_df, out_dir, group_cols)
+
+
+def _collapse_traces_to_run_means(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse per-trace rows to one row per run by averaging metric columns.
+
+    This ensures mean/std are computed across runs (seeds) of benchmark-level
+    scores instead of mixing trace-level variability into run variability.
+    """
+    metric_cols = [c for c in ["auroc", "auprc", "f1"] if c in df.columns]
+    if not metric_cols:
+        return df
+
+    # Prefer run_seed if available; fall back to seed_idx.
+    run_id_cols = [c for c in ["run_seed", "seed_idx"] if c in df.columns]
+    if not run_id_cols:
+        LOGGER.warning("No run identifier column found (run_seed/seed_idx); skipping trace collapsing.")
+        return df
+
+    group_cols = ["benchmark", "clf_name", "subsample", run_id_cols[0]]
+    if "dataset_id" in df.columns and df["dataset_id"].nunique() > 1:
+        LOGGER.info(
+            "Collapsing %d trace-level rows to run-level means using %s.",
+            len(df),
+            run_id_cols[0],
+        )
+
+    collapsed = df.groupby(group_cols, as_index=False)[metric_cols].mean()
+    return collapsed
 
 
 def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
-    """Produce per-metric line plots, one line per classifier (× dataset if multi)."""
+    """Produce per-metric line plots averaged over the whole benchmark.
+
+    For each sparsity level, values are aggregated across all datasets within a
+    benchmark (and all seeds), so each line reflects benchmark-level behavior.
+    """
     metrics = ["auroc", "auprc", "f1"]
     available_metrics = [m for m in metrics if m in df.columns]
     if not available_metrics:
         LOGGER.warning("No metric columns found in results; skipping plots.")
         return
 
-    # Determine plot grouping key (classifier, optionally × dataset).
-    line_key = "clf_name"
-    if "dataset_id" in df.columns and df["dataset_id"].nunique() > 1:
-        df = df.copy()
-        df["_line_key"] = df["clf_name"] + "/" + df["dataset_id"].astype(str)
-        line_key = "_line_key"
+    # One line per classifier (per benchmark if multiple benchmarks are present).
+    df = df.copy()
+    if "benchmark" in df.columns and df["benchmark"].nunique() > 1:
+        df["_line_key"] = df["benchmark"].astype(str) + "/" + df["clf_name"].astype(str)
+    else:
+        df["_line_key"] = df["clf_name"].astype(str)
 
-    line_labels = sorted(df[line_key].unique())
+    line_labels = sorted(df["_line_key"].unique())
 
     n_metrics = len(available_metrics)
     fig, axes = plt.subplots(n_metrics, 1, figsize=(10, 4 * n_metrics), sharex=True)
@@ -444,10 +485,10 @@ def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
 
     for ax, metric in zip(axes, available_metrics):
         for label, color in zip(line_labels, colors):
-            sub_df = df[df[line_key] == label]
+            sub_df = df[df["_line_key"] == label]
             agg = sub_df.groupby("subsample")[metric].agg(["mean", "std"]).sort_index()
-            mean = agg["mean"]
-            std = agg["std"].fillna(0.0)
+            mean = agg["mean"] * 100
+            std = agg["std"].fillna(0.0) * 100
             x = mean.index.to_numpy()
 
             (line,) = ax.plot(x, mean.to_numpy(), marker="o", color=color, label=label)
@@ -474,8 +515,10 @@ def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
 
         ax.set_ylabel(metric.upper())
         ax.set_title(metric.upper())
+        ax.grid(axis='y')
         ax.legend(fontsize=7, loc="lower right", ncol=max(1, len(line_labels) // 6))
-        ax.set_xlabel("subsample (fraction kept)")
+
+    axes[-1].set_xlabel("subsample (fraction kept)")
 
     plt.tight_layout()
     png_path = os.path.join(out_dir, "sparsity_baselines.png")
@@ -537,7 +580,7 @@ def parse_args():
         "--benchmark",
         choices=list(BENCHMARK_DATASETS.keys()),
         default="SWaT",
-        help="Which benchmark to evaluate (default: SWaT).",
+        help="Benchmark to evaluate; in aggregate mode, used to filter loaded results (default: SWaT).",
     )
     parser.add_argument(
         "--dataset-id",
@@ -670,7 +713,7 @@ def main():
         run_all(args, subsamples)
 
     elif args.mode == "aggregate":
-        aggregate(args.results_dir)
+        aggregate(args.results_dir, benchmark=args.benchmark)
 
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
