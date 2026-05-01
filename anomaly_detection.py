@@ -999,7 +999,6 @@ def main():
         metrics=aggregated_metrics,
     )
     logging.info("Aggregated metrics over %d run(s): %s", args_.runs, aggregated_metrics)
-    print(aggregated_metrics)
 
 
 if __name__ == "__main__":
