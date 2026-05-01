@@ -88,7 +88,7 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, verbose=1, batch_size=16, random_state=random_state),
         "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
         "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=1, random_state=random_state),
+        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=16, random_state=random_state),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
@@ -113,15 +113,15 @@ def configure_gpu(gpu_id):
         LOGGER.info("No --gpu-id provided; forcing CPU-only mode (CUDA_VISIBLE_DEVICES hidden)")
         return "cpu"
 
-    #os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    #LOGGER.info("Configured single GPU visibility: CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    LOGGER.info("Configured single GPU visibility: CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
 
     try:
         import torch
 
         if torch.cuda.is_available():
             # After CUDA_VISIBLE_DEVICES remapping, the selected GPU is index 0.
-            #torch.cuda.set_device(0)
+            torch.cuda.set_device(0)
             LOGGER.info("Pinned torch CUDA device to cuda:0 (mapped from physical GPU %s)", gpu_id)
             return "cuda"
         else:
