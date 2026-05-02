@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import gc
 import glob
 import logging
 import os
@@ -16,6 +17,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+import torch
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -27,6 +29,8 @@ LOGGER = logging.getLogger(__name__)
 CURRENT_ROUND = "-"
 _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
 WADI_REDUCED_BATCH_SIZE = 16
+USAD_INFERENCE_BATCH_SIZE = 64
+USAD_MIN_INFERENCE_BATCH_SIZE = 8
 
 
 class RoundContextFilter(logging.Filter):
@@ -83,7 +87,7 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         "OCSVM": lambda: OCSVM(),
         "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device, random_state=random_state),
         "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "USAD": lambda: USAD(seq_len=100, stride=100, device=device, random_state=random_state),
+        "USAD": lambda: USAD(seq_len=100, stride=100, batch_size=2048, device=device, random_state=random_state),
         "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device, random_state=random_state),
         "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, verbose=1, batch_size=16, random_state=random_state),
         "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
@@ -98,8 +102,6 @@ def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     try:
-        import torch
-
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -117,8 +119,6 @@ def configure_gpu(gpu_id):
     LOGGER.info("Configured single GPU visibility: CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
 
     try:
-        import torch
-
         if torch.cuda.is_available():
             # After CUDA_VISIBLE_DEVICES remapping, the selected GPU is index 0.
             torch.cuda.set_device(0)
@@ -606,7 +606,17 @@ def evaluate_classifier_on_dataset(
             )
 
     if hasattr(clf, "val_pc"):
-        clf.train_val_pc = 0.1 # hard setting validation part to 10%
+        clf.val_pc = 0.1
+        LOGGER.info(
+            "[%s/%s] %s validation split set to %.0f%% (val_pc=%.2f)",
+            benchmark_name,
+            dataset_id,
+            clf_name,
+            clf.val_pc * 100,
+            clf.val_pc,
+        )
+    elif hasattr(clf, "train_val_pc"):
+        clf.train_val_pc = 0.1
         LOGGER.info(
             "[%s/%s] %s validation split set to %.0f%% (train_val_pc=%.2f)",
             benchmark_name,
@@ -625,35 +635,83 @@ def evaluate_classifier_on_dataset(
         getattr(clf, "batch_size", "n/a"),
     )
 
-    import gc
     clf.fit(x_train)
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
     gc.collect()
 
     try:
-        import torch
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         LOGGER.debug("[%s/%s] torch cleanup skipped", benchmark_name, dataset_id, exc_info=True)
 
 
-    if clf_name == "TcnED":
-        LOGGER.warning(f"Running on TcnED, moving net to cpu.")
-        clf.net.to('cpu')
+    if clf_name in ["TcnED"]:
+        LOGGER.warning(f"Running on {clf_name}, moving net to cpu for inference.")
+        if hasattr(clf, "net") and clf.net is not None:    # TcnED
+            clf.net.to('cpu')
+
         clf.device = "cpu"
         configure_gpu(None)
 
-    y_test_scores = np.asarray(clf.decision_function(x_test)).ravel()
+    if clf_name == "USAD":
+        original_batch_size = getattr(clf, "batch_size", None)
+        if original_batch_size is not None and original_batch_size > USAD_INFERENCE_BATCH_SIZE:
+            clf.batch_size = USAD_INFERENCE_BATCH_SIZE
+            LOGGER.info(
+                "[%s/%s] %s inference batch size reduced: %s -> %s",
+                benchmark_name,
+                dataset_id,
+                clf_name,
+                original_batch_size,
+                clf.batch_size,
+            )
+
+    max_attempts = 1
+    if clf_name == "USAD" and hasattr(clf, "batch_size"):
+        max_attempts = 4
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with torch.inference_mode():
+                y_test_scores = np.asarray(clf.decision_function(x_test)).ravel()
+            break
+        except RuntimeError as error:
+            last_error = error
+            message = str(error).lower()
+            is_cuda_oom = "cuda" in message and "out of memory" in message
+            if not is_cuda_oom or clf_name != "USAD" or not hasattr(clf, "batch_size") or attempt == max_attempts:
+                raise
+
+            old_batch_size = int(getattr(clf, "batch_size"))
+            new_batch_size = max(USAD_MIN_INFERENCE_BATCH_SIZE, old_batch_size // 2)
+            if new_batch_size >= old_batch_size:
+                raise
+
+            LOGGER.warning(
+                "[%s/%s] %s inference OOM on attempt %d/%d. Reducing batch_size: %d -> %d and retrying.",
+                benchmark_name,
+                dataset_id,
+                clf_name,
+                attempt,
+                max_attempts,
+                old_batch_size,
+                new_batch_size,
+            )
+            clf.batch_size = new_batch_size
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        raise last_error if last_error is not None else RuntimeError("Inference failed without a captured error")
+
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
 
     del clf
     gc.collect()
 
     try:
-        import torch
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
