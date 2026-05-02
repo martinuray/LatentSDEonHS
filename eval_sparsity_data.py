@@ -1,12 +1,13 @@
 import json
 import logging
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 from anomaly_detection import extend_argparse, start_experiment
-from utils.parser import generic_parser
+from utils.parser import generic_parser, get_partition_batch_size
 
 SUBSAMPLES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 NUM_SEEDS = 5
@@ -109,6 +110,7 @@ def aggregate(out_dir: str):
 
 
 def main():
+    argv = sys.argv[1:]
     parser = extend_argparse(generic_parser)
     parser.add_argument(
         '--mode', choices=['single', 'aggregate'], default='aggregate',
@@ -121,11 +123,15 @@ def main():
     parser.add_argument(
         '--results-dir', default='out/sparsity_results',
         help="Directory for per-task JSON files and final outputs.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # important!
     args.fixed_subsample_mask = True
-    args.batch_size = 128
+    has_cli_batch_size = any(arg == "--batch-size" or arg.startswith("--batch-size=") for arg in argv)
+    if not has_cli_batch_size:
+        partition_batch_size = get_partition_batch_size()
+        if partition_batch_size is not None:
+            args.batch_size = partition_batch_size
 
     if args.mode == 'single':
         if args.task_id is None:
