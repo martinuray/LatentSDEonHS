@@ -303,7 +303,7 @@ def train_one_dataset(
             es_counter = 0
         else:
             es_counter += 1
-            if es_counter >= 2*args.restart: # early stopping patience shall be longer than one cosine sheduling
+            if es_counter >= 4*args.restart: # early stopping patience shall be longer than one cosine sheduling
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
