@@ -28,7 +28,7 @@
 
   "normalize_score": false,
   "data_normalization_strategy": "min-max",
-  "lr": 0.001,
+  "lr": 1e-1,
   "kl0_weight": 0.0001,
   "klp_weight": 0.001,
   "pxz_weight": 100.0,
@@ -37,7 +37,7 @@
   "n_deg": 16,
   "learnable_prior": false,
   "freeze_sigma": true,
-  "initial_sigma": 0.075,
+  "initial_sigma": 0.2,
   "mc_eval_samples": 1,
   "use_atanh": false,
   "subsample": 0.2,

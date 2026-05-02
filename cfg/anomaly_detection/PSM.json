@@ -22,7 +22,7 @@
   "n_deg": 6,
   "learnable_prior": false,
   "freeze_sigma": true,
-  "initial_sigma": 0.075,
+  "initial_sigma": 0.2,
   "mc_eval_samples": 1,
   "mc_train_samples": 1,
   "num_max_cpu_worker": 10,
