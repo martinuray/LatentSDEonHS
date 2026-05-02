@@ -31,6 +31,7 @@ _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
 WADI_REDUCED_BATCH_SIZE = 16
 USAD_INFERENCE_BATCH_SIZE = 64
 USAD_MIN_INFERENCE_BATCH_SIZE = 8
+DEFAULT_SEQ_LEN = 100
 
 
 class RoundContextFilter(logging.Filter):
@@ -56,7 +57,11 @@ def set_round_context(run_number: int | None = None, total_runs: int | None = No
         CURRENT_ROUND = f"{run_number}/{total_runs}"
 
 
-def build_classifier_factories(device: str = "cpu", random_state: int | None = None):
+def build_classifier_factories(
+    device: str = "cpu",
+    random_state: int | None = None,
+    seq_len: int = DEFAULT_SEQ_LEN,
+):
     # Import deepod models lazily so GPU visibility can be configured first.
     from pyod.models.copod import COPOD
     from pyod.models.iforest import IForest
@@ -78,6 +83,8 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         # DCdetector, NCAD
     )
 
+    ts_kwargs = {"seq_len": seq_len, "stride": seq_len, "device": device, "random_state": random_state, "verbose": 1}
+
     return {
         "KNN": lambda: KNN(),
         "PCA": lambda: PCA(n_components=3, random_state=random_state),
@@ -85,14 +92,14 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         "IForest": lambda: IForest(random_state=random_state),
         "LOF": lambda: LOF(),
         "OCSVM": lambda: OCSVM(),
-        "TimesNet": lambda: TimesNet(seq_len=100, stride=100, device=device, random_state=random_state),
-        "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "USAD": lambda: USAD(seq_len=100, stride=100, batch_size=2048, device=device, random_state=random_state),
-        "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device, random_state=random_state),
-        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, verbose=1, batch_size=16, random_state=random_state),
-        "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
-        "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=16, random_state=random_state),
+        "TimesNet": lambda: TimesNet(**ts_kwargs),
+        "DeepSVDD": lambda: DeepSVDDTS(**ts_kwargs),
+        "USAD": lambda: USAD(batch_size=2048, **ts_kwargs),
+        "AnomalyTransformer": lambda: AnomalyTransformer(**ts_kwargs),
+        "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
+        "TranAD": lambda: TranAD(**ts_kwargs),
+        "DeepIF": lambda: DeepIsolationForestTS(**ts_kwargs),
+        "COUTA": lambda: COUTA(batch_size=16, **ts_kwargs),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
