@@ -1,7 +1,7 @@
 {
   "data_dir": "data_dir",
-  "enable_file_logging": false,
-  "log_dir": null,
+  "enable_file_logging": true,
+  "log_dir": "logs",
   "enable_checkpointing": false,
   "checkpoint_dir": null,
   "checkpoint_at": [],
@@ -22,7 +22,7 @@
   "n_deg": 12,
   "learnable_prior": false,
   "freeze_sigma": true,
-  "initial_sigma": 0.05,
+  "initial_sigma": 0.2,
   "mc_eval_samples": 1,
   "mc_train_samples": 1,
   "num_max_cpu_worker": 10,

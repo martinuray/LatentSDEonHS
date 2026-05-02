@@ -117,12 +117,14 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Use SOn path-distribution encoder (sphere embedding). Disable to use GLn encoder.",
     )
     group.add_argument(
-        "--trace-id",
+        "--trace-ids",
         type=str,
+        nargs="+",
         default=None,
         help=(
-            "Optional trace/sub-dataset selector for multi-trace benchmarks. "
-            "Accepts dataset_id (preferred) or zero-based trace index as string."
+            "Optional trace/sub-dataset selectors for multi-trace benchmarks. "
+            "Each token accepts dataset_id (preferred) or zero-based trace index. "
+            "Supports comma-separated values and repeated tokens."
         ),
     )
     return parser
@@ -303,7 +305,7 @@ def train_one_dataset(
             es_counter = 0
         else:
             es_counter += 1
-            if es_counter >= 2*args.restart: # early stopping patience shall be longer than one cosine sheduling
+            if es_counter >= 4*args.restart: # early stopping patience shall be longer than one cosine sheduling
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
@@ -385,6 +387,24 @@ def aggregate_run_metrics(run_results):
 
     aggregated["num_runs"] = len(run_results)
     return aggregated
+
+
+def _normalize_trace_ids(trace_ids_arg):
+    """Normalize trace selectors from CLI into ordered unique non-empty strings."""
+    if trace_ids_arg is None:
+        return None
+
+    normalized = []
+    for token in trace_ids_arg:
+        for part in str(token).split(","):
+            part = part.strip()
+            if part:
+                normalized.append(part)
+
+    if not normalized:
+        return None
+
+    return list(dict.fromkeys(normalized))
 
 def finalstats2tensorboard(writer_, params_: dict, stats: dict, args):
     f1, f1_ts = 0, 0
@@ -569,8 +589,8 @@ def start_experiment(args, provider=None, store_final_metrics=True):
 
     def _store_final_metrics(final_metrics: dict):
         benchmark_name = args.dataset
-        if getattr(args, "trace_id", None):
-            benchmark_name = f"{args.dataset}:{args.trace_id}"
+        if getattr(args, "trace_ids", None):
+            benchmark_name = f"{args.dataset}:{','.join(args.trace_ids)}"
         append_final_metrics_csv(
             csv_path=getattr(args, "final_metrics_csv", "logs/final_metrics.csv"),
             benchmark=benchmark_name,
@@ -645,11 +665,8 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             per_dataset_histories = {}
 
             selected_indices = list(range(active_provider.num_datasets))
-            requested_trace = getattr(args, "trace_id", None)
-            if requested_trace is not None:
-                requested_trace = str(requested_trace).strip()
-                if not requested_trace:
-                    raise ValueError("--trace-id cannot be empty.")
+            requested_traces = getattr(args, "trace_ids", None)
+            if requested_traces is not None:
 
                 id_to_idx = {}
                 for ds_idx in range(active_provider.num_datasets):
@@ -657,26 +674,37 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                     dataset_id = str(ds.get("dataset_id", str(ds_idx)))
                     id_to_idx[dataset_id] = ds_idx
 
-                if requested_trace in id_to_idx:
-                    selected_indices = [id_to_idx[requested_trace]]
-                else:
+                resolved_indices = []
+                unknown = []
+                for requested_trace in requested_traces:
+                    if requested_trace in id_to_idx:
+                        resolved_indices.append(id_to_idx[requested_trace])
+                        continue
+
                     try:
                         req_idx = int(requested_trace)
                         if req_idx < 0 or req_idx >= active_provider.num_datasets:
                             raise ValueError
-                        selected_indices = [req_idx]
-                    except ValueError as exc:
-                        available_ids = sorted(id_to_idx.keys())
-                        raise ValueError(
-                            f"Unknown trace '{requested_trace}' for dataset {args.dataset}. "
-                            f"Use one of dataset_ids={available_ids} or an index in "
-                            f"[0, {active_provider.num_datasets - 1}]."
-                        ) from exc
+                        resolved_indices.append(req_idx)
+                    except ValueError:
+                        unknown.append(requested_trace)
+
+                if unknown:
+                    available_ids = sorted(id_to_idx.keys())
+                    raise ValueError(
+                        f"Unknown trace(s) {unknown} for dataset {args.dataset}. "
+                        f"Use one of dataset_ids={available_ids} or an index in "
+                        f"[0, {active_provider.num_datasets - 1}]."
+                    )
+
+                selected_indices = list(dict.fromkeys(resolved_indices))
+                if not selected_indices:
+                    raise ValueError("--trace-ids did not resolve to any trace.")
 
                 logging.info(
-                    "Restricting run to one trace via --trace-id=%s (resolved idx=%d)",
-                    requested_trace,
-                    selected_indices[0],
+                    "Restricting run to traces via --trace-ids=%s (resolved idx=%s)",
+                    requested_traces,
+                    selected_indices,
                 )
 
             for ds_idx in selected_indices:
@@ -768,9 +796,9 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             return combined_stats
 
         # Fallback path for providers without hybrid layout.
-        if getattr(args, "trace_id", None) is not None:
+        if getattr(args, "trace_ids", None) is not None:
             raise ValueError(
-                f"--trace-id is only supported for multi-trace datasets. "
+                f"--trace-ids is only supported for multi-trace datasets. "
                 f"Dataset {args.dataset} does not expose trace-wise training in this provider."
             )
 
@@ -975,13 +1003,9 @@ def main():
 
     # Final parse: explicit CLI values override dataset config defaults.
     args_ = parser.parse_args(argv)
+    args_.trace_ids = _normalize_trace_ids(args_.trace_ids)
     if args_.runs < 1:
         parser.error("--runs must be >= 1")
-
-    print(args_)
-    #if args_.runs == 1:
-    #    _ = start_experiment(args_, provider=None, store_final_metrics=True)
-    #    return
 
     run_results = []
     for run_idx in range(args_.runs):
@@ -991,7 +1015,7 @@ def main():
         run_results.append(run_result)
 
     aggregated_metrics = aggregate_run_metrics(run_results)
-    benchmark_name = args_.dataset if args_.trace_id is None else f"{args_.dataset}:{args_.trace_id}"
+    benchmark_name = args_.dataset if args_.trace_ids is None else f"{args_.dataset}:{','.join(args_.trace_ids)}"
     append_final_metrics_csv(
         csv_path=getattr(args_, "final_metrics_csv", "logs/final_metrics.csv"),
         benchmark=benchmark_name,
@@ -999,7 +1023,6 @@ def main():
         metrics=aggregated_metrics,
     )
     logging.info("Aggregated metrics over %d run(s): %s", args_.runs, aggregated_metrics)
-    print(aggregated_metrics)
 
 
 if __name__ == "__main__":
