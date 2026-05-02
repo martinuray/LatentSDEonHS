@@ -381,6 +381,18 @@ def parse_args():
         default=42,
         help="Base random seed; run i uses seed + i.",
     )
+    parser.add_argument(
+        "--seq-len-default",
+        type=positive_int,
+        default=DEFAULT_SEQ_LEN,
+        help="Default sequence length for time-series deep models; stride is set equal to seq_len.",
+    )
+    parser.add_argument(
+        "--benchmark-seq-lens",
+        type=str,
+        default="",
+        help="Optional benchmark-specific seq lens, e.g. 'SWaT:200,WaDi:128'.",
+    )
     return parser.parse_args()
 
 
@@ -392,6 +404,45 @@ def _select_keys(available, requested_csv):
     if invalid:
         raise ValueError(f"Unknown names: {invalid}. Available: {list(available.keys())}")
     return requested
+
+
+def _parse_benchmark_seq_lens(mapping_csv: str, available_benchmarks: dict[str, list[dict]]):
+    if mapping_csv is None or not mapping_csv.strip():
+        return {}
+
+    parsed = {}
+    for raw_entry in mapping_csv.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(
+                f"Invalid --benchmark-seq-lens entry '{entry}'. Expected format BENCHMARK:SEQ_LEN."
+            )
+
+        benchmark, seq_len_text = entry.split(":", 1)
+        benchmark = benchmark.strip()
+        seq_len_text = seq_len_text.strip()
+        if benchmark not in available_benchmarks:
+            raise ValueError(
+                f"Unknown benchmark '{benchmark}' in --benchmark-seq-lens. "
+                f"Available: {list(available_benchmarks.keys())}"
+            )
+
+        try:
+            seq_len = int(seq_len_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid seq_len '{seq_len_text}' for benchmark '{benchmark}'. Must be an integer."
+            ) from exc
+
+        if seq_len < 1:
+            raise ValueError(
+                f"Invalid seq_len '{seq_len}' for benchmark '{benchmark}'. Must be >= 1."
+            )
+        parsed[benchmark] = seq_len
+
+    return parsed
 
 
 def load_dataset(spec, max_train_samples=None, max_test_samples=None):
@@ -829,8 +880,13 @@ if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
     runtime_device = configure_gpu(args.gpu_id)
+    benchmark_seq_len_overrides = _parse_benchmark_seq_lens(args.benchmark_seq_lens, BENCHMARK_DATASETS)
 
-    classifier_factories = build_classifier_factories(device=runtime_device, random_state=args.seed)
+    classifier_factories = build_classifier_factories(
+        device=runtime_device,
+        random_state=args.seed,
+        seq_len=args.seq_len_default,
+    )
 
     output_dir = ROOT_DIR / "out"
     os.makedirs(output_dir, exist_ok=True)
@@ -841,7 +897,7 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s, seq_len_default=%s, benchmark_seq_lens=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
@@ -849,6 +905,8 @@ if __name__ == "__main__":
         args.runs,
         args.seed,
         runtime_device,
+        args.seq_len_default,
+        benchmark_seq_len_overrides,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
@@ -871,9 +929,22 @@ if __name__ == "__main__":
         run_seed = args.seed + run_idx
         set_round_context(run_number, args.runs)
         set_global_seed(run_seed)
-        classifier_factories = build_classifier_factories(device=runtime_device, random_state=run_seed)
         LOGGER.info("Starting run %d/%d with seed=%d", run_number, args.runs, run_seed)
         for benchmark_name in selected_benchmarks:
+            seq_len_for_benchmark = benchmark_seq_len_overrides.get(benchmark_name, args.seq_len_default)
+            LOGGER.info(
+                "Run %d/%d benchmark %s uses seq_len=%d (stride=%d)",
+                run_number,
+                args.runs,
+                benchmark_name,
+                seq_len_for_benchmark,
+                seq_len_for_benchmark,
+            )
+            classifier_factories = build_classifier_factories(
+                device=runtime_device,
+                random_state=run_seed,
+                seq_len=seq_len_for_benchmark,
+            )
             dataset_specs = BENCHMARK_DATASETS[benchmark_name]
             for clf_name in selected_classifiers:
                 clf_factory = classifier_factories[clf_name]
