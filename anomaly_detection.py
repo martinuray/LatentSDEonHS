@@ -978,11 +978,6 @@ def main():
     if args_.runs < 1:
         parser.error("--runs must be >= 1")
 
-    print(args_)
-    #if args_.runs == 1:
-    #    _ = start_experiment(args_, provider=None, store_final_metrics=True)
-    #    return
-
     run_results = []
     for run_idx in range(args_.runs):
         delete_processed_data(args_.dataset, data_dir=args_.data_dir)
