@@ -213,22 +213,63 @@ def _num_features(arr: np.ndarray) -> int:
     return 1
 
 
-def analyze_single_ad_dataset(data_dir: str, benchmark: str) -> Dict:
-    root = os.path.join(data_dir, benchmark, "raw")
-    train = np.load(os.path.join(root, "train.npy"), allow_pickle=True)
-    test = np.load(os.path.join(root, "test.npy"), allow_pickle=True)
-    labels = np.load(os.path.join(root, "labels.npy"), allow_pickle=True)
+def analyze_swat(data_dir: str) -> Dict:
+    """SWaT: train.csv / test.csv / labels.csv under raw/."""
+    raw_root = os.path.join(data_dir, "SWaT", "raw")
+    train = pd.read_csv(os.path.join(raw_root, "train.csv")).to_numpy(dtype=float)
+    test  = pd.read_csv(os.path.join(raw_root, "test.csv")).to_numpy(dtype=float)
+    labels = pd.read_csv(os.path.join(raw_root, "labels.csv"))["labels"].to_numpy(dtype=float)
+    rows = [{
+        "dataset_id": "SWaT",
+        "num_features": int(train.shape[1]),
+        "train_length": int(train.shape[0]),
+        "test_length": int(test.shape[0]),
+        "anomaly_ratio": _ratio_from_labels(labels),
+    }]
+    return _rows_to_summary("SWaT", rows)
 
-    rows = [
-        {
-            "dataset_id": benchmark,
-            "num_features": _num_features(train),
-            "train_length": _count_timesteps(train),
-            "test_length": _count_timesteps(test),
-            "anomaly_ratio": _ratio_from_labels(labels),
-        }
-    ]
-    return _rows_to_summary(benchmark, rows)
+
+def analyze_wadi(data_dir: str) -> Dict:
+    """WaDi: WADI_14days.csv (train) + WADI_attackdata_labelled.csv (test) under raw/v2/.
+
+    Both files have two header rows (numeric indices + actual names).
+    Row, Date, Time columns are dropped. For test the last column is the attack
+    label (1 = normal, -1 = attack).
+    """
+    _META_COLS = {"Row", "Row ", "Date", "Date ", "Time", "Time "}
+    raw_root = os.path.join(data_dir, "WaDi", "raw", "v2")
+
+    def _load_wadi_csv(path: str, label_col: str | None = None):
+        df = pd.read_csv(path, header=[0, 1])
+        # Flatten multi-level columns to their second level (actual names).
+        df.columns = [str(b).strip() for _, b in df.columns]
+        # Drop metadata columns.
+        drop = [c for c in df.columns if c in _META_COLS]
+        df = df.drop(columns=drop, errors="ignore")
+        if label_col and label_col in df.columns:
+            lbl = pd.to_numeric(df[label_col], errors="coerce").fillna(1).to_numpy()
+            df = df.drop(columns=[label_col])
+        else:
+            lbl = None
+        data = df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        return data, lbl
+
+    train_data, _ = _load_wadi_csv(os.path.join(raw_root, "WADI_14days.csv"))
+    test_data, lbl = _load_wadi_csv(
+        os.path.join(raw_root, "WADI_attackdata_labelled.csv"),
+        label_col="Attack LABLE (1:No Attack, -1:Attack)",
+    )
+    # label convention: -1 = attack → convert to 0/1
+    labels = (lbl == -1).astype(float) if lbl is not None else np.zeros(test_data.shape[0])
+
+    rows = [{
+        "dataset_id": "WaDi",
+        "num_features": int(train_data.shape[1]),
+        "train_length": int(train_data.shape[0]),
+        "test_length": int(test_data.shape[0]),
+        "anomaly_ratio": _ratio_from_labels(labels),
+    }]
+    return _rows_to_summary("WaDi", rows)
 
 
 def analyze_psm(data_dir: str) -> Dict:
@@ -314,8 +355,10 @@ def analyze_benchmark(data_dir: str, benchmark: str, qad_subdir: str) -> Dict:
         return analyze_qad(data_dir, qad_subdir=qad_subdir)
     if benchmark in ["SMAP", "MSL"]:
         return analyze_nasa(data_dir, spacecraft=benchmark)
-    if benchmark in ["SWaT", "WaDi"]:
-        return analyze_single_ad_dataset(data_dir, benchmark)
+    if benchmark == "SWaT":
+        return analyze_swat(data_dir)
+    if benchmark == "WaDi":
+        return analyze_wadi(data_dir)
     if benchmark == "PSM":
         return analyze_psm(data_dir)
     if benchmark in ["creditcard", "gecco"]:
@@ -366,6 +409,98 @@ def _print_summary(summary: Dict, limit: int):
     CONSOLE.print(ds_table)
 
 
+def _latex_escape(text: str) -> str:
+    """Escape basic LaTeX special chars in table cells."""
+    repl = {
+        "\\": r"\\textbackslash{}",
+        "&": r"\\&",
+        "%": r"\\%",
+        "$": r"\\$",
+        "#": r"\\#",
+        "_": r"\\_",
+        "{": r"\\{",
+        "}": r"\\}",
+        "~": r"\\textasciitilde{}",
+        "^": r"\\textasciicircum{}",
+    }
+    return "".join(repl.get(ch, ch) for ch in str(text))
+
+
+def _print_final_table(summaries: Dict):
+    """Print a single consolidated table across all analyzed benchmarks."""
+    table = Table(title="[bold]All Benchmarks — Summary[/bold]")#, box=box.HEAVY_OUTLINE)
+    table.add_column("Benchmark", style="bold cyan")
+    table.add_column("Traces", justify="right")
+    table.add_column("Features", justify="right")
+    table.add_column("Train points", justify="right")
+    table.add_column("Test points", justify="right")
+    table.add_column("Anomaly ratio", justify="right", style="magenta")
+
+    final_rows = []
+    for name, summary in summaries.items():
+        if not summary["datasets"]:
+            table.add_row(name, "0", "-", "-", "-", "-")
+            final_rows.append(
+                {
+                    "benchmark": name,
+                    "traces": "0",
+                    "features": "-",
+                    "train_points": "-",
+                    "test_points": "-",
+                    "anomaly_ratio": "-",
+                }
+            )
+            continue
+
+        df = pd.DataFrame(summary["datasets"])
+        num_traces = summary["num_datasets"]
+        # features: report as range if not all the same, otherwise single value
+        feat_vals = df["num_features"].unique()
+        features_str = str(int(feat_vals[0])) if len(feat_vals) == 1 else f"{int(df['num_features'].min())}-{int(df['num_features'].max())}"
+        train_total = summary["total_train_length"]
+        test_total = summary["total_test_length"]
+        anom = summary["weighted_anomaly_ratio"]
+
+        table.add_row(
+            name,
+            str(num_traces),
+            features_str,
+            f"{train_total:,}",
+            f"{test_total:,}",
+            f"{anom:.4f}",
+        )
+        final_rows.append(
+            {
+                "benchmark": name,
+                "traces": str(num_traces),
+                "features": features_str,
+                "train_points": str(train_total),
+                "test_points": str(test_total),
+                "anomaly_ratio": f"{anom:.4f}",
+            }
+        )
+
+    CONSOLE.print()
+    CONSOLE.print(table)
+
+    print("\nLaTeX source:")
+    print(r"\begin{tabular}{lrrrrr}")
+    print(r"\hline")
+    print(r"Benchmark & Traces & Features & Train points & Test points & Anomaly ratio \\")
+    print(r"\hline")
+    for row in final_rows:
+        print(
+            f"{_latex_escape(row['benchmark'])} & "
+            f"{_latex_escape(row['traces'])} & "
+            f"{_latex_escape(row['features'])} & "
+            f"{_latex_escape(row['train_points'])} & "
+            f"{_latex_escape(row['test_points'])} & "
+            f"{_latex_escape(row['anomaly_ratio'])} \\\\"
+        )
+    print(r"\hline")
+    print(r"\end{tabular}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze anomaly-detection benchmark datasets.")
     parser.add_argument(
@@ -398,6 +533,8 @@ def main():
         except FileNotFoundError as exc:
             CONSOLE.print(f"[yellow]Skipping {b}: {exc}[/yellow]")
 
+    if summaries:
+        _print_final_table(summaries)
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:

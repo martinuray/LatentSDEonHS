@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -25,7 +27,6 @@ LOGGER = logging.getLogger(__name__)
 CURRENT_ROUND = "-"
 _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
 WADI_REDUCED_BATCH_SIZE = 16
-TCNED_DECISION_CHUNK_SIZE = 5000
 
 
 class RoundContextFilter(logging.Filter):
@@ -84,10 +85,10 @@ def build_classifier_factories(device: str = "cpu", random_state: int | None = N
         "DeepSVDD": lambda: DeepSVDDTS(seq_len=100, stride=100, device=device, random_state=random_state),
         "USAD": lambda: USAD(seq_len=100, stride=100, device=device, random_state=random_state),
         "AnomalyTransformer": lambda: AnomalyTransformer(seq_len=100, stride=100, device=device, random_state=random_state),
-        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, random_state=random_state),
+        "TcnED": lambda: TcnED(seq_len=100, stride=100, device=device, verbose=1, batch_size=16, random_state=random_state),
         "TranAD": lambda: TranAD(seq_len=100, stride=100, device=device, random_state=random_state),
         "DeepIF": lambda: DeepIsolationForestTS(seq_len=100, stride=100, device=device, random_state=random_state),
-        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=1, random_state=random_state),
+        "COUTA": lambda: COUTA(seq_len=100, stride=100, device=device, batch_size=16, random_state=random_state),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
@@ -373,15 +374,6 @@ def parse_args():
         default=42,
         help="Base random seed; run i uses seed + i.",
     )
-    parser.add_argument(
-        "--tcned-decision-chunk-size",
-        type=int,
-        default=TCNED_DECISION_CHUNK_SIZE,
-        help=(
-            "Chunk size for TcnED decision_function during testing to reduce memory. "
-            "Use 0 to disable chunking."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -591,33 +583,6 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
     return x_train, x_test, y_test
 
 
-def _decision_function_with_chunking(clf, x_test, chunk_size, clf_name, benchmark_name, dataset_id):
-    if chunk_size is None or chunk_size <= 0 or x_test.shape[0] <= chunk_size:
-        return clf.decision_function(x_test)
-
-    LOGGER.info(
-        "[%s/%s] %s decision_function chunked: chunk_size=%d, total_rows=%d",
-        benchmark_name,
-        dataset_id,
-        clf_name,
-        chunk_size,
-        x_test.shape[0],
-    )
-    score_chunks = []
-    for start_idx in range(0, x_test.shape[0], chunk_size):
-        end_idx = min(start_idx + chunk_size, x_test.shape[0])
-        score_chunk = np.asarray(clf.decision_function(x_test[start_idx:end_idx])).ravel()
-        score_chunks.append(score_chunk)
-
-    y_test_scores = np.concatenate(score_chunks, axis=0)
-    if y_test_scores.shape[0] != x_test.shape[0]:
-        raise ValueError(
-            f"[{benchmark_name}/{dataset_id}] {clf_name} decision_function returned {y_test_scores.shape[0]} "
-            f"scores for {x_test.shape[0]} test rows"
-        )
-    return y_test_scores
-
-
 def evaluate_classifier_on_dataset(
     clf_name,
     clf,
@@ -626,9 +591,8 @@ def evaluate_classifier_on_dataset(
     y_test,
     benchmark_name,
     dataset_id,
-    tcned_decision_chunk_size=TCNED_DECISION_CHUNK_SIZE,
 ):
-    if benchmark_name in ["WaDi", "SWaT"] and hasattr(clf, "batch_size"):
+    if benchmark_name in ["WaDi", "SWaT"] and hasattr(clf, "batch_size") and False:
         original_batch_size = getattr(clf, "batch_size", None)
         if original_batch_size is None or original_batch_size > WADI_REDUCED_BATCH_SIZE:
             clf.batch_size = WADI_REDUCED_BATCH_SIZE
@@ -641,15 +605,16 @@ def evaluate_classifier_on_dataset(
                 clf.batch_size,
             )
 
-    clf.train_val_pc = 0.1 # hard setting validation part to 10%
-    LOGGER.info(
-        "[%s/%s] %s validation split set to %.0f%% (train_val_pc=%.2f)",
-        benchmark_name,
-        dataset_id,
-        clf_name,
-        clf.train_val_pc * 100,
-        clf.train_val_pc,
-    )
+    if hasattr(clf, "val_pc"):
+        clf.train_val_pc = 0.1 # hard setting validation part to 10%
+        LOGGER.info(
+            "[%s/%s] %s validation split set to %.0f%% (train_val_pc=%.2f)",
+            benchmark_name,
+            dataset_id,
+            clf_name,
+            clf.train_val_pc * 100,
+            clf.train_val_pc,
+        )
 
     LOGGER.info(
         "[%s/%s] running %s (device=%s, batch_size=%s)",
@@ -665,17 +630,22 @@ def evaluate_classifier_on_dataset(
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
     gc.collect()
 
-    decision_chunk_size = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        LOGGER.debug("[%s/%s] torch cleanup skipped", benchmark_name, dataset_id, exc_info=True)
+
+
     if clf_name == "TcnED":
-        decision_chunk_size = tcned_decision_chunk_size
-    y_test_scores = _decision_function_with_chunking(
-        clf,
-        x_test,
-        decision_chunk_size,
-        clf_name,
-        benchmark_name,
-        dataset_id,
-    )
+        LOGGER.warning(f"Running on TcnED, moving net to cpu.")
+        clf.net.to('cpu')
+        clf.device = "cpu"
+        configure_gpu(None)
+
+    y_test_scores = np.asarray(clf.decision_function(x_test)).ravel()
     metric_results, _ = get_ts_eval(y_test_scores, y_test)
 
     del clf
@@ -806,7 +776,7 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s, tcned_decision_chunk_size=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
@@ -814,7 +784,6 @@ if __name__ == "__main__":
         args.runs,
         args.seed,
         runtime_device,
-        args.tcned_decision_chunk_size,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
@@ -860,7 +829,6 @@ if __name__ == "__main__":
                             y_test,
                             benchmark_name,
                             dataset_id,
-                            tcned_decision_chunk_size=args.tcned_decision_chunk_size,
                         )
                         per_dataset_rows.append(row)
                         per_run_rows.append({**row, "run": run_number, "seed": run_seed})

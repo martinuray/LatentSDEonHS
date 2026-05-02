@@ -116,6 +116,15 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=True,
         help="Use SOn path-distribution encoder (sphere embedding). Disable to use GLn encoder.",
     )
+    group.add_argument(
+        "--trace-id",
+        type=str,
+        default=None,
+        help=(
+            "Optional trace/sub-dataset selector for multi-trace benchmarks. "
+            "Accepts dataset_id (preferred) or zero-based trace index as string."
+        ),
+    )
     return parser
 
 
@@ -559,9 +568,12 @@ def start_experiment(args, provider=None, store_final_metrics=True):
     logging.debug(f'Parameters set: {vars(args)}')
 
     def _store_final_metrics(final_metrics: dict):
+        benchmark_name = args.dataset
+        if getattr(args, "trace_id", None):
+            benchmark_name = f"{args.dataset}:{args.trace_id}"
         append_final_metrics_csv(
             csv_path=getattr(args, "final_metrics_csv", "logs/final_metrics.csv"),
-            benchmark=args.dataset,
+            benchmark=benchmark_name,
             run_datetime=experiment_id,
             metrics=final_metrics,
         )
@@ -632,7 +644,42 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             per_dataset_stats = {}
             per_dataset_histories = {}
 
-            for ds_idx in range(active_provider.num_datasets):
+            selected_indices = list(range(active_provider.num_datasets))
+            requested_trace = getattr(args, "trace_id", None)
+            if requested_trace is not None:
+                requested_trace = str(requested_trace).strip()
+                if not requested_trace:
+                    raise ValueError("--trace-id cannot be empty.")
+
+                id_to_idx = {}
+                for ds_idx in range(active_provider.num_datasets):
+                    ds = active_provider._ds_trn.get_dataset(ds_idx)
+                    dataset_id = str(ds.get("dataset_id", str(ds_idx)))
+                    id_to_idx[dataset_id] = ds_idx
+
+                if requested_trace in id_to_idx:
+                    selected_indices = [id_to_idx[requested_trace]]
+                else:
+                    try:
+                        req_idx = int(requested_trace)
+                        if req_idx < 0 or req_idx >= active_provider.num_datasets:
+                            raise ValueError
+                        selected_indices = [req_idx]
+                    except ValueError as exc:
+                        available_ids = sorted(id_to_idx.keys())
+                        raise ValueError(
+                            f"Unknown trace '{requested_trace}' for dataset {args.dataset}. "
+                            f"Use one of dataset_ids={available_ids} or an index in "
+                            f"[0, {active_provider.num_datasets - 1}]."
+                        ) from exc
+
+                logging.info(
+                    "Restricting run to one trace via --trace-id=%s (resolved idx=%d)",
+                    requested_trace,
+                    selected_indices[0],
+                )
+
+            for ds_idx in selected_indices:
                 trn_slice = DatasetSlice(active_provider._ds_trn, ds_idx)
                 tst_slice = DatasetSlice(active_provider._ds_tst, ds_idx)
                 val_slice = DatasetSlice(active_provider._ds_val, ds_idx)
@@ -683,7 +730,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 per_dataset_stats[dataset_id] = tst_stats
                 per_dataset_histories[dataset_id] = hist_stats
 
-            if active_provider.num_datasets == 1:
+            if len(per_dataset_stats) == 1:
                 only_id = next(iter(per_dataset_stats.keys()))
                 stats2pass = per_dataset_histories[only_id]["tst"]
                 best_stats2pass = per_dataset_stats[only_id]
@@ -696,8 +743,8 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 logging.shutdown()
                 writer.close()
                 if store_final_metrics:
-                    _store_final_metrics(stats2pass[0])
-                logging.info(f"Final metrics across {active_provider.num_datasets} datasets: {best_stats2pass}")
+                    _store_final_metrics(best_stats2pass)
+                logging.info(f"Final metrics for dataset trace {only_id}: {best_stats2pass}")
                 return per_dataset_stats[only_id]
 
             macro_stats = compute_macro_metrics(per_dataset_stats)
@@ -721,6 +768,12 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             return combined_stats
 
         # Fallback path for providers without hybrid layout.
+        if getattr(args, "trace_id", None) is not None:
+            raise ValueError(
+                f"--trace-id is only supported for multi-trace datasets. "
+                f"Dataset {args.dataset} does not expose trace-wise training in this provider."
+            )
+
         dl_trn = active_provider.get_train_loader(
             batch_size=args.batch_size,
             shuffle=True,
@@ -938,9 +991,10 @@ def main():
         run_results.append(run_result)
 
     aggregated_metrics = aggregate_run_metrics(run_results)
+    benchmark_name = args_.dataset if args_.trace_id is None else f"{args_.dataset}:{args_.trace_id}"
     append_final_metrics_csv(
         csv_path=getattr(args_, "final_metrics_csv", "logs/final_metrics.csv"),
-        benchmark=args_.dataset,
+        benchmark=benchmark_name,
         run_datetime=datetime.datetime.now().strftime('%y%m%d-%H:%M:%S'),
         metrics=aggregated_metrics,
     )

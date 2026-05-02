@@ -10,7 +10,10 @@ Modes
 -----
 single
     Run one ``(seed, subsample)`` pair identified by ``--task-id`` (or explicitly
-    via ``--subsample`` + ``--seed``).  Saves a JSON file with the results.
+    via ``--subsample`` + ``--seed``). Saves a JSON file with the results.
+all
+    Run the full ``num_seeds × subsamples`` sweep and persist one JSON file per
+    task using the same layout as ``single`` mode.
 aggregate
     Collect all ``task_*.json`` files from ``--results-dir``, build a summary CSV,
     and produce a per-metric line plot.
@@ -34,6 +37,11 @@ python baselines/eval_sparsity_baselines.py \\
 # Aggregate results into CSV + plots:
 python baselines/eval_sparsity_baselines.py \\
     --mode aggregate --results-dir out/sparsity_SWaT
+
+# Run the full seed × subsample sweep:
+python baselines/eval_sparsity_baselines.py \
+    --mode all --benchmark SWaT --classifiers KNN \
+    --results-dir out/sparsity_SWaT
 """
 
 from __future__ import annotations
@@ -57,7 +65,6 @@ if str(ROOT_DIR) not in sys.path:
 # Re-use dataset registry and loading helpers from the main baseline module.
 from baselines.baseline import (
     BENCHMARK_DATASETS,
-    TCNED_DECISION_CHUNK_SIZE,
     WADI_REDUCED_BATCH_SIZE,
     _select_keys,
     aggregate_mean_std,
@@ -197,11 +204,35 @@ def _total_tasks(num_seeds: int, subsamples: list[float]) -> int:
     return num_seeds * len(subsamples)
 
 
+def _load_existing_result_rows(path: str) -> list[dict]:
+    """Load previously saved result rows from ``path``.
+
+    Returns an empty list when the file does not exist or is empty. Legacy
+    single-dict payloads are normalized to a one-element list.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+
+    with open(path) as fh:
+        payload = json.load(fh)
+
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return [payload]
+
+    raise ValueError(
+        f"Expected JSON list/dict in existing results file {path}, got {type(payload).__name__}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Single run
 # ---------------------------------------------------------------------------
 
-def run_single(args, subsamples: list[float]):
+def run_single(args, subsamples: list[float], device: str | None = None):
     """Run one ``(seed, subsample)`` pair and persist results as JSON."""
     out_dir = args.results_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -227,7 +258,8 @@ def run_single(args, subsamples: list[float]):
         subsample,
     )
 
-    device = configure_gpu(args.gpu_id)
+    if device is None:
+        device = configure_gpu(args.gpu_id)
     classifier_factories = build_classifier_factories(device=device, random_state=run_seed)
     selected_classifiers = _select_keys(classifier_factories, args.classifiers)
 
@@ -278,7 +310,6 @@ def run_single(args, subsamples: list[float]):
                     y_test=y_test,
                     benchmark_name=benchmark_name,
                     dataset_id=dataset_id,
-                    tcned_decision_chunk_size=args.tcned_decision_chunk_size,
                 )
                 rows.append({
                     **result,
@@ -301,18 +332,46 @@ def run_single(args, subsamples: list[float]):
     set_round_context()
 
     out_file = os.path.join(out_dir, f"{task_label}.json")
+    existing_rows = _load_existing_result_rows(out_file)
+    combined_rows = existing_rows + rows
     with open(out_file, "w") as fh:
-        json.dump(rows, fh, indent=2)
-    LOGGER.info("Saved %d result(s) to %s", len(rows), out_file)
+        json.dump(combined_rows, fh, indent=2)
+    LOGGER.info(
+        "Saved %d new result(s) to %s (%d total)",
+        len(rows),
+        out_file,
+        len(combined_rows),
+    )
     return rows
+
+
+def run_all(args, subsamples: list[float]):
+    """Run the full seed × subsample sweep and persist per-task JSON files."""
+    all_rows = []
+    total_tasks = _total_tasks(args.num_seeds, subsamples)
+    LOGGER.info("Running full sweep across %d task(s)", total_tasks)
+
+    # Configure GPU once for the entire sweep so CUDA_VISIBLE_DEVICES is set
+    # consistently across all tasks rather than being reset each iteration.
+    device = configure_gpu(args.gpu_id)
+    LOGGER.info("Using device: %s (gpu_id=%s)", device, args.gpu_id)
+
+    for task_id in range(total_tasks):
+        task_args = argparse.Namespace(**vars(args))
+        task_args.task_id = task_id
+        task_args.subsample_value = None
+        all_rows.extend(run_single(task_args, subsamples, device=device))
+
+    LOGGER.info("Completed full sweep across %d task(s)", total_tasks)
+    return all_rows
 
 
 # ---------------------------------------------------------------------------
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def aggregate(out_dir: str):
-    """Collect all task JSON files, build summary CSV, and produce plots."""
+def aggregate(out_dir: str, benchmark: str | None = None):
+    """Collect task JSON files, optionally filter by benchmark, and plot."""
     os.makedirs(out_dir, exist_ok=True)
     json_files = sorted(
         f for f in os.listdir(out_dir) if f.endswith(".json")
@@ -333,17 +392,26 @@ def aggregate(out_dir: str):
         raise ValueError("All JSON files were empty.")
 
     results_df = pd.DataFrame(all_rows)
+    if benchmark is not None:
+        if "benchmark" not in results_df.columns:
+            raise ValueError("Cannot filter aggregate results: 'benchmark' column is missing in input JSON rows.")
+        results_df = results_df[results_df["benchmark"] == benchmark].copy()
+        if results_df.empty:
+            raise ValueError(
+                f"No rows found for benchmark '{benchmark}' in {out_dir}. "
+                "Check --benchmark or results-dir contents."
+            )
+        LOGGER.info("Aggregate filter active: benchmark=%s (rows=%d)", benchmark, len(results_df))
     csv_path = os.path.join(out_dir, "sparsity_baselines_raw.csv")
     results_df.to_csv(csv_path, index=False)
     print(f"Saved raw results CSV to {csv_path}")
 
-    group_cols = ["benchmark", "clf_name", "subsample"]
-    optional_cols = ["dataset_id"]
-    for col in optional_cols:
-        if col in results_df.columns and results_df[col].nunique() > 1:
-            group_cols.append(col)
+    # For multi-trace benchmarks, first average metrics over traces per run
+    # (seed), then compute mean/std over these run-level means.
+    collapsed_df = _collapse_traces_to_run_means(results_df)
 
-    summary_df = aggregate_mean_std(results_df, group_cols)
+    group_cols = ["benchmark", "clf_name", "subsample"]
+    summary_df = aggregate_mean_std(collapsed_df, group_cols)
     summary_csv = os.path.join(out_dir, "sparsity_baselines_summary.csv")
     summary_df.to_csv(summary_csv, index=False)
     print(f"Saved summary CSV (mean ± std) to {summary_csv}")
@@ -353,25 +421,57 @@ def aggregate(out_dir: str):
         build_mean_std_report(summary_df, group_cols).to_string(index=False),
     )
 
-    _plot_results(results_df, out_dir, group_cols)
+    _plot_results(collapsed_df, out_dir, group_cols)
+
+
+def _collapse_traces_to_run_means(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse per-trace rows to one row per run by averaging metric columns.
+
+    This ensures mean/std are computed across runs (seeds) of benchmark-level
+    scores instead of mixing trace-level variability into run variability.
+    """
+    metric_cols = [c for c in ["auroc", "auprc", "f1"] if c in df.columns]
+    if not metric_cols:
+        return df
+
+    # Prefer run_seed if available; fall back to seed_idx.
+    run_id_cols = [c for c in ["run_seed", "seed_idx"] if c in df.columns]
+    if not run_id_cols:
+        LOGGER.warning("No run identifier column found (run_seed/seed_idx); skipping trace collapsing.")
+        return df
+
+    group_cols = ["benchmark", "clf_name", "subsample", run_id_cols[0]]
+    if "dataset_id" in df.columns and df["dataset_id"].nunique() > 1:
+        LOGGER.info(
+            "Collapsing %d trace-level rows to run-level means using %s.",
+            len(df),
+            run_id_cols[0],
+        )
+
+    collapsed = df.groupby(group_cols, as_index=False)[metric_cols].mean()
+    return collapsed
 
 
 def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
-    """Produce per-metric line plots, one line per classifier (× dataset if multi)."""
+    """Produce per-metric line plots averaged over the whole benchmark.
+
+    For each sparsity level, values are aggregated across all datasets within a
+    benchmark (and all seeds), so each line reflects benchmark-level behavior.
+    """
     metrics = ["auroc", "auprc", "f1"]
     available_metrics = [m for m in metrics if m in df.columns]
     if not available_metrics:
         LOGGER.warning("No metric columns found in results; skipping plots.")
         return
 
-    # Determine plot grouping key (classifier, optionally × dataset).
-    line_key = "clf_name"
-    if "dataset_id" in df.columns and df["dataset_id"].nunique() > 1:
-        df = df.copy()
-        df["_line_key"] = df["clf_name"] + "/" + df["dataset_id"].astype(str)
-        line_key = "_line_key"
+    # One line per classifier (per benchmark if multiple benchmarks are present).
+    df = df.copy()
+    if "benchmark" in df.columns and df["benchmark"].nunique() > 1:
+        df["_line_key"] = df["benchmark"].astype(str) + "/" + df["clf_name"].astype(str)
+    else:
+        df["_line_key"] = df["clf_name"].astype(str)
 
-    line_labels = sorted(df[line_key].unique())
+    line_labels = sorted(df["_line_key"].unique())
 
     n_metrics = len(available_metrics)
     fig, axes = plt.subplots(n_metrics, 1, figsize=(10, 4 * n_metrics), sharex=True)
@@ -383,10 +483,10 @@ def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
 
     for ax, metric in zip(axes, available_metrics):
         for label, color in zip(line_labels, colors):
-            sub_df = df[df[line_key] == label]
+            sub_df = df[df["_line_key"] == label]
             agg = sub_df.groupby("subsample")[metric].agg(["mean", "std"]).sort_index()
-            mean = agg["mean"]
-            std = agg["std"].fillna(0.0)
+            mean = agg["mean"] * 100
+            std = agg["std"].fillna(0.0) * 100
             x = mean.index.to_numpy()
 
             (line,) = ax.plot(x, mean.to_numpy(), marker="o", color=color, label=label)
@@ -413,8 +513,10 @@ def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
 
         ax.set_ylabel(metric.upper())
         ax.set_title(metric.upper())
+        ax.grid(axis='y')
         ax.legend(fontsize=7, loc="lower right", ncol=max(1, len(line_labels) // 6))
-        ax.set_xlabel("subsample (fraction kept)")
+
+    axes[-1].set_xlabel("subsample (fraction kept)")
 
     plt.tight_layout()
     png_path = os.path.join(out_dir, "sparsity_baselines.png")
@@ -449,9 +551,10 @@ def parse_args():
 
     parser.add_argument(
         "--mode",
-        choices=["single", "aggregate"],
+        choices=["single", "all", "aggregate"],
         default="aggregate",
         help="'single': run one experiment (requires --task-id or --subsample-value + --seed); "
+             "'all': run the full seeds × subsamples sweep; "
              "'aggregate': collect all JSON results and plot.",
     )
     parser.add_argument(
@@ -459,7 +562,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "0-based task index encoding (seed_idx, subsample_idx). "
+            "0-based task index encoding (seed_idx, subsample_idx) for --mode single. "
             "Range: 0 .. num_seeds × len(subsamples) - 1."
         ),
     )
@@ -467,7 +570,7 @@ def parse_args():
         "--subsample-value",
         type=pos_float,
         default=None,
-        help="Explicit subsample fraction to keep (alternative to --task-id).",
+        help="Explicit subsample fraction to keep for --mode single (alternative to --task-id).",
     )
 
     # Benchmark / dataset selection
@@ -475,7 +578,7 @@ def parse_args():
         "--benchmark",
         choices=list(BENCHMARK_DATASETS.keys()),
         default="SWaT",
-        help="Which benchmark to evaluate (default: SWaT).",
+        help="Benchmark to evaluate; in aggregate mode, used to filter loaded results (default: SWaT).",
     )
     parser.add_argument(
         "--dataset-id",
@@ -555,12 +658,6 @@ def parse_args():
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
     )
-    parser.add_argument(
-        "--tcned-decision-chunk-size",
-        type=int,
-        default=TCNED_DECISION_CHUNK_SIZE,
-        help="Chunk size for TcnED decision_function to limit memory usage.",
-    )
 
     return parser.parse_args()
 
@@ -600,8 +697,15 @@ def main():
             )
         run_single(args, subsamples)
 
+    elif args.mode == "all":
+        if args.task_id is not None or args.subsample_value is not None:
+            raise SystemExit(
+                "In --mode all do not provide --task-id or --subsample-value; the full sweep is run automatically."
+            )
+        run_all(args, subsamples)
+
     elif args.mode == "aggregate":
-        aggregate(args.results_dir)
+        aggregate(args.results_dir, benchmark=args.benchmark)
 
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
