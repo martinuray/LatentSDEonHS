@@ -150,9 +150,15 @@ class QADData:
             data_ = self.scaler.transform(data_)
         return data_
 
-    def _process_QAD_data(self, n_samples=None):
-        logging.warning("Processing QAD Data")
+    def _process_QAD_data(self, n_samples=None, subsample_factor=10):
+        logging.warning(f"Processing QAD Data {self.mode} {self.dataset_number} with subsample factor {subsample_factor}")
         raw_data = load_qad_txt(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.txt'))
+
+        # Drop the Enable feature
+        if 'Enable' in raw_data.columns:
+            raw_data = raw_data.drop(columns=['Enable'])
+
+        raw_data = raw_data.iloc[::subsample_factor]
         raw_data = reshape_data(raw_data, self.window_length)
 
         if self.mode == 'test':
@@ -160,6 +166,7 @@ class QADData:
                 os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.txt'),
                 is_label=True,
             )
+            self.targets = self.targets[::subsample_factor]
             self.targets = reshape_data(self.targets, self.window_length)
         else:
             self.targets = np.zeros(raw_data.shape[0:2])
