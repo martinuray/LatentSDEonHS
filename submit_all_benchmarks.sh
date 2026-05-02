@@ -15,57 +15,15 @@ TIMEOUT="48:00:00"           # Timeout per job (HH:MM:SS)
 NUM_GPUS=1                   # Number of GPUs per job
 NUM_CPUS=8                   # Number of CPUs per job
 MEMORY="40GB"                # Memory per job
-JOB_NAME_PREFIX="anomaly"    # Prefix for job names
+JOB_NAME_PREFIX="ano"    # Prefix for job names
 
 # Number of runs per benchmark
 RUNS=5
 
 # Common anomaly_detection.py parameters (dataset and runs are set per benchmark below)
-COMMON_ARGS="\
---data-dir data_dir \
---enable-file-logging \
---log-dir logs \
---enable-checkpointing \
---checkpoint-dir checkpoints \
---checkpoint-at 1 2 3 4 5 6 90 150 190 210 390 590 990 1350 2100 \
---final-metrics-csv logs/final_metrics.csv \
---data-window-length 100 \
---data-window-overlap 0.0 \
---batch-size 512 \
---lr 0.001 \
---n-epochs 211 \
---kl0-weight 0.0001 \
---klp-weight 100.0 \
---pxz-weight 10.0 \
---seed -1 \
---restart 30 \
---device cuda \
---z-dim 16 \
---h-dim 512 \
---n-deg 12 \
---no-learnable-prior \
---freeze-sigma \
---initial-sigma 0.15 \
---mc-eval-samples 1 \
---mc-train-samples 1 \
---num-max-cpu-worker 10 \
---eval-every-n-epochs 30 \
---loglevel debug \
---no-use-atanh \
---no-debug \
---subsample 0.2 \
---no-normalize-score \
---data-normalization-strategy none \
---dec-hidden-dim 512 \
---n-dec-layers 2 \
---early-stopping-patience 10 \
---early-stopping-min-delta 0 \
---non-linear-decoder \
---delete-processed-data \
---fixed-subsample-mask"
 
 # Benchmarks to run (from anomaly_detection.py)
-BENCHMARKS=("SWaT" "WaDi" "SMD" "QAD" "MSL" "SMAP" "PSM")
+BENCHMARKS=("SMD" "MSL" "SMAP")
 
 
 # ---- Initialize conda ----
@@ -78,7 +36,7 @@ conda activate baseline-latent
 cd /home2/muray/Code/LatentSDEonHS
 
 # Log directory for SLURM output
-LOG_DIR="slurm_logs"
+LOG_DIR="slurm_logs_benchmark"
 mkdir -p "${LOG_DIR}"
 
 echo "=================================="
@@ -97,9 +55,7 @@ echo ""
 
 # Submit a job for each benchmark
 for BENCHMARK in "${BENCHMARKS[@]}"; do
-    LOG_FILE="${LOG_DIR}/${BENCHMARK}_%j.log"
-
-    echo "Submitting job for benchmark: ${BENCHMARK}"
+    echo "Submitting jobs for benchmark: ${BENCHMARK}"
 
     sbatch \
         --partition="${PARTITION}" \
@@ -107,14 +63,29 @@ for BENCHMARK in "${BENCHMARKS[@]}"; do
         --gpus="${NUM_GPUS}" \
         --cpus-per-task="${NUM_CPUS}" \
         --mem="${MEMORY}" \
-        --job-name="${JOB_NAME_PREFIX}_${BENCHMARK}" \
-        --output="${LOG_FILE}" \
-        --error="${LOG_FILE}" \
+        --job-name="${JOB_NAME_PREFIX}_Sn_${BENCHMARK}" \
+        --output="${LOG_DIR}/${BENCHMARK}_Sn_%j.log" \
+        --error="${LOG_DIR}/${BENCHMARK}_Sn_%j.log" \
         --wrap="python anomaly_detection.py \
             --dataset ${BENCHMARK} \
             --runs ${RUNS} \
-            ${COMMON_ARGS}"
+            --sphere-embedding"
 
+    sleep 0.5
+
+    sbatch \
+        --partition="${PARTITION}" \
+        --time="${TIMEOUT}" \
+        --gpus="${NUM_GPUS}" \
+        --cpus-per-task="${NUM_CPUS}" \
+        --mem="${MEMORY}" \
+        --job-name="${JOB_NAME_PREFIX}_Rn_${BENCHMARK}" \
+        --output="${LOG_DIR}/${BENCHMARK}_Rn_%j.log" \
+        --error="${LOG_DIR}/${BENCHMARK}_Rn_%j.log" \
+        --wrap="python anomaly_detection.py \
+            --dataset ${BENCHMARK} \
+            --runs ${RUNS} \
+            --no-sphere-embedding"
 
     # Small delay to avoid overwhelming the scheduler
     sleep 0.5
