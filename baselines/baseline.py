@@ -87,7 +87,7 @@ def build_classifier_factories(
 
     return {
         "KNN": lambda: KNN(),
-        "PCA": lambda: PCA(n_components=3, random_state=random_state),
+        "PCA": lambda: PCA(n_components=3, random_state=random_state, weighted=False),
         "COPOD": lambda: COPOD(),
         "IForest": lambda: IForest(random_state=random_state),
         "LOF": lambda: LOF(),
@@ -99,7 +99,7 @@ def build_classifier_factories(
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
         "TranAD": lambda: TranAD(**ts_kwargs),
         "DeepIF": lambda: DeepIsolationForestTS(**ts_kwargs),
-        "COUTA": lambda: COUTA(batch_size=16, **ts_kwargs),
+        "COUTA": lambda: COUTA(batch_size=2, **ts_kwargs),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
