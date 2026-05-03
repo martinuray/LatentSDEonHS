@@ -39,7 +39,7 @@ from utils.misc import (
     save_checkpoint,
     save_stats,
     append_final_metrics_csv)
-from utils.parser import generic_parser
+from utils.parser import generic_parser, get_partition_batch_size
 
 
 DATASET_CHOICES = ["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"]
@@ -79,6 +79,10 @@ def _validate_config_keys(parser: argparse.ArgumentParser, cfg: dict, dataset: s
             f"Unknown config keys for dataset '{dataset}': {unknown}. "
             f"Expected keys from parser destinations."
         )
+
+
+def _has_explicit_batch_size_cli_override(argv):
+    return any(arg == "--batch-size" or arg.startswith("--batch-size=") for arg in argv)
 
 
 def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -623,9 +627,12 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_normalization_strategy=args.data_normalization_strategy,
             )
         elif args.dataset == 'QAD':
+            dataset_number = None
+            if len(args.trace_ids) == 1:
+                dataset_number = int(args.trace_ids[0])
             provider = QADProvider(
                 data_dir=data_dir,
-                dataset_number=None,
+                dataset_number=dataset_number,
                 window_length=args.data_window_length,
                 seed=args.seed,
                 subsample=args.subsample,
@@ -994,6 +1001,7 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
 
 def main():
     argv = sys.argv[1:]
+    has_cli_batch_size = _has_explicit_batch_size_cli_override(argv)
     bootstrap_args = _extract_bootstrap_args(argv)
 
     parser = extend_argparse(generic_parser)
@@ -1004,6 +1012,10 @@ def main():
     # Final parse: explicit CLI values override dataset config defaults.
     args_ = parser.parse_args(argv)
     args_.trace_ids = _normalize_trace_ids(args_.trace_ids)
+    if not has_cli_batch_size:
+        partition_batch_size = get_partition_batch_size()
+        if partition_batch_size is not None:
+            args_.batch_size = partition_batch_size
     if args_.runs < 1:
         parser.error("--runs must be >= 1")
 

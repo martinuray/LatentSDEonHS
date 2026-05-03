@@ -1,6 +1,7 @@
 """Setup some generic commandline arguments, common to all experiments."""
 
 import argparse
+import os
 
 """Setup command-line parsing."""
 generic_parser = argparse.ArgumentParser()
@@ -46,6 +47,53 @@ group3.add_argument(
     choices=["debug", "info", "error", "warning", "critical"],
     default="debug",
 )
+
+
+DEFAULT_PARTITION_BATCH_SIZES = {
+    "rtx2080ti": 128,
+    "a6000": 512,
+    "cpu": 32,
+}
+
+
+def _parse_partition_batch_sizes(raw: str):
+    """Parse mapping like 'rtx2080ti:128,a6000:256'."""
+    mapping = {}
+    if not raw:
+        return mapping
+
+    for item in raw.split(','):
+        token = item.strip()
+        if not token or ':' not in token:
+            continue
+
+        name, value = token.split(':', 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+
+        try:
+            mapping[name] = int(value)
+        except ValueError:
+            continue
+    return mapping
+
+
+def get_partition_batch_size(partition_name: str | None = None):
+    """Return a partition-aware batch size, or None if no mapping matches."""
+    partition = partition_name or os.environ.get("SLURM_JOB_PARTITION") or os.environ.get("SLURM_PARTITION")
+    if not partition:
+        return None
+
+    # For multi-partition requests, slurm may expose a comma-separated list.
+    partition = str(partition).split(',')[0].strip()
+    if not partition:
+        return None
+
+    mapping = dict(DEFAULT_PARTITION_BATCH_SIZES)
+    mapping.update(_parse_partition_batch_sizes(os.environ.get("LATENTSDE_PARTITION_BATCH_SIZES", "")))
+    return mapping.get(partition)
 
 def remove_argument(parser, arg):
     for action in parser._actions:
