@@ -76,9 +76,12 @@ def _set_circular_false(mask_row, start_idx, run_length):
     mask_row[:split_idx] = False
 
 
-def create_random_burst_mask(n_features, x_len, seed, masked_ratio=0.3, s=0.2, max_false_length = 90):
+def create_random_burst_mask(n_features, x_len, seed, masked_ratio=0.3, s=0.2, max_false_length = None):
     if seed > 0:
         np.random.seed(seed)
+
+    if max_false_length is None:
+        max_false_length = x_len - 5
 
     p = masked_ratio
     out_mask = np.empty((n_features, x_len), dtype=bool)
