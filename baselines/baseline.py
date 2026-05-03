@@ -509,6 +509,10 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_test_df = _load_qad_txt(data_dir / spec["test_file"])
         y_test_df = _load_qad_txt(data_dir / spec["label_file"], is_label=True)
 
+        x_train_df = x_train_df[::10]
+        x_test_df = x_test_df[::10]
+        y_test_df = y_test_df[::10]
+
         x_train = x_train_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
         x_test = x_test_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
