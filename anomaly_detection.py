@@ -627,9 +627,12 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 data_normalization_strategy=args.data_normalization_strategy,
             )
         elif args.dataset == 'QAD':
+            dataset_number = None
+            if len(args.trace_ids) == 1:
+                dataset_number = int(args.trace_ids[0])
             provider = QADProvider(
                 data_dir=data_dir,
-                dataset_number=None,
+                dataset_number=dataset_number,
                 window_length=args.data_window_length,
                 seed=args.seed,
                 subsample=args.subsample,
