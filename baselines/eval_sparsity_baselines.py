@@ -86,7 +86,7 @@ from utils.anomaly_detection import create_random_burst_mask
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_SUBSAMPLES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+DEFAULT_SUBSAMPLES = [0.01, 0.05]
 DEFAULT_NUM_SEEDS = 5
 
 
