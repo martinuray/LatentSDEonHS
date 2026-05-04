@@ -160,6 +160,7 @@ def apply_burst_sparsity(
             x_len=n_time,
             seed=seed,
             masked_ratio=masked_ratio,
+            max_false_length=n_time-5
         )  # (n_features, n_time), True = keep
         keep_mask = burst_mask
     except (ValueError, RuntimeError) as exc:
