@@ -58,6 +58,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import warnings
+np.seterr(all='ignore')
+warnings.filterwarnings('ignore')
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
