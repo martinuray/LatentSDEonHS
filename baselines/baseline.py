@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -87,7 +88,7 @@ def build_classifier_factories(
 
     return {
         "KNN": lambda: KNN(),
-        "PCA": lambda: PCA(n_components=3, random_state=random_state),
+        "PCA": lambda: PCA(n_components=3, random_state=random_state, weighted=False),
         "COPOD": lambda: COPOD(),
         "IForest": lambda: IForest(random_state=random_state),
         "LOF": lambda: LOF(),
@@ -99,7 +100,7 @@ def build_classifier_factories(
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
         "TranAD": lambda: TranAD(**ts_kwargs),
         "DeepIF": lambda: DeepIsolationForestTS(**ts_kwargs),
-        "COUTA": lambda: COUTA(batch_size=16, **ts_kwargs),
+        "COUTA": lambda: COUTA(batch_size=2, **ts_kwargs),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
@@ -509,6 +510,10 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_test_df = _load_qad_txt(data_dir / spec["test_file"])
         y_test_df = _load_qad_txt(data_dir / spec["label_file"], is_label=True)
 
+        x_train_df = x_train_df[::10]
+        x_test_df = x_test_df[::10]
+        y_test_df = y_test_df[::10]
+
         x_train = x_train_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
         x_test = x_test_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
@@ -894,6 +899,7 @@ if __name__ == "__main__":
     macro_path = output_dir / "baselines.csv"
     per_dataset_summary_path = output_dir / "baselines_per_dataset_mean_std.csv"
     macro_summary_path = output_dir / "baselines_macro_mean_std.csv"
+    runtime_path = output_dir / "baselines_runtime_per_dataset.csv"
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
@@ -924,6 +930,7 @@ if __name__ == "__main__":
     per_dataset_rows = []
     per_run_rows = []
     failed_runs = []
+    runtime_rows = []
     for run_idx in range(args.runs):
         run_number = run_idx + 1
         run_seed = args.seed + run_idx
@@ -950,6 +957,7 @@ if __name__ == "__main__":
                 clf_factory = classifier_factories[clf_name]
                 for dataset_spec in dataset_specs:
                     dataset_id = dataset_spec["dataset_id"]
+                    started_at = time.perf_counter()
                     try:
                         x_train, x_test, y_test = load_dataset(
                             dataset_spec,
@@ -969,7 +977,44 @@ if __name__ == "__main__":
                         per_dataset_rows.append(row)
                         per_run_rows.append({**row, "run": run_number, "seed": run_seed})
                         append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
+                        elapsed_seconds = time.perf_counter() - started_at
+                        runtime_row = {
+                            "run": run_number,
+                            "seed": run_seed,
+                            "benchmark": benchmark_name,
+                            "dataset_id": dataset_id,
+                            "clf_name": clf_name,
+                            "status": "success",
+                            "duration_sec": elapsed_seconds,
+                            "error_type": "",
+                            "error_message": "",
+                        }
+                        runtime_rows.append(runtime_row)
+                        append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
+                        LOGGER.info(
+                            "[seed=%d][%s/%s] %s completed in %.3f sec",
+                            run_seed,
+                            benchmark_name,
+                            dataset_id,
+                            clf_name,
+                            elapsed_seconds,
+                        )
                     except Exception:
+                        elapsed_seconds = time.perf_counter() - started_at
+                        error_type, error_message, _ = sys.exc_info()
+                        runtime_row = {
+                            "run": run_number,
+                            "seed": run_seed,
+                            "benchmark": benchmark_name,
+                            "dataset_id": dataset_id,
+                            "clf_name": clf_name,
+                            "status": "failed",
+                            "duration_sec": elapsed_seconds,
+                            "error_type": error_type.__name__ if error_type is not None else "Exception",
+                            "error_message": str(error_message) if error_message is not None else "",
+                        }
+                        runtime_rows.append(runtime_row)
+                        append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
                         failed_runs.append((run_number, run_seed, benchmark_name, dataset_id, clf_name))
                         LOGGER.exception(
                             "[seed=%d][%s/%s] %s failed",
@@ -1020,4 +1065,12 @@ if __name__ == "__main__":
     LOGGER.info("Appended macro-averaged metrics to %s", macro_path)
     LOGGER.info("Appended per-dataset mean/std metrics to %s", per_dataset_summary_path)
     LOGGER.info("Appended macro mean/std metrics to %s", macro_summary_path)
+    if runtime_rows:
+        runtime_df = pd.DataFrame(runtime_rows)
+        LOGGER.info("Runtime tracking rows: %d", len(runtime_df))
+        LOGGER.info(
+            "Runtime by status: %s",
+            runtime_df.groupby("status", as_index=False).size().to_dict(orient="records"),
+        )
+    LOGGER.info("Appended per-dataset runtime metrics to %s", runtime_path)
 

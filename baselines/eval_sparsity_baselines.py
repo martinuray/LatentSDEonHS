@@ -58,6 +58,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import warnings
+np.seterr(all='ignore')
+warnings.filterwarnings('ignore')
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -82,7 +86,7 @@ from utils.anomaly_detection import create_random_burst_mask
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_SUBSAMPLES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+DEFAULT_SUBSAMPLES = [0.01, 0.05]
 DEFAULT_NUM_SEEDS = 5
 
 
@@ -156,6 +160,7 @@ def apply_burst_sparsity(
             x_len=n_time,
             seed=seed,
             masked_ratio=masked_ratio,
+            max_false_length=n_time-5
         )  # (n_features, n_time), True = keep
         keep_mask = burst_mask
     except (ValueError, RuntimeError) as exc:
