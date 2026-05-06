@@ -2,11 +2,11 @@
 #SBATCH --job-name=latent_baseline
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --partition=rtx2080ti
-###SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --time=48:00:00
+#SBATCH --partition=a6000
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=40G
 
 # ---- Initialize conda ----
 source $(conda info --base)/etc/profile.d/conda.sh
@@ -27,5 +27,4 @@ echo "Running classifier=$CLASSIFIER on benchmark=$BENCHMARK"
 python baselines/baseline.py \
 	    --benchmarks "$BENCHMARK" \
 	        --classifiers "$CLASSIFIER" \
-		    --runs 5 #\
-		        #--gpu-id 0
+		      --runs 5 --gpu-id 0
