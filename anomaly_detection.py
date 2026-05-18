@@ -271,7 +271,7 @@ def train_one_dataset(
         "oth": ["esc", "lr"],
         "trn": ["log_pxz", "kl0", "klp", "loss"],
         "val": ["log_pxz", "kl0", "klp", "loss"],
-        "tst": ["loss", "auc", "auprc", "prec", "rec", "f1"],
+        "tst": ["loss", "auc_roc", "auc_pr", "f1"],
     }
     if not args.freeze_sigma:
         stats_mask["oth"].append("sig")
@@ -464,14 +464,16 @@ def normalise_scores(test_delta, norm="median-iqr", smooth=True,
     else:
         return err_scores
 
-def get_results_for_all_score_normalizations(
+def eval_scores_for_all_score_normalizations(
         scores: np.ndarray,
-        test_labels: np.ndarray):
+        test_labels: np.ndarray,
+        window_length:int = 100):
 
     # Options
-    #normalisations = ["median-iqr", "mean-std", None] # TODO: then for better performance in the end ?
+    # TODO: then for better performance in the end ?
+    #normalisations = ["median-iqr", "mean-std", None]
+    #aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
     normalisations = [None]
-    #aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"] # TODO: then for better performance in the end
     aggregation_strategies = ["l1"]
 
     AGG_STRATEGIES = {
@@ -494,18 +496,18 @@ def get_results_for_all_score_normalizations(
 
         for aggregation_strategy in aggregation_strategies:
             normed_agg_scores = AGG_STRATEGIES[aggregation_strategy](normed_scores)
-            r, d = get_ts_eval(normed_agg_scores, test_labels.flatten())
+            results = get_ts_eval(normed_agg_scores, test_labels.flatten(), window_length=window_length)
 
-            agg_scores[(aggregation_strategy, n_key)] = r['f1']
-            df_list.append((n_key, (aggregation_strategy, d)))
+            agg_scores[(aggregation_strategy, n_key)] = results['f1']
+            df_list.append((n_key, (aggregation_strategy, results)))
 
     best_strategy = max(agg_scores, key=agg_scores.get)
-    #logging.debug(f"Best score through {best_strategy[0]} and {best_strategy[1]}: {agg_scores[best_strategy]}")
     best_idx = next(i for i, (n, (s, _)) in enumerate(df_list) if (s, n) == best_strategy)
-    return dict(df_list), df_list[best_idx][1][1]
+
+    return df_list[best_idx][1][1]  # returns the result dictionary
 
 
-def logprob2f1s(scores, true_labels):
+def eval_scores(scores, true_labels, window_length=100):
 
     if type(scores) is list:
         scores = torch.cat(scores, dim=0)
@@ -513,7 +515,7 @@ def logprob2f1s(scores, true_labels):
     if type(true_labels) is list:
         true_labels = torch.cat(true_labels, dim=0)
 
-    all_metrics_, best_metrics_ = get_results_for_all_score_normalizations(scores, true_labels)
+    best_metrics_ = eval_scores_for_all_score_normalizations(scores, true_labels, window_length=window_length)
     return best_metrics_
 
 
@@ -954,15 +956,11 @@ def evaluate(
         where=normalize_counts[:, None] > 0,
     )
 
-    #if epoch % 10 == 0:
     if test:
-        best_metrics = logprob2f1s(all_scores, all_labels)
-        best_metrics.set_index(best_metrics.columns[0], inplace=True)
-        stats['f1'] = best_metrics.loc["F1", "point_wise"]
-        stats['prec'] = best_metrics.loc["Precision", "point_wise"]
-        stats['rec'] = best_metrics.loc["Recall", "point_wise"]
-        stats['auc'] = best_metrics.loc["AUROC", "point_wise"] #roc_auc_score(all_labels, all_scores.mean(1))
-        stats['auprc'] = best_metrics.loc["AUPRC", "point_wise"] #average_precision_score(all_labels, all_scores.mean(1))
+        best_metrics = eval_scores(all_scores, all_labels, window_length=args.data_window_length)
+        for key, value in best_metrics.items():
+            stats[key.lower()] = value
+
     return stats
 
 

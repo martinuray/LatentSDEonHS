@@ -629,18 +629,14 @@ class Evaluator:
         return self.best_ts_fbeta_score_classic(labels, scores, 1)
 
 
-def get_ts_eval(scores, targets):
+from vus.metrics import get_metrics
+
+def get_ts_eval(scores, targets, window_length=100):
     ts_evalator = Evaluator()
-    # targets = torch.from_numpy(targets)
-    # scores = torch.from_numpy(scores)
 
     results = ts_evalator.best_f1_score(targets, scores)
+    vus_results = get_metrics(scores, targets, metric='all', slidingWindow=window_length)
+    del results['auprc'], results['auroc'], results['threshold']
+    del vus_results['F'], vus_results['Precision'], vus_results['Recall']
 
-    ## dataframe to display
-    metrics_name = ['F1', 'Precision', 'Recall', 'AUPRC', 'AUROC']
-    raw = [results['f1'], results['precision'], results['recall'],
-           results['auprc'], results['auroc']]
-    score_dict = {'': metrics_name, 'point_wise': raw}
-
-    df = pd.DataFrame(score_dict)
-    return results, df
+    return results | vus_results
