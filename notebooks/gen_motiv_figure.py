@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -128,7 +129,6 @@ labels = labels[:max_signal_len]
 data = data.iloc[start_idx:end_idx:subsample, col_idx]
 labels = labels.iloc[start_idx:end_idx:subsample, 0].to_numpy() == 1
 
-#%%
 checkpoint_path = _select_checkpoint_path()
 scores_full = _score_trace_with_checkpoint(checkpoint_path, trace_id=1)
 r = float(np.nanpercentile(scores_full, q))
@@ -152,6 +152,8 @@ anomaly_spans = [
     for start, end in zip(anomaly_starts, anomaly_ends)
 ]
 
+
+#%% Fig 1. Motivational Figure
 LINE_COLOR = "0.2"
 ANOMALY_COLOR = "red"
 ANOMALY_ALPHA = 0.1
@@ -228,3 +230,86 @@ fig.tight_layout(pad=0.2, h_pad=0.1)
 plt.savefig("out/motivational_figure.png", dpi=300, bbox_inches="tight", pad_inches=0.01)
 plt.show()
 plt.close("all")
+
+
+#%% Content for Fig 2. ML Flow
+data_len = 650
+fig, axs = plt.subplots(nrows=3, ncols = 1, figsize=(5, 4 ))
+for i in range(data.shape[1]):
+    ax = axs[i]
+    ax.plot(t[:data_len], data.iloc[:data_len, i], color=LINE_COLOR, linewidth=LINE_WIDTH)
+    #for span_start, span_end in anomaly_spans:
+    #    ax.axvspan(span_start, span_end, color=ANOMALY_COLOR, alpha=ANOMALY_ALPHA, linewidth=0)
+    #    ax.axvline(span_start, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+    #    ax.axvline(span_end, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+    #ax.set_ylabel(str(data.columns[i]), rotation=90, va="center")
+    #ax.yaxis.set_label_coords(YLABEL_X, 0.5)
+    ax.set_xlim(t[:data_len].min(), t[:data_len].max())
+    ax.set_yticklabels([])
+    ax.set_xticklabels([])
+    #ax.grid(axis="y", alpha=GRID_ALPHA, linewidth=0.6)
+
+plt.savefig(f'/tmp/motiv_fig/train.pdf', dpi=300, bbox_inches="tight", pad_inches=0.02)
+plt.show()
+
+starts = [1000, 2900]
+
+for idx, start in enumerate(starts):
+    fig, axs = plt.subplots(nrows=3, ncols = 1, figsize=(5, 4 ))
+    for i in range(data.shape[1]):
+        ax = axs[i]
+        ax.plot(t[start:start+data_len], data.iloc[start:start+data_len, i], color=LINE_COLOR, linewidth=LINE_WIDTH)
+        for span_start, span_end in anomaly_spans:
+            ax.axvspan(span_start, span_end, color=ANOMALY_COLOR, alpha=ANOMALY_ALPHA, linewidth=0)
+            ax.axvline(span_start, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+            ax.axvline(span_end, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+        #ax.set_ylabel(str(data.columns[i]), rotation=90, va="center")
+        #ax.yaxis.set_label_coords(YLABEL_X, 0.5)
+        ax.set_xlim(t[start:start+data_len].min(), t[start:start+data_len].max())
+        ax.set_yticklabels([])
+        ax.set_xticklabels([])
+
+        #ax.grid(axis="y", alpha=GRID_ALPHA, linewidth=0.6)
+
+    plt.tight_layout()
+    plt.savefig(f'/tmp/motiv_fig/test_{idx}.pdf', dpi=300, bbox_inches="tight", pad_inches=0.02)
+    plt.show()
+
+    fig, axs = plt.subplots(nrows=1, ncols=1, figsize=(5, 4/3))
+    axs.plot(t[start:start+data_len], scores_benign[start:start+data_len],
+             color=LINE_COLOR, linewidth=LINE_WIDTH)
+    axs.plot(t[start:start + data_len], scores_anom[start:start + data_len],
+             color='red', linewidth=LINE_WIDTH*2)
+    axs.set_ylim(0, 50)
+    axs.set_yticklabels([])
+    axs.set_xticklabels([])
+    plt.tight_layout()
+    plt.savefig(f'/tmp/motiv_fig/score_{idx}.pdf', dpi=300, bbox_inches="tight", pad_inches=0.02)
+    plt.show()
+
+plt.close('all')
+
+
+#%% Zip all PDF files
+import zipfile
+import os
+
+motiv_fig_dir = Path('/tmp/motiv_fig')
+zip_path = motiv_fig_dir / 'motiv_figures.zip'
+
+pdf_patterns = ['train*.pdf', 'test_*.pdf', 'score_*.pdf']
+pdf_files = []
+for pattern in pdf_patterns:
+    pdf_files.extend(motiv_fig_dir.glob(pattern))
+
+if pdf_files:
+    if os.path.isfile(zip_path):
+        os.remove(zip_path)
+    
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for pdf_file in sorted(pdf_files):
+            zipf.write(pdf_file, arcname=pdf_file.name)
+    print(f"Created archive: {zip_path} ({zip_path.stat().st_size / 1024:.1f} KB)")
+    print(f"Files in archive: {len(pdf_files)}")
+else:
+    print("No PDF files found matching patterns: train*.pdf, test_*.pdf, score_*.pdf")
