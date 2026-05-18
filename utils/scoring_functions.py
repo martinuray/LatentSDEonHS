@@ -638,5 +638,6 @@ def get_ts_eval(scores, targets, window_length=100):
     vus_results = get_metrics(scores, targets, metric='all', slidingWindow=window_length)
     del results['auprc'], results['auroc'], results['threshold']
     del vus_results['F'], vus_results['Precision'], vus_results['Recall']
-
-    return results | vus_results
+    m = results | vus_results
+    f_m = {key.lower(): value for key, value in m.items()}
+    return f_m

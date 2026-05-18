@@ -20,6 +20,11 @@ from sklearn.preprocessing import StandardScaler
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
 import torch
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -280,6 +285,192 @@ def configure_logging(level_name: str):
     set_round_context()
 
 
+def _wandb_is_available(args) -> bool:
+    return wandb is not None and not getattr(args, "wandb_disabled", False) and getattr(args, "wandb_mode", "online") != "disabled"
+
+
+def _wandb_json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _wandb_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        return [_wandb_json_safe(item) for item in seq]
+    return value
+
+
+def _wandb_table_from_dataframe(df: pd.DataFrame):
+    if wandb is None:
+        return None
+    return wandb.Table(dataframe=df.reset_index(drop=True))
+
+
+def _wandb_summary_from_dataframe(df: pd.DataFrame, prefix: str, key_cols: list[str], metric_cols: list[str]):
+    summary = {}
+    for _, row in df.iterrows():
+        key_suffix = "/".join(str(row[col]) for col in key_cols)
+        for metric in metric_cols:
+            value = row.get(metric)
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                summary[f"{prefix}/{key_suffix}/{metric}"] = float(value)
+    return summary
+
+
+def _wandb_init_run(
+    args,
+    runtime_device: str,
+    run_number: int,
+    run_seed: int,
+    clf_name: str,
+    selected_benchmarks: list[str],
+    selected_classifiers: list[str],
+    benchmark_seq_len_overrides: dict[str, int],
+    benchmark_dataset_counts: dict[str, int],
+    benchmark_dataset_ids: dict[str, list[str]],
+    output_paths: dict[str, Path],
+    classifier_defaults: dict[str, object],
+):
+    if not _wandb_is_available(args):
+        if wandb is None:
+            LOGGER.info("W&B logging disabled because wandb is not installed.")
+        else:
+            LOGGER.info("W&B logging disabled via CLI.")
+        return None
+
+    try:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        benchmark_slug = "-".join(selected_benchmarks)
+        classifier_slug = "-".join(selected_classifiers)
+        base_run_name = args.wandb_name or f"baseline__{benchmark_slug}__{classifier_slug}__r{args.runs}__seed{args.seed}__{timestamp}"
+        run_name = f"{base_run_name}__clf={clf_name}__run{run_number:02d}_seed{run_seed}"
+        run_group = args.wandb_group or f"benchmarks={benchmark_slug}__classifiers={classifier_slug}"
+        tags = list(dict.fromkeys((args.wandb_tags or []) + selected_benchmarks + [clf_name, runtime_device]))
+
+        config = {
+            "args": _wandb_json_safe(vars(args)),
+            "run_context": {
+                "run_number": run_number,
+                "run_seed": run_seed,
+                "clf_name": clf_name,
+            },
+            "selection": {
+                "benchmarks": selected_benchmarks,
+                "classifiers": selected_classifiers,
+            },
+            "runtime": {
+                "device": runtime_device,
+                "python": sys.version.split()[0],
+                "torch": torch.__version__,
+                "cuda_available": bool(torch.cuda.is_available()),
+            },
+            "benchmark_seq_len_overrides": benchmark_seq_len_overrides,
+            "benchmark_dataset_counts": benchmark_dataset_counts,
+            "benchmark_dataset_ids": benchmark_dataset_ids,
+            "classifier_defaults": classifier_defaults,
+            "output_paths": {name: str(path) for name, path in output_paths.items()},
+            "wandb": {
+                "project": args.wandb_project,
+                "entity": args.wandb_entity,
+                "name": run_name,
+                "group": run_group,
+                "mode": args.wandb_mode,
+            },
+        }
+
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=run_group,
+            tags=tags,
+            mode=args.wandb_mode,
+            config=config,
+            reinit=True,
+        )
+        wandb.define_metric("global_step")
+        wandb.define_metric("evaluation/*", step_metric="global_step")
+        wandb.define_metric("summary/*", summary="last")
+        LOGGER.info("Initialized W&B run: project=%s, name=%s, group=%s, mode=%s", args.wandb_project, run_name, run_group, args.wandb_mode)
+        return run
+    except Exception as exc:
+        LOGGER.warning("W&B initialization failed; continuing without W&B logging: %s", exc, exc_info=True)
+        return None
+
+
+def _wandb_log_evaluation(run, global_step: int, row: dict, run_number: int, seed: int, elapsed_seconds: float, status: str, metrics: dict | None = None):
+    if run is None:
+        return True
+
+    try:
+        payload = {
+            "global_step": global_step,
+            "evaluation/run_number": run_number,
+            "evaluation/seed": seed,
+            "evaluation/duration_sec": float(elapsed_seconds),
+            "evaluation/success": 1.0 if status == "success" else 0.0,
+            "evaluation/failure": 1.0 if status != "success" else 0.0,
+        }
+        combined_metrics = {}
+        if metrics:
+            combined_metrics.update(metrics)
+        combined_metrics.update({key: value for key, value in row.items() if key not in {"benchmark", "dataset_id", "clf_name"}})
+        for metric_name, metric_value in combined_metrics.items():
+            if isinstance(metric_value, (int, float, np.integer, np.floating)):
+                payload[f"evaluation/{metric_name}"] = float(metric_value)
+        run.log(payload, step=global_step)
+        return True
+    except Exception as exc:
+        LOGGER.warning("W&B evaluation logging failed; disabling further W&B logging: %s", exc, exc_info=True)
+        return False
+
+
+def _wandb_log_final_outputs(run, per_dataset_df, per_run_df, macro_df, per_dataset_summary_df, macro_summary_df, runtime_df, failed_runs, output_paths):
+    if run is None:
+        return True
+
+    try:
+        summary_payload = {
+            "summary/num_successful_rows": int(len(per_dataset_df)),
+            "summary/num_unique_runs": int(per_run_df["run"].nunique()) if (not per_run_df.empty and "run" in per_run_df.columns) else 0,
+            "summary/num_failed_runs": int(len(failed_runs)),
+            "summary/num_runtime_rows": int(len(runtime_df)) if runtime_df is not None else 0,
+        }
+
+        summary_payload.update(_wandb_summary_from_dataframe(macro_df, "summary/macro", ["benchmark", "clf_name"], ["auc_roc", "auc_pr", "f1"]))
+        summary_payload.update(_wandb_summary_from_dataframe(per_dataset_summary_df, "summary/per_dataset_mean_std", ["benchmark", "dataset_id", "clf_name"], ["auc_roc_mean", "auc_roc_std", "auc_pr_mean", "auc_pr_std", "f1_mean", "f1_std", "num_runs"]))
+        summary_payload.update(_wandb_summary_from_dataframe(macro_summary_df, "summary/macro_mean_std", ["benchmark", "clf_name"], ["auc_roc_mean", "auc_roc_std", "auc_pr_mean", "auc_pr_std", "f1_mean", "f1_std", "num_runs"]))
+
+        for key, value in summary_payload.items():
+            run.summary[key] = value
+
+        tables = {
+            "tables/per_dataset": per_dataset_df,
+            "tables/per_run": per_run_df,
+            "tables/macro": macro_df.reset_index(),
+            "tables/per_dataset_mean_std": per_dataset_summary_df,
+            "tables/macro_mean_std": macro_summary_df,
+        }
+        if runtime_df is not None and not runtime_df.empty:
+            tables["tables/runtime"] = runtime_df
+
+        run.log({name: _wandb_table_from_dataframe(df) for name, df in tables.items() if df is not None})
+
+        artifact = wandb.Artifact(name=f"{run.name}-results".replace("=", "_"), type="results")
+        for path in output_paths.values():
+            if path.exists():
+                artifact.add_file(str(path))
+        run.log_artifact(artifact)
+        return True
+    except Exception as exc:
+        LOGGER.warning("Final W&B logging failed; continuing without W&B artifacts: %s", exc, exc_info=True)
+        return False
+
+
 BENCHMARK_DATASETS = {
     "SWaT": [
         {
@@ -393,6 +584,49 @@ def parse_args():
         type=str,
         default="",
         help="Optional benchmark-specific seq lens, e.g. 'SWaT:200,WaDi:128'.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="latent-sde-on-hs-baselines",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity / team name.",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Optional explicit W&B run name. If omitted, a descriptive name is generated.",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        type=str,
+        default=None,
+        help="Optional W&B group name. Defaults to the selected benchmark/classifier combination.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="*",
+        default=[],
+        help="Optional W&B tags.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B mode.",
+    )
+    parser.add_argument(
+        "--wandb-disabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable W&B logging entirely.",
     )
     return parser.parse_args()
 
@@ -769,7 +1003,7 @@ def evaluate_classifier_on_dataset(
     else:
         raise last_error if last_error is not None else RuntimeError("Inference failed without a captured error")
 
-    metric_results, _ = get_ts_eval(y_test_scores, y_test)
+    metric_results = get_ts_eval(y_test_scores, y_test)
 
     del clf
     gc.collect()
@@ -781,32 +1015,27 @@ def evaluate_classifier_on_dataset(
         LOGGER.debug("[%s/%s] torch cleanup skipped", benchmark_name, dataset_id, exc_info=True)
 
 
-    selected_metrics = {
-        "auroc": metric_results["auroc"],
-        "auprc": metric_results["auprc"],
-        "f1": metric_results["f1"],
-    }
     LOGGER.info(
-        "[%s/%s] %s: auroc=%.6f, auprc=%.6f, f1=%.6f",
+        "[%s/%s] %s: auc_roc=%.6f, auc_pr=%.6f, f1=%.6f",
         benchmark_name,
         dataset_id,
         clf_name,
-        selected_metrics["auroc"],
-        selected_metrics["auprc"],
-        selected_metrics["f1"],
+        metric_results["auc_roc"],
+        metric_results["auc_pr"],
+        metric_results["f1"],
     )
 
     return {
         "benchmark": benchmark_name,
         "dataset_id": dataset_id,
         "clf_name": clf_name,
-        **selected_metrics,
-    }
+        **metric_results,
+    }, metric_results
 
 
 def macro_average(per_dataset_df):
     macro_df = (
-        per_dataset_df.groupby(["benchmark", "clf_name"], as_index=False)[["auroc", "auprc", "f1"]]
+        per_dataset_df.groupby(["benchmark", "clf_name"], as_index=False)[["auc_roc", "auc_pr", "f1"]]
         .mean()
         .sort_values(["benchmark", "clf_name"])
     )
@@ -858,7 +1087,7 @@ def append_df_to_csv(df, csv_path, index=False):
 
 
 def aggregate_mean_std(df, group_cols):
-    metrics = ["auroc", "auprc", "f1"]
+    metrics = ["auc_roc", "auc_pr", "f1"]
     mean_df = df.groupby(group_cols, as_index=False)[metrics].mean().rename(columns={m: f"{m}_mean" for m in metrics})
     std_df = (
         df.groupby(group_cols, as_index=False)[metrics]
@@ -872,7 +1101,7 @@ def aggregate_mean_std(df, group_cols):
 
 def build_mean_std_report(df, group_cols):
     report_df = df[group_cols + ["num_runs"]].copy()
-    for metric in ["auroc", "auprc", "f1"]:
+    for metric in ["auc_roc", "auc_pr", "f1"]:
         report_df[metric] = (
             df[f"{metric}_mean"].map(lambda value: f"{value:.6f}")
             + " +- "
@@ -927,6 +1156,26 @@ if __name__ == "__main__":
         else:
             LOGGER.info("Benchmark %s has %d dataset(s)", benchmark_name, dataset_count)
 
+    benchmark_dataset_counts = {benchmark_name: len(BENCHMARK_DATASETS[benchmark_name]) for benchmark_name in selected_benchmarks}
+    benchmark_dataset_ids = {
+        benchmark_name: [spec["dataset_id"] for spec in BENCHMARK_DATASETS[benchmark_name]]
+        for benchmark_name in selected_benchmarks
+    }
+    classifier_defaults = {
+        "device": runtime_device,
+        "random_state": args.seed,
+        "seq_len_default": args.seq_len_default,
+        "runs": args.runs,
+        "max_train_samples": args.max_train_samples,
+        "max_test_samples": args.max_test_samples,
+    }
+    output_paths = {
+        "per_dataset": per_dataset_path,
+        "macro": macro_path,
+        "per_dataset_mean_std": per_dataset_summary_path,
+        "macro_mean_std": macro_summary_path,
+        "runtime": runtime_path,
+    }
     per_dataset_rows = []
     per_run_rows = []
     failed_runs = []
@@ -937,92 +1186,176 @@ if __name__ == "__main__":
         set_round_context(run_number, args.runs)
         set_global_seed(run_seed)
         LOGGER.info("Starting run %d/%d with seed=%d", run_number, args.runs, run_seed)
-        for benchmark_name in selected_benchmarks:
-            seq_len_for_benchmark = benchmark_seq_len_overrides.get(benchmark_name, args.seq_len_default)
-            LOGGER.info(
-                "Run %d/%d benchmark %s uses seq_len=%d (stride=%d)",
-                run_number,
-                args.runs,
-                benchmark_name,
-                seq_len_for_benchmark,
-                seq_len_for_benchmark,
-            )
-            classifier_factories = build_classifier_factories(
-                device=runtime_device,
-                random_state=run_seed,
-                seq_len=seq_len_for_benchmark,
-            )
-            dataset_specs = BENCHMARK_DATASETS[benchmark_name]
-            for clf_name in selected_classifiers:
-                clf_factory = classifier_factories[clf_name]
-                for dataset_spec in dataset_specs:
-                    dataset_id = dataset_spec["dataset_id"]
-                    started_at = time.perf_counter()
-                    try:
-                        x_train, x_test, y_test = load_dataset(
-                            dataset_spec,
-                            max_train_samples=args.max_train_samples,
-                            max_test_samples=args.max_test_samples,
-                        )
-                        clf = clf_factory()
-                        row = evaluate_classifier_on_dataset(
-                            clf_name,
-                            clf,
-                            x_train,
-                            x_test,
-                            y_test,
-                            benchmark_name,
-                            dataset_id,
-                        )
-                        per_dataset_rows.append(row)
-                        per_run_rows.append({**row, "run": run_number, "seed": run_seed})
-                        append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
-                        elapsed_seconds = time.perf_counter() - started_at
-                        runtime_row = {
-                            "run": run_number,
-                            "seed": run_seed,
-                            "benchmark": benchmark_name,
-                            "dataset_id": dataset_id,
-                            "clf_name": clf_name,
-                            "status": "success",
-                            "duration_sec": elapsed_seconds,
-                            "error_type": "",
-                            "error_message": "",
-                        }
-                        runtime_rows.append(runtime_row)
-                        append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
-                        LOGGER.info(
-                            "[seed=%d][%s/%s] %s completed in %.3f sec",
-                            run_seed,
-                            benchmark_name,
-                            dataset_id,
-                            clf_name,
-                            elapsed_seconds,
-                        )
-                    except Exception:
-                        elapsed_seconds = time.perf_counter() - started_at
-                        error_type, error_message, _ = sys.exc_info()
-                        runtime_row = {
-                            "run": run_number,
-                            "seed": run_seed,
-                            "benchmark": benchmark_name,
-                            "dataset_id": dataset_id,
-                            "clf_name": clf_name,
-                            "status": "failed",
-                            "duration_sec": elapsed_seconds,
-                            "error_type": error_type.__name__ if error_type is not None else "Exception",
-                            "error_message": str(error_message) if error_message is not None else "",
-                        }
-                        runtime_rows.append(runtime_row)
-                        append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
-                        failed_runs.append((run_number, run_seed, benchmark_name, dataset_id, clf_name))
-                        LOGGER.exception(
-                            "[seed=%d][%s/%s] %s failed",
-                            run_seed,
-                            benchmark_name,
-                            dataset_id,
-                            clf_name,
-                        )
+
+        for clf_name in selected_classifiers:
+            for benchmark_name in selected_benchmarks:
+                seq_len_for_benchmark = benchmark_seq_len_overrides.get(benchmark_name, args.seq_len_default)
+                single_benchmark_dataset_counts = {benchmark_name: benchmark_dataset_counts[benchmark_name]}
+                single_benchmark_dataset_ids = {benchmark_name: benchmark_dataset_ids[benchmark_name]}
+
+                run_wandb = _wandb_init_run(
+                    args=args,
+                    runtime_device=runtime_device,
+                    run_number=run_number,
+                    run_seed=run_seed,
+                    clf_name=clf_name,
+                    selected_benchmarks=[benchmark_name],
+                    selected_classifiers=selected_classifiers,
+                    benchmark_seq_len_overrides=benchmark_seq_len_overrides,
+                    benchmark_dataset_counts=single_benchmark_dataset_counts,
+                    benchmark_dataset_ids=single_benchmark_dataset_ids,
+                    output_paths=output_paths,
+                    classifier_defaults=classifier_defaults,
+                )
+                run_wandb_step = 0
+                run_per_dataset_rows = []
+                run_per_run_rows = []
+                run_failed_runs = []
+                run_runtime_rows = []
+
+                try:
+                    LOGGER.info(
+                        "Run %d/%d clf=%s benchmark=%s seq_len=%d",
+                        run_number, args.runs, clf_name, benchmark_name, seq_len_for_benchmark,
+                    )
+                    clf_factories_for_benchmark = build_classifier_factories(
+                        device=runtime_device,
+                        random_state=run_seed,
+                        seq_len=seq_len_for_benchmark,
+                    )
+                    clf_factory = clf_factories_for_benchmark[clf_name]
+                    dataset_specs = BENCHMARK_DATASETS[benchmark_name]
+                    for dataset_spec in dataset_specs:
+                        dataset_id = dataset_spec["dataset_id"]
+                        started_at = time.perf_counter()
+                        try:
+                            x_train, x_test, y_test = load_dataset(
+                                dataset_spec,
+                                max_train_samples=args.max_train_samples,
+                                max_test_samples=args.max_test_samples,
+                            )
+                            clf = clf_factory()
+                            row, metric_results = evaluate_classifier_on_dataset(
+                                clf_name,
+                                clf,
+                                x_train,
+                                x_test,
+                                y_test,
+                                benchmark_name,
+                                dataset_id,
+                            )
+                            per_dataset_rows.append(row)
+                            run_per_dataset_rows.append(row)
+
+                            row_with_run = {**row, "run": run_number, "seed": run_seed}
+                            per_run_rows.append(row_with_run)
+                            run_per_run_rows.append(row_with_run)
+                            append_df_to_csv(pd.DataFrame([row]), per_dataset_path, index=False)
+
+                            elapsed_seconds = time.perf_counter() - started_at
+                            run_wandb_step += 1
+                            if run_wandb is not None and not _wandb_log_evaluation(
+                                run_wandb,
+                                run_wandb_step,
+                                row,
+                                run_number,
+                                run_seed,
+                                elapsed_seconds,
+                                status="success",
+                                metrics=metric_results,
+                            ):
+                                run_wandb = None
+
+                            runtime_row = {
+                                "run": run_number,
+                                "seed": run_seed,
+                                "benchmark": benchmark_name,
+                                "dataset_id": dataset_id,
+                                "clf_name": clf_name,
+                                "status": "success",
+                                "duration_sec": elapsed_seconds,
+                                "error_type": "",
+                                "error_message": "",
+                            }
+                            runtime_rows.append(runtime_row)
+                            run_runtime_rows.append(runtime_row)
+                            append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
+                            LOGGER.info(
+                                "[seed=%d][%s/%s] %s completed in %.3f sec",
+                                run_seed, benchmark_name, dataset_id, clf_name, elapsed_seconds,
+                            )
+                        except Exception:
+                            elapsed_seconds = time.perf_counter() - started_at
+                            error_type, error_message, _ = sys.exc_info()
+                            runtime_row = {
+                                "run": run_number,
+                                "seed": run_seed,
+                                "benchmark": benchmark_name,
+                                "dataset_id": dataset_id,
+                                "clf_name": clf_name,
+                                "status": "failed",
+                                "duration_sec": elapsed_seconds,
+                                "error_type": error_type.__name__ if error_type is not None else "Exception",
+                                "error_message": str(error_message) if error_message is not None else "",
+                            }
+                            runtime_rows.append(runtime_row)
+                            run_runtime_rows.append(runtime_row)
+                            append_df_to_csv(pd.DataFrame([runtime_row]), runtime_path, index=False)
+
+                            run_wandb_step += 1
+                            if run_wandb is not None and not _wandb_log_evaluation(
+                                run_wandb,
+                                run_wandb_step,
+                                {"auc_roc": np.nan, "auc_pr": np.nan, "f1": np.nan},
+                                run_number,
+                                run_seed,
+                                elapsed_seconds,
+                                status="failed",
+                                metrics=None,
+                            ):
+                                run_wandb = None
+
+                            failed_run = (run_number, run_seed, benchmark_name, dataset_id, clf_name)
+                            failed_runs.append(failed_run)
+                            run_failed_runs.append(failed_run)
+                            LOGGER.exception(
+                                "[seed=%d][%s/%s] %s failed",
+                                run_seed, benchmark_name, dataset_id, clf_name,
+                            )
+                finally:
+                    if run_wandb is not None:
+                        run_per_dataset_df = pd.DataFrame(run_per_dataset_rows)
+                        run_per_run_df = pd.DataFrame(run_per_run_rows)
+                        run_runtime_df = pd.DataFrame(run_runtime_rows)
+
+                        if not run_per_dataset_df.empty:
+                            run_macro_df = macro_average(run_per_dataset_df)
+                            run_per_dataset_summary_df = aggregate_mean_std(run_per_run_df, ["benchmark", "dataset_id", "clf_name"])
+                            run_per_run_macro_df = (
+                                run_per_run_df.groupby(["run", "benchmark", "clf_name"], as_index=False)[["auc_roc", "auc_pr", "f1"]]
+                                .mean()
+                            )
+                            run_macro_summary_df = aggregate_mean_std(run_per_run_macro_df, ["benchmark", "clf_name"])
+                        else:
+                            run_macro_df = pd.DataFrame(columns=["benchmark", "clf_name", "auc_roc", "auc_pr", "f1", "num_datasets"])
+                            run_per_dataset_summary_df = pd.DataFrame(columns=["benchmark", "dataset_id", "clf_name", "auc_roc_mean", "auc_roc_std", "auc_pr_mean", "auc_pr_std", "f1_mean", "f1_std", "num_runs"])
+                            run_macro_summary_df = pd.DataFrame(columns=["benchmark", "clf_name", "auc_roc_mean", "auc_roc_std", "auc_pr_mean", "auc_pr_std", "f1_mean", "f1_std", "num_runs"])
+
+                        if not _wandb_log_final_outputs(
+                            run_wandb,
+                            run_per_dataset_df,
+                            run_per_run_df,
+                            run_macro_df,
+                            run_per_dataset_summary_df,
+                            run_macro_summary_df,
+                            run_runtime_df,
+                            run_failed_runs,
+                            output_paths,
+                        ):
+                            run_wandb = None
+
+                    if run_wandb is not None:
+                        run_wandb.finish()
 
     set_round_context()
 
@@ -1041,7 +1374,7 @@ if __name__ == "__main__":
     append_df_to_csv(per_dataset_summary_df, per_dataset_summary_path, index=False)
 
     per_run_macro_df = (
-        per_run_df.groupby(["run", "benchmark", "clf_name"], as_index=False)[["auroc", "auprc", "f1"]]
+        per_run_df.groupby(["run", "benchmark", "clf_name"], as_index=False)[["auc_roc", "auc_pr", "f1"]]
         .mean()
     )
     macro_summary_df = aggregate_mean_std(per_run_macro_df, ["benchmark", "clf_name"])
@@ -1073,4 +1406,6 @@ if __name__ == "__main__":
             runtime_df.groupby("status", as_index=False).size().to_dict(orient="records"),
         )
     LOGGER.info("Appended per-dataset runtime metrics to %s", runtime_path)
+
+    runtime_df = pd.DataFrame(runtime_rows) if runtime_rows else pd.DataFrame()
 
