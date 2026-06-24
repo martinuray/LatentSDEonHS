@@ -9,6 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +18,11 @@ from sklearn.preprocessing import StandardScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 
 from core.models import (
     PathToGaussianDecoder,
@@ -28,6 +34,7 @@ from core.training import generic_train
 from data.ad_provider import ADProvider
 from data.nasa_provider import NASAProvider
 from data.qad_provider import QADProvider
+from data.tsb_ad_m_provider import TSBADMProvider
 from data.smd_provider import SMDProvider
 from data.psm_provider import PSMProvider
 from utils.scoring_functions import get_ts_eval
@@ -42,7 +49,7 @@ from utils.misc import (
 from utils.parser import generic_parser, get_partition_batch_size
 
 
-DATASET_CHOICES = ["SWaT", "WaDi", "SMD", "QAD", "MSL", "SMAP", "PSM"]
+DATASET_CHOICES = ["SWaT", "WaDi", "SMD", "QAD", "TSB-AD-M", "MSL", "SMAP", "PSM"]
 DEFAULT_CFG_DIR = Path("cfg") / "anomaly_detection"
 
 
@@ -130,6 +137,49 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "Each token accepts dataset_id (preferred) or zero-based trace index. "
             "Supports comma-separated values and repeated tokens."
         ),
+    )
+    group.add_argument(
+        "--wandb-project",
+        type=str,
+        default="latent-sde-on-hs-anomaly-detection",
+        help="Weights & Biases project name.",
+    )
+    group.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity / team name.",
+    )
+    group.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Optional explicit W&B run name. If omitted, a descriptive name is generated.",
+    )
+    group.add_argument(
+        "--wandb-group",
+        type=str,
+        default=None,
+        help="Optional W&B group name. Defaults to the selected dataset/model combination.",
+    )
+    group.add_argument(
+        "--wandb-tags",
+        nargs="*",
+        default=[],
+        help="Optional W&B tags.",
+    )
+    group.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B mode.",
+    )
+    group.add_argument(
+        "--wandb-disabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable W&B logging entirely.",
     )
     return parser
 
@@ -262,6 +312,7 @@ def train_one_dataset(
     writer,
     stats_prefix,
     experiment_id_str,
+    wandb_run=None,
 ):
     desired_t = torch.linspace(0, 1.00, num_timepoints, device=args.device).float()
     modules, optimizer, scheduler, elbo_loss = build_modules_and_optim(args, input_dim, desired_t)
@@ -303,6 +354,9 @@ def train_one_dataset(
         )
 
         val_loss = val_stats["loss"]
+        to_append = {"lr": scheduler.get_last_lr()[-1],
+                     "esc": es_counter,
+                     "sig": modules['pxz_net'].sigma.item()}
         if val_loss < (best_val_loss - args.early_stopping_min_delta):
             best_val_loss = val_loss
             best_stats = tst_stats
@@ -315,11 +369,11 @@ def train_one_dataset(
                 stats["tst"].append(tst_stats)
                 stats["val"].append(val_stats)
                 stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+                if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
+                    wandb_run = None
                 break
 
-        to_append = {"lr": scheduler.get_last_lr()[-1],
-                     "esc": es_counter,
-                     "sig": modules['pxz_net'].sigma.item()}
+        to_append["esc"] = es_counter
 
         stats["oth"].append(to_append)
         scheduler.step()
@@ -328,6 +382,8 @@ def train_one_dataset(
         stats["tst"].append(tst_stats)
         stats["val"].append(val_stats)
         stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+        if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
+            wandb_run = None
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
             ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
@@ -391,6 +447,178 @@ def aggregate_run_metrics(run_results):
 
     aggregated["num_runs"] = len(run_results)
     return aggregated
+
+
+def _wandb_is_available(args) -> bool:
+    return wandb is not None and not getattr(args, "wandb_disabled", False) and getattr(args, "wandb_mode", "online") != "disabled"
+
+
+def _wandb_json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _wandb_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_wandb_json_safe(item) for item in list(value)]
+    return value
+
+
+def _wandb_table_from_dataframe(df: pd.DataFrame):
+    if wandb is None:
+        return None
+    return wandb.Table(dataframe=df.reset_index(drop=True))
+
+
+def _wandb_summary_from_dataframe(df: pd.DataFrame, prefix: str, key_cols: list[str], metric_cols: list[str]):
+    summary = {}
+    for _, row in df.iterrows():
+        key_suffix = "/".join(str(row[col]) for col in key_cols if col in row and pd.notna(row[col]))
+        for metric in metric_cols:
+            value = row.get(metric)
+            if _is_numeric_scalar(value):
+                summary_key = f"{prefix}/{key_suffix}/{metric}" if key_suffix else f"{prefix}/{metric}"
+                summary[summary_key] = float(value)
+    return summary
+
+
+def _build_wandb_context(args, run_number: int, total_runs: int, run_seed: int):
+    benchmark_name = args.dataset if getattr(args, "trace_ids", None) is None else f"{args.dataset}:{','.join(args.trace_ids)}"
+    model_variant = "Sn" if getattr(args, "sphere_embedding", True) else "Rn"
+    return {
+        "benchmark_name": benchmark_name,
+        "model_variant": model_variant,
+        "run_number": run_number,
+        "total_runs": total_runs,
+        "run_seed": run_seed,
+    }
+
+
+def _wandb_init_run(args, experiment_id_str: str, runtime_context: dict, output_paths: dict[str, Path]):
+    if not _wandb_is_available(args):
+        if wandb is None:
+            logging.info("W&B logging disabled because wandb is not installed.")
+        else:
+            logging.info("W&B logging disabled via CLI.")
+        return None
+
+    try:
+        benchmark_name = runtime_context["benchmark_name"]
+        model_variant = runtime_context["model_variant"]
+        run_number = runtime_context["run_number"]
+        run_seed = runtime_context["run_seed"]
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_run_name = args.wandb_name or f"anomaly_detection__{benchmark_name}__{model_variant}__runs{args.runs}__seed{args.seed}__{timestamp}"
+        run_name = f"{base_run_name}__run{run_number:02d}_seed{run_seed}"
+        run_group = args.wandb_group or f"dataset={benchmark_name}__model={model_variant}"
+        tags = list(dict.fromkeys((args.wandb_tags or []) + [args.dataset, benchmark_name, model_variant, args.device]))
+
+        config = {
+            "args": _wandb_json_safe(vars(args)),
+            "run_context": runtime_context,
+            "output_paths": {name: str(path) for name, path in output_paths.items()},
+        }
+
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=run_group,
+            tags=tags,
+            mode=args.wandb_mode,
+            config=config,
+            reinit=True,
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("epoch/*", step_metric="epoch")
+        wandb.define_metric("summary/*", summary="last")
+        logging.info("Initialized W&B run: project=%s, name=%s, group=%s, mode=%s", args.wandb_project, run_name, run_group, args.wandb_mode)
+        return run
+    except Exception as exc:
+        logging.warning("W&B initialization failed; continuing without W&B logging: %s", exc, exc_info=True)
+        return None
+
+
+def _wandb_log_epoch(run, epoch: int, stats_prefix: str, trn_stats: dict, val_stats: dict | None, tst_stats: dict, oth_stats: dict):
+    if run is None:
+        return True
+
+    try:
+        metric_prefix = stats_prefix or "global"
+        payload = {"epoch": epoch}
+        for split_name, split_stats in (("trn", trn_stats), ("val", val_stats), ("tst", tst_stats), ("oth", oth_stats)):
+            if not split_stats:
+                continue
+            for key, value in split_stats.items():
+                if _is_numeric_scalar(value):
+                    payload[f"epoch/{metric_prefix}/{split_name}/{key}"] = float(value)
+        run.log(payload, step=epoch)
+        return True
+    except Exception as exc:
+        logging.warning("W&B epoch logging failed; disabling further W&B logging: %s", exc, exc_info=True)
+        return False
+
+
+def _wandb_build_per_dataset_table(final_metrics: dict):
+    if not isinstance(final_metrics, dict) or "per_dataset" not in final_metrics or not isinstance(final_metrics["per_dataset"], dict):
+        return pd.DataFrame()
+
+    rows = []
+    for dataset_id, metrics in final_metrics["per_dataset"].items():
+        row = {"dataset_id": dataset_id}
+        for key, value in metrics.items():
+            if _is_numeric_scalar(value):
+                row[key] = float(value)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _wandb_build_macro_table(final_metrics: dict):
+    if not isinstance(final_metrics, dict):
+        return pd.DataFrame()
+
+    row = {}
+    for key, value in final_metrics.items():
+        if key == "per_dataset":
+            continue
+        if _is_numeric_scalar(value):
+            row[key] = float(value)
+    return pd.DataFrame([row]) if row else pd.DataFrame()
+
+
+def _wandb_log_final_outputs(run, final_metrics: dict, output_paths: dict[str, Path]):
+    if run is None:
+        return True
+
+    try:
+        flat_metrics = _flatten_numeric_metrics(final_metrics)
+        for key, value in flat_metrics.items():
+            run.summary[f"summary/{key}"] = float(value)
+
+        per_dataset_df = _wandb_build_per_dataset_table(final_metrics)
+        macro_df = _wandb_build_macro_table(final_metrics)
+        payload = {}
+        if not per_dataset_df.empty:
+            payload["tables/per_dataset"] = _wandb_table_from_dataframe(per_dataset_df)
+            metric_cols = [col for col in per_dataset_df.columns if col != "dataset_id"]
+            run.summary.update(_wandb_summary_from_dataframe(per_dataset_df, "summary/per_dataset", ["dataset_id"], metric_cols))
+        if not macro_df.empty:
+            payload["tables/final_metrics"] = _wandb_table_from_dataframe(macro_df)
+        if payload:
+            run.log(payload)
+
+        artifact = wandb.Artifact(name=f"{run.name}-results".replace("=", "_").replace(":", "-"), type="results")
+        for path in output_paths.values():
+            if path is not None and path.exists():
+                artifact.add_file(str(path))
+        run.log_artifact(artifact)
+        return True
+    except Exception as exc:
+        logging.warning("Final W&B logging failed; continuing without W&B artifacts: %s", exc, exc_info=True)
+        return False
 
 
 def _normalize_trace_ids(trace_ids_arg):
@@ -561,7 +789,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
     return stats
 
 
-def start_experiment(args, provider=None, store_final_metrics=True):
+def start_experiment(args, provider=None, store_final_metrics=True, run_number: int = 1, total_runs: int = 1):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
     experiment_id_str = f'{experiment_log_file_string}_{experiment_id}'
@@ -570,6 +798,13 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         args.n_epochs = 1
 
     writer = SummaryWriter(f'runs/{experiment_id_str}')
+    log_txt_path = Path(args.log_dir) / f"{experiment_id_str}.txt" if args.log_dir is not None else None
+    log_json_path = Path(args.log_dir) / f"{experiment_id_str}.json" if args.log_dir is not None else None
+    runtime_context = _build_wandb_context(args, run_number=run_number, total_runs=total_runs, run_seed=args.seed)
+    output_paths = {
+        "log_txt": log_txt_path,
+        "log_json": log_json_path,
+    }
 
     set_up_logging(
         console_log_level=args.loglevel,
@@ -592,6 +827,8 @@ def start_experiment(args, provider=None, store_final_metrics=True):
         set_seed(args.seed)
     logging.debug(f"Seed set to {args.seed}")
     logging.debug(f'Parameters set: {vars(args)}')
+    wandb_run = _wandb_init_run(args, experiment_id_str, runtime_context, output_paths)
+    final_result = None
 
     def _store_final_metrics(final_metrics: dict):
         benchmark_name = args.dataset
@@ -641,6 +878,27 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
                 raw_subdir="qad_clean_txt_100Hz",
+            )
+        elif args.dataset == 'TSB-AD-M':
+            dataset_number = None
+            if args.trace_ids is not None:
+                try:
+                    dataset_number = [int(trace_id) for trace_id in args.trace_ids]
+                    if len(dataset_number) == 1:
+                        dataset_number = dataset_number[0]
+                except ValueError as exc:
+                    raise ValueError(
+                        f"--trace-ids for dataset {args.dataset} must be numeric file indices, got {args.trace_ids}"
+                    ) from exc
+            provider = TSBADMProvider(
+                data_dir=data_dir,
+                dataset_number=dataset_number,
+                window_length=args.data_window_length,
+                window_overlap=args.data_window_overlap,
+                seed=args.seed,
+                subsample=args.subsample,
+                fixed_subsample_mask=args.fixed_subsample_mask,
+                data_normalization_strategy=args.data_normalization_strategy,
             )
         elif args.dataset in ['SMAP', 'MSL']:
             provider = NASAProvider(
@@ -692,8 +950,8 @@ def start_experiment(args, provider=None, store_final_metrics=True):
 
                     try:
                         req_idx = int(requested_trace)
-                        if req_idx < 0 or req_idx >= active_provider.num_datasets:
-                            raise ValueError
+                        #if req_idx < 0 or req_idx >= active_provider.num_datasets:
+                        #    raise ValueError
                         resolved_indices.append(req_idx)
                     except ValueError:
                         unknown.append(requested_trace)
@@ -716,7 +974,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                     selected_indices,
                 )
 
-            for ds_idx in selected_indices:
+            for ds_idx, _ in enumerate(selected_indices):
                 trn_slice = DatasetSlice(active_provider._ds_trn, ds_idx)
                 tst_slice = DatasetSlice(active_provider._ds_tst, ds_idx)
                 val_slice = DatasetSlice(active_provider._ds_val, ds_idx)
@@ -762,6 +1020,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                     writer=writer,
                     stats_prefix=dataset_id,
                     experiment_id_str=experiment_id_str,
+                    wandb_run=wandb_run,
                 )
 
                 per_dataset_stats[dataset_id] = tst_stats
@@ -777,8 +1036,6 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                     stats=stats2pass,
                     args=args,
                 )
-                logging.shutdown()
-                writer.close()
                 if store_final_metrics:
                     _store_final_metrics(best_stats2pass)
                 logging.info(f"Final metrics for dataset trace {only_id}: {best_stats2pass}")
@@ -800,8 +1057,6 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             logging.info(f"Macro metrics across {active_provider.num_datasets} datasets: {macro_stats}")
             if store_final_metrics:
                 _store_final_metrics(combined_stats)
-            logging.shutdown()
-            writer.close()
             return combined_stats
 
         # Fallback path for providers without hybrid layout.
@@ -844,18 +1099,24 @@ def start_experiment(args, provider=None, store_final_metrics=True):
             writer=writer,
             stats_prefix="",
             experiment_id_str=experiment_id_str,
+            wandb_run=wandb_run,
         )
 
         finalstats2tensorboard(writer_=writer, params_=vars(args), stats=stats["tst"], args=args)
         if store_final_metrics:
             _store_final_metrics(tst_stats)
-        logging.shutdown()
-        writer.close()
         return tst_stats
 
     try:
-        return _run_with_provider(provider)
+        final_result = _run_with_provider(provider)
+        return final_result
     finally:
+        if wandb_run is not None:
+            if not _wandb_log_final_outputs(wandb_run, final_result or {}, output_paths):
+                wandb_run = None
+        if wandb_run is not None:
+            wandb_run.finish()
+        writer.close()
         if args.delete_processed_data:
             delete_processed_data(args.dataset, data_dir=data_dir)
         if provider is not None and hasattr(provider, "cleanup"):
@@ -863,6 +1124,7 @@ def start_experiment(args, provider=None, store_final_metrics=True):
                 provider.cleanup()
             except Exception as err:
                 logging.warning(f"Provider cleanup failed: {err}")
+        logging.shutdown()
 
 
 def evaluate(
@@ -980,6 +1242,8 @@ def delete_processed_data(dataset_name: str, data_dir: str = 'data_dir'):
         processed_dirs.append(os.path.join(data_dir, 'SMD', 'processed'))
     elif dataset_name == 'QAD':
         processed_dirs.append(os.path.join(data_dir, 'QAD', 'processed'))
+    elif dataset_name == 'TSB-AD-M':
+        processed_dirs.append(os.path.join(data_dir, 'TSB-AD-M', 'processed'))
     elif dataset_name in ['SMAP', 'MSL']:
         processed_dirs.append(os.path.join(data_dir, dataset_name, 'processed'))
     elif dataset_name == 'PSM':
@@ -1021,7 +1285,13 @@ def main():
     for run_idx in range(args_.runs):
         delete_processed_data(args_.dataset, data_dir=args_.data_dir)
         logging.info("Starting run %d/%d", run_idx + 1, args_.runs)
-        run_result = start_experiment(args_, provider=None, store_final_metrics=False)
+        run_result = start_experiment(
+            args_,
+            provider=None,
+            store_final_metrics=False,
+            run_number=run_idx + 1,
+            total_runs=args_.runs,
+        )
         run_results.append(run_result)
 
     aggregated_metrics = aggregate_run_metrics(run_results)

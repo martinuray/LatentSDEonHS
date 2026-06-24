@@ -460,7 +460,7 @@ def _wandb_log_final_outputs(run, per_dataset_df, per_run_df, macro_df, per_data
 
         run.log({name: _wandb_table_from_dataframe(df) for name, df in tables.items() if df is not None})
 
-        artifact = wandb.Artifact(name=f"{run.name}-results".replace("=", "_"), type="results")
+        artifact = wandb.Artifact(name=f"{run.name}-results".replace("=", "_").replace(":", "-"), type="results")
         for path in output_paths.values():
             if path.exists():
                 artifact.add_file(str(path))
