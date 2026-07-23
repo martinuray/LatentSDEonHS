@@ -5,6 +5,7 @@
     NeurIPS 2023
 """
 
+import logging
 import math
 import numpy as np
 from typing import Tuple, Callable, Optional
@@ -28,7 +29,6 @@ from torch.distributions import (
 
 from core.power_spherical.distributions import PowerSpherical, HypersphericalUniform
 from core.pathdistribution import SOnPathDistribution, BrownianMotionOnSphere, PathDistribution, GLnPathDistribution
-from core.sde_solvers import geometric_euler
 from utils.misc import scatter_obs_and_msk
 
 
@@ -526,13 +526,12 @@ class SOnPathDistributionEncoder(nn.Module):
             time points {t_1,...,t_T} to corresponding K_t's (i.e., 
             the drift in the Lie algebra so(n), see paper).
         learnable_prior (bool, optional): If set to True, the prior 
-            path distribution is learned. In particular, this is  
-            implemented by updating an nn.Parameter that encodes a 
-            representation passed through the time function (time_fn).
-            Defaults to False.
-        in_dim (int, optional): Dimension of the input dimension expected 
+            path distribution is learned. Defaults to False.
+        in_dim (int, optional): Dimension of the input dimension expected
             by the time function (time_fn); only used if learnable_prior=True. 
             Defaults to 32.
+        sde (bool, optional): If True, use the full SDE solver (with noise).
+            If False, use ODE mode (no noise). Defaults to True.
     """
 
     def __init__(
@@ -542,6 +541,7 @@ class SOnPathDistributionEncoder(nn.Module):
         time_fn: nn.Module,
         learnable_prior: bool = False,
         in_dim: int = 32,
+        sde: bool = True,
     ) -> None:
         super().__init__()
         self._loc_map = loc_map
@@ -550,6 +550,11 @@ class SOnPathDistributionEncoder(nn.Module):
         self._sigma = nn.Parameter(torch.tensor(0.1))
         self._learnable_prior = learnable_prior
         self.in_dim = in_dim
+        self._sde = sde
+        if self._sde:
+            logging.info("Using SDE solver")
+        else:
+            logging.info("Using ODE solver.")
         if learnable_prior:
             self.prior_h = nn.Parameter(torch.randn(1, in_dim))
 
@@ -575,27 +580,30 @@ class SOnPathDistributionEncoder(nn.Module):
         scl = self._scl_map(h)        
         scl = scl.square() * 100.0
         scl = torch.minimum(scl, torch.tensor(50000.0, device=scl.device))
-        p0 = PowerSpherical(F.normalize(loc), scl.squeeze(dim=1))
+        scl = torch.maximum(scl, torch.tensor(1e-7, device=scl.device))
+        scl = scl.expand_as(loc)
+        p0 = torch.distributions.MultivariateNormal(loc, torch.diag_embed(scl.squeeze(dim=1)))
 
         def K(arg_t: Tensor) -> Tensor: return self._time_fn(h, arg_t)
-        posterior = SOnPathDistribution(p0, K, self._sigma, t)
+        posterior = SOnPathDistribution(p0, K, self._sigma, t, sde=self._sde)
 
         if self._learnable_prior:
             prior_p0 = HypersphericalUniform(loc.shape[1], h.device, h.dtype)
-            def prior_K(arg_t: Tensor) -> Tensor: 
+            def prior_K(arg_t: Tensor) -> Tensor:
                 return self._time_fn(self.prior_h, arg_t)
-            prior = SOnPathDistribution(prior_p0, prior_K, self._sigma, t)
+            prior = SOnPathDistribution(prior_p0, prior_K, self._sigma, t, sde=self._sde)
         else:
-            prior = BrownianMotionOnSphere(loc.shape[-1], self._sigma, t)
+            prior = BrownianMotionOnSphere(loc.shape[-1], self._sigma, t, sde=self._sde)
         return posterior, prior
 
 
 class PendulumRecogNetwork(nn.Module):
-    """_summary_
+    """Recognition network for the pendulum experiment.
 
     Args:
-        h_dim (int, optional): _description_. Defaults to 32.
-        mtan_input_dim (int, optional): _description Defaults to 32.
+        h_dim (int, optional): Hidden dimension. Defaults to 32.
+        mtan_input_dim (int, optional): mTAN input dimension. Defaults to 32.
+        use_atanh (bool, optional): Whether to apply atanh. Defaults to False.
     """
 
     def __init__(
@@ -1102,27 +1110,30 @@ def default_SOnPathDistributionEncoder(
     learnable_prior: bool = False,
     time_min: float = 0.0,
     time_max: float = 1.0,
+    sde: bool = True,
 ) -> SOnPathDistributionEncoder:
-    """Implements the default SOnPathDistributionEncoder encoder we use 
-    throughout all experiments, where the time function is parametrized 
-    via Chebyshev polynomials and the modules that map representations to 
-    the location and concentration parameter of the power spherical 
+    """Implements the default SOnPathDistributionEncoder encoder we use
+    throughout all experiments, where the time function is parametrized
+    via Chebyshev polynomials and the modules that map representations to
+    the location and concentration parameter of the power spherical
     distribution are affine maps (i.e., nn.Linear).
 
     Args:
-        h_dim (int): Dimension of the representations from which the 
+        h_dim (int): Dimension of the representations from which the
             PathDistribution objects are produced.
         z_dim (int): Desired dimensionality of the latent space.
-        n_deg (int): Max. degree of Chebyshev polynomials used to 
+        n_deg (int): Max. degree of Chebyshev polynomials used to
             parametrize the time function.
-        learnable_prior (bool, optional): If set to True, a learnable 
+        learnable_prior (bool, optional): If set to True, a learnable
             prior path distribution is used. Defaults to False.
-        time_min (float, optional): Left side of the interval 
-            [time_min, time_max] on which the Chebyshev polynomials are 
+        time_min (float, optional): Left side of the interval
+            [time_min, time_max] on which the Chebyshev polynomials are
             defined. Defaults to 0.0.
-        time_max (float, optional): Right side of the interval 
-            [time_min, time_max] on which the Chebyshev polynomials are 
+        time_max (float, optional): Right side of the interval
+            [time_min, time_max] on which the Chebyshev polynomials are
             defined. Defaults to 1.0.
+        sde (bool, optional): If True, use the full SDE solver (with noise).
+            Defaults to True.
 
     Returns:
         SOnPathDistributionEncoder: Parametrized SOnPathDistributionEncoder
@@ -1133,18 +1144,18 @@ def default_SOnPathDistributionEncoder(
     scl_map = nn.Linear(h_dim, 1)
     time_fn = Chebyshev(h_dim, n_deg, group_dim, time_min=time_min, time_max=time_max)
     return SOnPathDistributionEncoder(
-        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim
+        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim, sde=sde
     )
 
 
 class ActivityRecogNetwork(nn.Module):
-    """Implementation of the recognition network used in the human 
+    """Implementation of the recognition network used in the human
     activity recognition experiment.
 
         Args:
-            mtan_input_dim (int, optional): _description_. Defaults to 32.
-            mtan_hidden_dim (int, optional): _description_. Defaults to 32.
-            use_atanh (bool, optional): _description_. Defaults to False.
+            mtan_input_dim (int, optional): _description. Defaults to 32.
+            mtan_hidden_dim (int, optional): _description. Defaults to 32.
+            use_atanh (bool, optional): _description. Defaults to False.
     """
 
     def __init__(
@@ -1283,22 +1294,13 @@ class GLnPathDistributionEncoder(nn.Module):
     distribution in GL(n).
 
     Args:
-        loc_map (nn.Module): Module mapping to the location parameter
-            of the power spherical distribution of initial SDE states.
-        scl_map (nn.Module): Module mapping to the concentration/scale
-            parameter of the power spherical distribution of initial
-            SDE states.
-        time_fn (nn.Module): Module mapping representations and given
-            time points {t_1,...,t_T} to corresponding K_t's (i.e.,
-            the drift in the Lie algebra so(n), see paper).
-        learnable_prior (bool, optional): If set to True, the prior
-            path distribution is learned. In particular, this is
-            implemented by updating an nn.Parameter that encodes a
-            representation passed through the time function (time_fn).
-            Defaults to False.
-        in_dim (int, optional): Dimension of the input dimension expected
-            by the time function (time_fn); only used if learnable_prior=True.
-            Defaults to 32.
+        loc_map (nn.Module): Module mapping to the location parameter.
+        scl_map (nn.Module): Module mapping to the scale parameter.
+        time_fn (nn.Module): Module mapping representations and time points to K_t's.
+        learnable_prior (bool, optional): If True, use a learnable prior. Defaults to False.
+        in_dim (int, optional): Input dimension for the time function. Defaults to 32.
+        sde (bool, optional): If True, use the full SDE solver (with noise).
+            If False, use ODE mode (no noise). Defaults to True.
     """
 
     def __init__(
@@ -1308,6 +1310,7 @@ class GLnPathDistributionEncoder(nn.Module):
         time_fn: nn.Module,
         learnable_prior: bool = False,
         in_dim: int = 32,
+        sde: bool = True,
     ) -> None:
         super().__init__()
         self._loc_map = loc_map
@@ -1316,17 +1319,23 @@ class GLnPathDistributionEncoder(nn.Module):
         self._sigma = nn.Parameter(torch.tensor(0.1))
         self._learnable_prior = learnable_prior
         self.in_dim = in_dim
+        self._sde = sde
+        if self._sde:
+            logging.info("Using SDE solver")
+        else:
+            logging.info("Using ODE solver.")
+
         if learnable_prior:
             self.prior_h = nn.Parameter(torch.randn(1, in_dim))
         else:
             self.prior_h = nn.Parameter(torch.randn(1, in_dim))
             self._prior_time_fn = zeroChebyshev(
-                    input_dim=self._time_fn.input_dim,
-                    degree=self._time_fn.degree,
-                    out_dim=self._time_fn.out_dim,
-                    time_min=self._time_fn.time_min,
-                    time_max=self._time_fn.time_max
-                )
+                input_dim=self._time_fn.input_dim,
+                degree=self._time_fn.degree,
+                out_dim=self._time_fn.out_dim,
+                time_min=self._time_fn.time_min,
+                time_max=self._time_fn.time_max
+            )
 
     def extra_repr(self) -> str:
         return f"learnable prior={self._learnable_prior}"
@@ -1354,20 +1363,21 @@ class GLnPathDistributionEncoder(nn.Module):
         p0 = torch.distributions.MultivariateNormal(loc, torch.diag_embed(scl.squeeze(dim=1)))
 
         def K(arg_t: Tensor) -> Tensor: return self._time_fn(h, arg_t)
-        posterior = GLnPathDistribution(p0, K, self._sigma, t)
+        posterior = GLnPathDistribution(p0, K, self._sigma, t, sde=self._sde)
 
         prior_p0 = torch.distributions.MultivariateNormal(
-                torch.zeros_like(loc),
-                torch.diag_embed(torch.ones_like(scl.squeeze(dim=1)))
-                )
+            torch.zeros_like(loc),
+            torch.diag_embed(torch.ones_like(scl.squeeze(dim=1)))
+        )
         if self._learnable_prior:
             def prior_K(arg_t: Tensor) -> Tensor:
                 return self._time_fn(self.prior_h, arg_t)
         else:
             def prior_K(arg_t: Tensor) -> Tensor:
                 return self._prior_time_fn(self.prior_h, arg_t)
-        prior = GLnPathDistribution(prior_p0, prior_K, self._sigma, t)
+        prior = GLnPathDistribution(prior_p0, prior_K, self._sigma, t, sde=self._sde)
         return posterior, prior
+
 
 def default_GLnPathDistributionEncoder(
     h_dim: int,
@@ -1376,30 +1386,25 @@ def default_GLnPathDistributionEncoder(
     learnable_prior: bool = False,
     time_min: float = 0.0,
     time_max: float = 1.0,
+    sde: bool = True,
 ) -> GLnPathDistributionEncoder:
-    """Implements the default SOnPathDistributionEncoder encoder we use
+    """Implements the default GLnPathDistributionEncoder encoder we use
     throughout all experiments, where the time function is parametrized
     via Chebyshev polynomials and the modules that map representations to
-    the location and concentration parameter of the power spherical
-    distribution are affine maps (i.e., nn.Linear).
+    the location and concentration parameter of the normal distribution
+    are affine maps (i.e., nn.Linear).
 
     Args:
-        h_dim (int): Dimension of the representations from which the
-            PathDistribution objects are produced.
+        h_dim (int): Dimension of the representations.
         z_dim (int): Desired dimensionality of the latent space.
-        n_deg (int): Max. degree of Chebyshev polynomials used to
-            parametrize the time function.
-        learnable_prior (bool, optional): If set to True, a learnable
-            prior path distribution is used. Defaults to False.
-        time_min (float, optional): Left side of the interval
-            [time_min, time_max] on which the Chebyshev polynomials are
-            defined. Defaults to 0.0.
-        time_max (float, optional): Right side of the interval
-            [time_min, time_max] on which the Chebyshev polynomials are
-            defined. Defaults to 1.0.
+        n_deg (int): Max. degree of Chebyshev polynomials.
+        learnable_prior (bool, optional): Use a learnable prior. Defaults to False.
+        time_min (float, optional): Left bound of the Chebyshev interval. Defaults to 0.0.
+        time_max (float, optional): Right bound of the Chebyshev interval. Defaults to 1.0.
+        sde (bool, optional): If True, use the full SDE solver (with noise). Defaults to True.
 
     Returns:
-        SOnPathDistributionEncoder: Parametrized SOnPathDistributionEncoder
+        GLnPathDistributionEncoder: Parametrized GLnPathDistributionEncoder
     """
     group_dim = int(z_dim * z_dim)
 
@@ -1407,5 +1412,5 @@ def default_GLnPathDistributionEncoder(
     scl_map = nn.Linear(h_dim, 1)
     time_fn = Chebyshev(h_dim, n_deg, group_dim, time_min=time_min, time_max=time_max)
     return GLnPathDistributionEncoder(
-        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim
+        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim, sde=sde
     )

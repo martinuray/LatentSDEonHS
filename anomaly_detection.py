@@ -128,6 +128,12 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Use SOn path-distribution encoder (sphere embedding). Disable to use GLn encoder.",
     )
     group.add_argument(
+        "--sde",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("Using SDE, or if not, ODE."),
+    )
+    group.add_argument(
         "--trace-ids",
         type=str,
         nargs="+",
@@ -268,6 +274,7 @@ def build_modules_and_optim(args, input_dim, desired_t):
             learnable_prior=args.learnable_prior,
             time_min=0.0,
             time_max=2.0 * desired_t[-1].item(),
+            sde=args.sde,
         )
         logging.debug("Using default_SOnPathDistributionEncoder (sphere embedding)")
     else:
@@ -278,6 +285,7 @@ def build_modules_and_optim(args, input_dim, desired_t):
             learnable_prior=args.learnable_prior,
             time_min=0.0,
             time_max=2.0 * desired_t[-1].item(),
+            sde=args.sde,
         )
         logging.debug("Using default_GLnPathDistributionEncoder")
 

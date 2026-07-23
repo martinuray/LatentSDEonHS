@@ -39,6 +39,9 @@ class PathDistribution(Distribution):
             Validate argument constraints. Defaults to False.
         solver (Callable):
             SDE solver to use. Defaults to core.sde_solvers.geometric_euler.
+        sde (bool):
+            Whether the SDE is stochastic or deterministic.
+            Defaults to True.
     """
 
     arg_constraints = {
@@ -55,7 +58,8 @@ class PathDistribution(Distribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Callable = geometric_euler,
+        sde: bool = True,
         ) -> None:
 
         assert p0.sample().device == sigma.device == t.device, 'Device mismatch'
@@ -72,6 +76,7 @@ class PathDistribution(Distribution):
         self.kl_samples = kl_samples
         self.group_dim, self.basis = self._generate_basis()
         self._solver = solver
+        self.sde = sde
 
     @property
     def t(self) -> Tensor:
@@ -113,7 +118,7 @@ class PathDistribution(Distribution):
     def _integrate(self, z0: Tensor) -> Tensor:
         """Integrates the SDE forward, starting at the initial value z0.
         """
-        return self._solver(z0, self.Kt, self.sigma, self.dt, self.basis)
+        return self._solver(z0, self.Kt, self.sigma, self.dt, self.basis, self.sde)
 
     def rsample(self, sample_shape: torch.Size = torch.Size()) -> Tensor:
         """Draw sample from path distribution.
@@ -166,6 +171,9 @@ class SOnPathDistribution(PathDistribution):
             Validate argument constraints. Defaults to False.
         solver (Callable):
             SDE solver to use. Defaults to core.sde_solvers.geometric_euler.
+        sde (bool):
+            Whether the SDE is stochastic or deterministic.
+            Defaults to True.
 
     Example:
         location = torch.rand(5, 3)
@@ -192,9 +200,10 @@ class SOnPathDistribution(PathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Callable = geometric_euler,
+        sde: bool = True,
         ) -> None:
-        super().__init__(p0, K ,sigma, t, validate_args, kl_samples, solver)
+        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver, sde)
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         """Generates the basis of so(n) that consists of the matrices e_i * e_j^T e_j * e_i^T.
@@ -216,14 +225,15 @@ class BrownianMotionOnSphere(SOnPathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Callable = geometric_euler,
+        sde: bool = True,
         ) -> None:
 
         p0 = HypersphericalUniform(dim, device=sigma.device, validate_args=validate_args)
         group_dim = int(dim*(dim-1)/2)
         def K(tt: Tensor): 
             return torch.zeros(len(tt), group_dim, device=sigma.device)
-        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver)
+        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver, sde)
 
 
 @register_kl(HypersphericalUniform, HypersphericalUniform)
@@ -267,6 +277,9 @@ class GLnPathDistribution(PathDistribution):
                 Validate argument constraints. Defaults to False.
             solver (Callable):
                 SDE solver to use. Defaults to core.sde_solvers.geometric_euler.
+            sde (bool):
+                Whether the SDE is stochastic or deterministic.
+                Defaults to True.
     """
 
     arg_constraints = {
@@ -283,9 +296,10 @@ class GLnPathDistribution(PathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Callable = geometric_euler,
+        sde: bool = True,
         ) -> None:
-        super(GLnPathDistribution, self).__init__(p0, K ,sigma, t, validate_args, kl_samples, solver)
+        super(GLnPathDistribution, self).__init__(p0, K, sigma, t, validate_args, kl_samples, solver, sde)
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         group_dim = self.dim * self.dim

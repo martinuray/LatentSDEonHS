@@ -3,7 +3,7 @@
 import torch
 from utils.misc import vec_to_matrix
 
-def geometric_euler(z0, drift, cov, dt, basis):    
+def geometric_euler(z0, drift, cov, dt, basis, sde=True):
     noise = torch.randn(z0.shape[:-2]+drift.shape, device=z0.device)
     if cov.numel() == 1:
         noise = noise * cov
@@ -12,7 +12,12 @@ def geometric_euler(z0, drift, cov, dt, basis):
     
     noise = torch.einsum('...td, t -> ...td', noise, dt.sqrt())
     drift = torch.einsum('...td, t -> ...td', drift, dt)
-    omegas = drift + noise
+
+    if sde:
+        omegas = drift + noise
+    else:
+        omegas = drift
+
     omegas = vec_to_matrix(omegas, basis)
 
     Qs = torch.matrix_exp(omegas.contiguous())
