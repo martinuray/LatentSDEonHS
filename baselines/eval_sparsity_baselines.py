@@ -25,6 +25,7 @@ Flexibility
 * ``--classifiers`` comma-separated list, or ``all``
 * ``--subsamples``  comma-separated fractions to *keep*, e.g. ``0.1,0.3,0.5,0.9``
 * ``--num-seeds``   how many repeated seeds to try per subsample level
+* ``--interp``      interpolation strategy: ``linear`` (default), ``spline``, ``forward_fill``
 
 Usage examples
 --------------
@@ -57,6 +58,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.interpolate import CubicSpline
 
 import warnings
 np.seterr(all='ignore')
@@ -94,15 +96,36 @@ DEFAULT_NUM_SEEDS = 5
 # Burst-mask based interpolation
 # ---------------------------------------------------------------------------
 
-def _interpolate_masked_values(x: np.ndarray, keep_mask: np.ndarray) -> np.ndarray:
-    """Linearly interpolate masked time points per feature.
+INTERP_METHODS = ("linear", "spline", "forward_fill")
 
-    ``keep_mask`` marks available points. Missing interior points are linearly
-    interpolated, while edge segments are filled with the nearest available
-    value.
+
+def _interpolate_masked_values(
+    x: np.ndarray,
+    keep_mask: np.ndarray,
+    method: str = "linear",
+) -> np.ndarray:
+    """Interpolate masked time points per feature using the chosen strategy.
+
+    Parameters
+    ----------
+    x:
+        Original data array of shape ``(n_time, n_features)``.
+    keep_mask:
+        Boolean array of shape ``(n_features, n_time)`` where ``True`` = observed.
+    method:
+        One of ``"linear"``, ``"spline"``, or ``"forward_fill"``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of the same shape as ``x`` with missing values filled.
     """
+    if method not in INTERP_METHODS:
+        raise ValueError(f"Unknown interpolation method '{method}'. Choose from {INTERP_METHODS}.")
+
     x_interp = np.array(x, copy=True)
     n_features = x_interp.shape[1]
+
     for feat in range(n_features):
         feat_keep = keep_mask[feat]
         masked_idx = np.flatnonzero(~feat_keep)
@@ -115,7 +138,26 @@ def _interpolate_masked_values(x: np.ndarray, keep_mask: np.ndarray) -> np.ndarr
             continue
 
         vals = x_interp[:, feat]
-        x_interp[masked_idx, feat] = np.interp(masked_idx, keep_idx, vals[keep_idx])
+
+        if method == "linear":
+            x_interp[masked_idx, feat] = np.interp(masked_idx, keep_idx, vals[keep_idx])
+
+        elif method == "spline":
+            # CubicSpline needs at least 4 knots; fall back to linear for small sets.
+            if keep_idx.size >= 4:
+                cs = CubicSpline(keep_idx, vals[keep_idx], extrapolate=True)
+                x_interp[masked_idx, feat] = cs(masked_idx)
+            else:
+                x_interp[masked_idx, feat] = np.interp(masked_idx, keep_idx, vals[keep_idx])
+
+        elif method == "forward_fill":
+            # Fill each missing position with the last observed value to its left;
+            # for leading gaps (no prior observation) use the first observed value.
+            first_obs_val = vals[keep_idx[0]]
+            for idx in masked_idx:
+                prior = keep_idx[keep_idx < idx]
+                x_interp[idx, feat] = vals[prior[-1]] if prior.size > 0 else first_obs_val
+
     return x_interp
 
 
@@ -123,6 +165,7 @@ def apply_burst_sparsity(
     x_train: np.ndarray,
     subsample: float,
     seed: int | None = None,
+    interp_method: str = "linear",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply burst masking and interpolate masked values in ``x_train``.
 
@@ -134,6 +177,9 @@ def apply_burst_sparsity(
         Fraction of time-steps to **keep** (0 < subsample <= 1).
     seed:
         Optional RNG seed for reproducibility.
+    interp_method:
+        Interpolation strategy for masked values. One of ``"linear"``,
+        ``"spline"``, or ``"forward_fill"``.
 
     Returns
     -------
@@ -180,12 +226,13 @@ def apply_burst_sparsity(
     finally:
         np.random.set_state(rng_state)
 
-    x_interp = _interpolate_masked_values(x_train, keep_mask)
+    x_interp = _interpolate_masked_values(x_train, keep_mask, method=interp_method)
     n_kept = int(keep_mask.sum())
     n_total = int(keep_mask.size)
     LOGGER.info(
-        "Burst sparsity applied: subsample=%.3f -> kept %d / %d values (%.1f%%), masked values interpolated",
+        "Burst sparsity applied: subsample=%.3f, interp=%s -> kept %d / %d values (%.1f%%)",
         subsample,
+        interp_method,
         n_kept,
         n_total,
         100.0 * n_kept / n_total,
@@ -298,12 +345,14 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                     x_train_full,
                     subsample=subsample,
                     seed=mask_seed,
+                    interp_method=args.interp,
                 )
 
                 x_test_sparse, keep_mask_test = apply_burst_sparsity(
                     x_test_full,
                     subsample=subsample,
                     seed=mask_seed,
+                    interp_method=args.interp,
                 )
 
                 clf = clf_factory()
@@ -319,6 +368,7 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                 rows.append({
                     **result,
                     "subsample": subsample,
+                    "interp_method": args.interp,
                     "seed_idx": seed_idx,
                     "run_seed": run_seed,
                     "n_train_full": x_train_full.shape[0],
@@ -632,6 +682,19 @@ def parse_args():
         help="Base random seed; run i uses seed_base + i.",
     )
 
+    # Interpolation strategy
+    parser.add_argument(
+        "--interp",
+        choices=list(INTERP_METHODS),
+        default="linear",
+        help=(
+            "Interpolation strategy used to fill burst-masked values. "
+            "'linear': piecewise linear (default); "
+            "'spline': cubic spline (falls back to linear when < 4 knots); "
+            "'forward_fill': last-observation-carried-forward (LOCF)."
+        ),
+    )
+
     # Data caps
     parser.add_argument(
         "--max-train-samples",
@@ -687,10 +750,11 @@ def main():
         args.classifiers,
     )
     LOGGER.info(
-        "subsamples=%s | num_seeds=%d | seed_base=%d",
+        "subsamples=%s | num_seeds=%d | seed_base=%d | interp=%s",
         subsamples,
         args.num_seeds,
         args.seed_base,
+        args.interp,
     )
     total = _total_tasks(args.num_seeds, subsamples)
     LOGGER.info("Total tasks (seeds × subsamples): %d", total)
