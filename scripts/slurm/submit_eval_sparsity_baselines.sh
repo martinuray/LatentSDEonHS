@@ -3,44 +3,55 @@
 ################################################################################
 # SLURM Script: Run baselines/eval_sparsity_baselines.py in parallel
 #
-# Submits one SLURM array job (NUM_SEEDS × NUM_SUBSAMPLES tasks).
-# Each task evaluates one (seed, subsample) pair and writes a JSON.
-# A second job (depends on the array finishing) aggregates the results.
+# Sweeps over:
+#   - benchmarks:      QAD, PSM
+#   - interpolation:   linear, spline (cubic spline)
+#   - classifiers:     IForest, KNN, LOF (CPU only)
+#                       USAD, TcnED, DeepIF (GPU)
 #
-# All tasks run on CPU only (no GPU requested).
+# Each classifier runs as its own independent SLURM array job (25 tasks =
+# 5 seeds x 5 sparsity levels), writing into its own results directory.
+# Aggregation is handled independently elsewhere and is not submitted here.
+#
+# In total this submits 2 benchmarks x 2 interps x 6 classifiers =
+# 24 SLURM array jobs.
 #
 # Usage:
-#   ./scripts/slurm/submit_eval_sparsity_baselines.sh [BENCHMARK] [CLASSIFIERS] [RESULTS_DIR]
-# Examples:
+#   ./scripts/slurm/submit_eval_sparsity_baselines.sh [RESULTS_BASE_DIR]
+# Example:
 #   ./scripts/slurm/submit_eval_sparsity_baselines.sh
-#       → default: QAD, KNN, out/sparsity_baselines_QAD_KNN
-#   ./scripts/slurm/submit_eval_sparsity_baselines.sh SMD "KNN,IForest" out/sparsity_baselines_SMD
+#       -> out/sparsity_baselines_QAD_linear_IForest, out/sparsity_baselines_QAD_linear_KNN, ...
+#   ./scripts/slurm/submit_eval_sparsity_baselines.sh out/my_sparsity_sweep
 ################################################################################
 
 set -euo pipefail
 
 # ---- Configuration ----
 PARTITION="gtx1080ti"
-TIMEOUT="4:00:00"       # each single task finishes in minutes for most classifiers
+CPU_TIMEOUT="3:00:00"     # IForest / KNN / LOF are cheap but KNN/LOF can be slow on large traces
+GPU_TIMEOUT="6:00:00"     # USAD / TcnED / DeepIF are deep models; allow more headroom
 NUM_CPUS=4
 NUM_GPUS=1
-MEMORY="16GB"
+CPU_MEMORY="16GB"
+GPU_MEMORY="24GB"
 
-# Defaults: QAD benchmark, KNN classifier, CPU only
-BENCHMARK="${1:-QAD}"
-CLASSIFIERS="${2:-KNN}"
-RESULTS_DIR="${3:-out/sparsity_baselines_${BENCHMARK}_${CLASSIFIERS}}"
+BENCHMARKS=(QAD PSM)
+INTERPS=(linear spline)
 
-# Subsample grid (12 levels) and number of seeds → 60 total tasks (0-based: 0..59)
-NUM_SUBSAMPLES=12
+CPU_CLASSIFIERS=(IForest KNN LOF)
+GPU_CLASSIFIERS=(USAD TcnED DeepIF)
+
+# Sparsity grid (5 levels) and number of seeds -> 25 tasks per (benchmark, interp, classifier)
+SUBSAMPLES="0.001,0.01,0.05,0.1,0.2"
+NUM_SUBSAMPLES=5
 NUM_SEEDS=5
 NUM_TASKS=$(( NUM_SEEDS * NUM_SUBSAMPLES - 1 ))   # 0-based upper bound
 
-SUBSAMPLES="0.001,0.01,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"
+RESULTS_BASE_DIR="${1:-out/sparsity_baselines}"
 
 PROJECT_DIR="/home2/muray/Code/LatentSDEonHS"
 LOG_DIR="${PROJECT_DIR}/slurm_logs_sparsity_baselines"
-mkdir -p "${LOG_DIR}" "${RESULTS_DIR}"
+mkdir -p "${LOG_DIR}"
 
 # ---- Initialize conda ----
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -48,48 +59,65 @@ conda activate baseline-latent
 
 cd "${PROJECT_DIR}"
 
-# ---- Submit the array job ----
-ARRAY_JOB_ID=$(sbatch \
-    --partition="${PARTITION}" \
-    --time="${TIMEOUT}" \
-    --cpus-per-task="${NUM_CPUS}" \
-    --mem="${MEMORY}" \
-    --gpus="${NUM_GPUS}" \
-    --job-name="sparsity_bl_${BENCHMARK}" \
-    --output="${LOG_DIR}/sparsity_bl_${BENCHMARK}_%A_%a.log" \
-    --error="${LOG_DIR}/sparsity_bl_${BENCHMARK}_%A_%a.log" \
-    --array="0-${NUM_TASKS}" \
-    --wrap="python baselines/eval_sparsity_baselines.py \
-        --mode single \
-        --task-id \${SLURM_ARRAY_TASK_ID} \
-        --benchmark ${BENCHMARK} \
-        --classifiers ${CLASSIFIERS} \
-        --subsamples '${SUBSAMPLES}' \
-        --num-seeds ${NUM_SEEDS} \
-        --results-dir ${RESULTS_DIR}" \
-    --parsable)
+submit_classifier_jobs () {
+    local benchmark="$1"
+    local interp="$2"
+    local classifier="$3"
+    local device_group="$4"   # "cpu" or "gpu"
 
-echo "Submitted array job: ${ARRAY_JOB_ID}  (tasks 0-${NUM_TASKS})"
+    local results_dir="${RESULTS_BASE_DIR}_${benchmark}_${interp}_${classifier}"
+    mkdir -p "${results_dir}"
 
-# ---- Submit aggregation job (runs after all array tasks succeed) ----
-AGG_JOB_ID=$(sbatch \
-    --partition="${PARTITION}" \
-    --time="00:30:00" \
-    --cpus-per-task=2 \
-    --mem="8GB" \
-    --job-name="sparsity_bl_agg_${BENCHMARK}" \
-    --output="${LOG_DIR}/sparsity_bl_agg_${BENCHMARK}_%j.log" \
-    --error="${LOG_DIR}/sparsity_bl_agg_${BENCHMARK}_%j.log" \
-    --dependency="afterok:${ARRAY_JOB_ID}" \
-    --wrap="python baselines/eval_sparsity_baselines.py \
-        --mode aggregate \
-        --benchmark ${BENCHMARK} \
-        --results-dir ${RESULTS_DIR}" \
-    --parsable)
+    local timeout mem gpus gpu_id_flag
+    if [[ "${device_group}" == "gpu" ]]; then
+        timeout="${GPU_TIMEOUT}"
+        mem="${GPU_MEMORY}"
+        gpus="${NUM_GPUS}"
+        gpu_id_flag="--gpu-id 0"
+    else
+        timeout="${CPU_TIMEOUT}"
+        mem="${CPU_MEMORY}"
+        gpus=0
+        gpu_id_flag=""
+    fi
 
-echo "Submitted aggregation job: ${AGG_JOB_ID}  (depends on ${ARRAY_JOB_ID})"
-echo ""
-echo "Monitor array:       squeue -j ${ARRAY_JOB_ID}"
-echo "Monitor aggregation: squeue -j ${AGG_JOB_ID}"
-echo "Results will be in:  ${RESULTS_DIR}/"
+    local array_job_id
+    array_job_id=$(sbatch \
+        --partition="${PARTITION}" \
+        --time="${timeout}" \
+        --cpus-per-task="${NUM_CPUS}" \
+        --mem="${mem}" \
+        --gpus="${gpus}" \
+        --job-name="sparsity_bl_${benchmark}_${interp}_${classifier}" \
+        --output="${LOG_DIR}/sparsity_bl_${benchmark}_${interp}_${classifier}_%A_%a.log" \
+        --error="${LOG_DIR}/sparsity_bl_${benchmark}_${interp}_${classifier}_%A_%a.log" \
+        --array="0-${NUM_TASKS}" \
+        --wrap="python baselines/eval_sparsity_baselines.py \
+            --mode single \
+            --task-id \${SLURM_ARRAY_TASK_ID} \
+            --benchmark ${benchmark} \
+            --classifiers ${classifier} \
+            --subsamples '${SUBSAMPLES}' \
+            --num-seeds ${NUM_SEEDS} \
+            --interp ${interp} \
+            ${gpu_id_flag} \
+            --results-dir ${results_dir}" \
+        --parsable)
 
+    echo "Submitted array job (${benchmark}/${interp}/${classifier}, ${device_group}): ${array_job_id}  (tasks 0-${NUM_TASKS})"
+}
+
+for BENCHMARK in "${BENCHMARKS[@]}"; do
+    for INTERP in "${INTERPS[@]}"; do
+        for CLASSIFIER in "${CPU_CLASSIFIERS[@]}"; do
+            submit_classifier_jobs "${BENCHMARK}" "${INTERP}" "${CLASSIFIER}" "cpu"
+        done
+        for CLASSIFIER in "${GPU_CLASSIFIERS[@]}"; do
+            submit_classifier_jobs "${BENCHMARK}" "${INTERP}" "${CLASSIFIER}" "gpu"
+        done
+        echo ""
+    done
+done
+
+echo "All jobs submitted. Results will be under: ${RESULTS_BASE_DIR}_<BENCHMARK>_<INTERP>_<CLASSIFIER>/"
+echo "Monitor all:  squeue -u \$USER"
