@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=latent_baseline
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=slurm_logs_baseline/%x_%j.out
+#SBATCH --error=slurm_logs_baseline/%x_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --partition=rtx2080ti
 #SBATCH --cpus-per-task=8
