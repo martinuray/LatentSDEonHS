@@ -70,30 +70,24 @@ submit_variant_for_seed() {
       --runs ${RUNS} \
       --seed ${seed} \
       ${extra_flags}"
+
+    sleep 0.2
 }
 
-# 1) Sn
 for seed in "${SEEDS[@]}"; do
+  # 1) Sn
   submit_variant_for_seed "Sn" "rtx2080ti" "--sphere-embedding" "${seed}"
-  sleep 0.2
-done
 
-# 2) Rn
-for seed in "${SEEDS[@]}"; do
+  # 2) Rn
   submit_variant_for_seed "Rn" "rtx2080ti" "--no-sphere-embedding" "${seed}"
-  sleep 0.2
-done
 
-# 3) Rn without SDE (placeholder flags: update RN_NO_SDE_EXTRA_FLAGS when available)
-for seed in "${SEEDS[@]}"; do
+  # 3) Sn/Rn without SDE (placeholder flags: update RN_NO_SDE_EXTRA_FLAGS when available)
+  submit_variant_for_seed "SnNoSDE" "a6000" "--sphere-embedding ${RN_NO_SDE_EXTRA_FLAGS}" "${seed}"
   submit_variant_for_seed "RnNoSDE" "a6000" "--no-sphere-embedding ${RN_NO_SDE_EXTRA_FLAGS}" "${seed}"
-  sleep 0.2
-done
 
-# 4) Stronger decoder
-for seed in "${SEEDS[@]}"; do
-  submit_variant_for_seed "StrongDec" "rtx2080ti" "--sphere-embedding --dec-hidden-dim 128 --n-dec-layers 4" "${seed}"
-  sleep 0.2
+  # 4) Sn/Rn Stronger decoder
+  submit_variant_for_seed "SnStrongDec" "rtx2080ti" "--sphere-embedding --dec-hidden-dim 128 --n-dec-layers 4" "${seed}"
+  submit_variant_for_seed "RnStrongDec" "rtx2080ti" "--no-sphere-embedding --dec-hidden-dim 128 --n-dec-layers 4" "${seed}"
 done
 
 echo ""
