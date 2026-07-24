@@ -53,6 +53,7 @@ import logging
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -73,6 +74,10 @@ from baselines.baseline import (
     BENCHMARK_DATASETS,
     WADI_REDUCED_BATCH_SIZE,
     _select_keys,
+    _wandb_is_available,
+    _wandb_json_safe,
+    _wandb_summary_from_dataframe,
+    _wandb_table_from_dataframe,
     aggregate_mean_std,
     append_df_to_csv,
     build_classifier_factories,
@@ -86,10 +91,34 @@ from baselines.baseline import (
 )
 from utils.anomaly_detection import create_random_burst_mask
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SUBSAMPLES = [0.01, 0.05]
 DEFAULT_NUM_SEEDS = 5
+
+# Bookkeeping columns produced alongside metrics; excluded when auto-detecting
+# numeric metric columns for W&B summaries.
+_NON_METRIC_NUMERIC_COLUMNS = {
+    "seed_idx",
+    "run_seed",
+    "subsample",
+    "n_train_full",
+    "n_train_sparse",
+    "n_train_interpolated",
+    "n_test_full",
+    "n_test_sparse",
+    "n_test_interpolated",
+}
+
+
+def _detect_metric_columns(df: pd.DataFrame) -> list[str]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    return [c for c in numeric_cols if c not in _NON_METRIC_NUMERIC_COLUMNS]
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +310,268 @@ def _load_existing_result_rows(path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# W&B logging helpers
+# ---------------------------------------------------------------------------
+
+def _wandb_init_task_run(
+    args,
+    device: str,
+    seed_idx: int,
+    run_seed: int,
+    subsample: float,
+    task_label: str,
+    selected_classifiers: list[str],
+    dataset_ids: list[str],
+):
+    if not _wandb_is_available(args):
+        if wandb is None:
+            LOGGER.info("W&B logging disabled because wandb is not installed.")
+        else:
+            LOGGER.info("W&B logging disabled via CLI.")
+        return None
+
+    try:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        classifier_slug = "-".join(selected_classifiers)
+        base_run_name = args.wandb_name or f"sparsity__{args.benchmark}__{classifier_slug}__{timestamp}"
+        run_name = f"{base_run_name}__{task_label}__sub{subsample:.4f}__seed{run_seed}"
+        run_group = args.wandb_group or f"benchmark={args.benchmark}__classifiers={classifier_slug}"
+        tags = list(dict.fromkeys(
+            (args.wandb_tags or [])
+            + [args.benchmark, args.interp, device]
+            + selected_classifiers
+            + ([args.dataset_id] if args.dataset_id else [])
+        ))
+
+        config = {
+            "args": _wandb_json_safe(vars(args)),
+            "task": {
+                "task_id": args.task_id,
+                "task_label": task_label,
+                "seed_idx": seed_idx,
+                "run_seed": run_seed,
+                "subsample": subsample,
+            },
+            "selection": {
+                "benchmark": args.benchmark,
+                "dataset_id": args.dataset_id,
+                "classifiers": selected_classifiers,
+                "dataset_ids": dataset_ids,
+            },
+            "runtime": {
+                "device": device,
+                "python": sys.version.split()[0],
+            },
+            "interp_method": args.interp,
+            "max_train_samples": args.max_train_samples,
+            "max_test_samples": args.max_test_samples,
+            "results_dir": str(args.results_dir),
+            "wandb": {
+                "project": args.wandb_project,
+                "entity": args.wandb_entity,
+                "name": run_name,
+                "group": run_group,
+                "mode": args.wandb_mode,
+            },
+        }
+
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=run_group,
+            tags=tags,
+            mode=args.wandb_mode,
+            config=config,
+            reinit=True,
+        )
+        wandb.define_metric("global_step")
+        wandb.define_metric("evaluation/*", step_metric="global_step")
+        wandb.define_metric("summary/*", summary="last")
+        LOGGER.info(
+            "Initialized W&B run: project=%s, name=%s, group=%s, mode=%s",
+            args.wandb_project, run_name, run_group, args.wandb_mode,
+        )
+        return run
+    except Exception as exc:
+        LOGGER.warning("W&B initialization failed; continuing without W&B logging: %s", exc, exc_info=True)
+        return None
+
+
+def _wandb_log_evaluation(
+    run,
+    step: int,
+    row: dict,
+    subsample: float,
+    seed_idx: int,
+    run_seed: int,
+    elapsed_seconds: float,
+    status: str,
+):
+    if run is None:
+        return True
+
+    try:
+        payload = {
+            "global_step": step,
+            "evaluation/benchmark": row.get("benchmark"),
+            "evaluation/dataset_id": row.get("dataset_id"),
+            "evaluation/clf_name": row.get("clf_name"),
+            "evaluation/subsample": subsample,
+            "evaluation/seed_idx": seed_idx,
+            "evaluation/run_seed": run_seed,
+            "evaluation/duration_sec": float(elapsed_seconds),
+            "evaluation/success": 1.0 if status == "success" else 0.0,
+            "evaluation/failure": 1.0 if status != "success" else 0.0,
+        }
+        skip_keys = {"benchmark", "dataset_id", "clf_name"}
+        for key, value in row.items():
+            if key in skip_keys:
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating, bool)):
+                payload[f"evaluation/{key}"] = float(value)
+        run.log(payload, step=step)
+        return True
+    except Exception as exc:
+        LOGGER.warning("W&B evaluation logging failed; disabling further W&B logging: %s", exc, exc_info=True)
+        return False
+
+
+def _wandb_log_task_summary(run, rows: list[dict], failed_rows: list[dict], out_file: str):
+    if run is None:
+        return True
+
+    try:
+        rows_df = pd.DataFrame(rows)
+        summary_payload = {
+            "summary/num_successful_rows": int(len(rows)),
+            "summary/num_failed_rows": int(len(failed_rows)),
+        }
+
+        if not rows_df.empty:
+            metric_cols = _detect_metric_columns(rows_df)
+            for col in metric_cols:
+                summary_payload[f"summary/mean_{col}"] = float(rows_df[col].mean())
+            if metric_cols and "clf_name" in rows_df.columns:
+                per_clf = rows_df.groupby("clf_name")[metric_cols].mean()
+                for clf_name, clf_row in per_clf.iterrows():
+                    for col in metric_cols:
+                        summary_payload[f"summary/{clf_name}/{col}"] = float(clf_row[col])
+
+        for key, value in summary_payload.items():
+            run.summary[key] = value
+
+        tables = {}
+        if not rows_df.empty:
+            tables["tables/rows"] = _wandb_table_from_dataframe(rows_df)
+        if failed_rows:
+            tables["tables/failed"] = _wandb_table_from_dataframe(pd.DataFrame(failed_rows))
+        if tables:
+            run.log(tables)
+
+        if os.path.exists(out_file):
+            artifact_name = f"{run.name}-results".replace("=", "_").replace(":", "-").replace("/", "_")
+            artifact = wandb.Artifact(name=artifact_name, type="results")
+            artifact.add_file(out_file)
+            run.log_artifact(artifact)
+        return True
+    except Exception as exc:
+        LOGGER.warning("Final W&B logging failed; continuing without W&B artifacts: %s", exc, exc_info=True)
+        return False
+
+
+def _wandb_init_aggregate_run(args):
+    if not _wandb_is_available(args):
+        if wandb is None:
+            LOGGER.info("W&B logging disabled because wandb is not installed.")
+        else:
+            LOGGER.info("W&B logging disabled via CLI.")
+        return None
+
+    try:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        base_run_name = args.wandb_name or f"sparsity-aggregate__{args.benchmark}__{timestamp}"
+        run_group = args.wandb_group or f"benchmark={args.benchmark}__aggregate"
+        tags = list(dict.fromkeys((args.wandb_tags or []) + [args.benchmark, "aggregate"]))
+
+        config = {
+            "args": _wandb_json_safe(vars(args)),
+            "results_dir": str(args.results_dir),
+            "benchmark": args.benchmark,
+            "wandb": {
+                "project": args.wandb_project,
+                "entity": args.wandb_entity,
+                "name": base_run_name,
+                "group": run_group,
+                "mode": args.wandb_mode,
+            },
+        }
+
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=base_run_name,
+            group=run_group,
+            tags=tags,
+            mode=args.wandb_mode,
+            config=config,
+            reinit=True,
+        )
+        LOGGER.info(
+            "Initialized W&B aggregate run: project=%s, name=%s, group=%s, mode=%s",
+            args.wandb_project, base_run_name, run_group, args.wandb_mode,
+        )
+        return run
+    except Exception as exc:
+        LOGGER.warning("W&B initialization failed; continuing without W&B logging: %s", exc, exc_info=True)
+        return None
+
+
+def _wandb_log_aggregate_outputs(
+    run,
+    results_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    group_cols: list[str],
+    csv_path: str,
+    summary_csv: str,
+    png_path: str | None,
+):
+    if run is None:
+        return True
+
+    try:
+        summary_payload = {
+            "summary/num_raw_rows": int(len(results_df)),
+            "summary/num_summary_rows": int(len(summary_df)),
+        }
+        metric_mean_cols = [c for c in summary_df.columns if c.endswith("_mean") or c.endswith("_std") or c == "num_runs"]
+        summary_payload.update(_wandb_summary_from_dataframe(summary_df, "summary/mean_std", group_cols, metric_mean_cols))
+
+        for key, value in summary_payload.items():
+            run.summary[key] = value
+
+        tables = {
+            "tables/raw_results": _wandb_table_from_dataframe(results_df),
+            "tables/summary": _wandb_table_from_dataframe(summary_df),
+        }
+        run.log({name: table for name, table in tables.items() if table is not None})
+
+        if png_path and os.path.exists(png_path):
+            run.log({"plots/sparsity_curve": wandb.Image(png_path)})
+
+        artifact_name = f"{run.name}-aggregate".replace("=", "_").replace(":", "-").replace("/", "_")
+        artifact = wandb.Artifact(name=artifact_name, type="results")
+        for path in [csv_path, summary_csv, png_path]:
+            if path and os.path.exists(path):
+                artifact.add_file(path)
+        run.log_artifact(artifact)
+        return True
+    except Exception as exc:
+        LOGGER.warning("Final W&B logging failed; continuing without W&B artifacts: %s", exc, exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Single run
 # ---------------------------------------------------------------------------
 
@@ -327,76 +618,139 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                 f"Available: {[s['dataset_id'] for s in BENCHMARK_DATASETS[benchmark_name]]}"
             )
 
-    rows = []
-    for clf_name in selected_classifiers:
-        clf_factory = classifier_factories[clf_name]
-        for dataset_spec in dataset_specs:
-            dataset_id = dataset_spec["dataset_id"]
-            try:
-                x_train_full, x_test_full, y_test = load_dataset(
-                    dataset_spec,
-                    max_train_samples=args.max_train_samples,
-                    max_test_samples=args.max_test_samples,
-                )
-
-                # Apply burst-mask sparsity to training data only.
-                mask_seed = run_seed * 1000 + int(subsample * 1000)
-                x_train_sparse, keep_mask_train = apply_burst_sparsity(
-                    x_train_full,
-                    subsample=subsample,
-                    seed=mask_seed,
-                    interp_method=args.interp,
-                )
-
-                x_test_sparse, keep_mask_test = apply_burst_sparsity(
-                    x_test_full,
-                    subsample=subsample,
-                    seed=mask_seed,
-                    interp_method=args.interp,
-                )
-
-                clf = clf_factory()
-                result = evaluate_classifier_on_dataset(
-                    clf_name=clf_name,
-                    clf=clf,
-                    x_train=x_train_sparse,
-                    x_test=x_test_sparse,
-                    y_test=y_test,
-                    benchmark_name=benchmark_name,
-                    dataset_id=dataset_id,
-                )
-                rows.append({
-                    **result,
-                    "subsample": subsample,
-                    "interp_method": args.interp,
-                    "seed_idx": seed_idx,
-                    "run_seed": run_seed,
-                    "n_train_full": x_train_full.shape[0],
-                    "n_train_sparse": int(keep_mask_train.sum()),
-                    "n_train_interpolated": int((~keep_mask_train).sum()),
-                    "n_test_full": x_test_full.shape[0],
-                    "n_test_sparse": int(keep_mask_test.sum()),
-                    "n_test_interpolated": int((~keep_mask_test).sum()),
-                })
-            except Exception:
-                LOGGER.exception(
-                    "[%s/%s] %s failed (subsample=%.3f, seed=%d)",
-                    benchmark_name, dataset_id, clf_name, subsample, run_seed,
-                )
-
-    set_round_context()
-
-    out_file = os.path.join(out_dir, f"{task_label}.json")
-    existing_rows = _load_existing_result_rows(out_file)
-    combined_rows = existing_rows + rows
-    with open(out_file, "w") as fh:
-        json.dump(combined_rows, fh, indent=2)
-    LOGGER.info(
-        "Saved %d new result(s) to %s (%d total)",
-        len(rows),
-        out_file,
-        len(combined_rows),
+    dataset_ids = [s["dataset_id"] for s in dataset_specs]
+    run_wandb = _wandb_init_task_run(
+        args=args,
+        device=device,
+        seed_idx=seed_idx,
+        run_seed=run_seed,
+        subsample=subsample,
+        task_label=task_label,
+        selected_classifiers=selected_classifiers,
+        dataset_ids=dataset_ids,
     )
+    wandb_step = 0
+
+    rows = []
+    failed_rows = []
+    try:
+        for clf_name in selected_classifiers:
+            clf_factory = classifier_factories[clf_name]
+            for dataset_spec in dataset_specs:
+                dataset_id = dataset_spec["dataset_id"]
+                started_at = time.perf_counter()
+                try:
+                    x_train_full, x_test_full, y_test = load_dataset(
+                        dataset_spec,
+                        max_train_samples=args.max_train_samples,
+                        max_test_samples=args.max_test_samples,
+                    )
+
+                    # Apply burst-mask sparsity to training data only.
+                    mask_seed = run_seed * 1000 + int(subsample * 1000)
+                    x_train_sparse, keep_mask_train = apply_burst_sparsity(
+                        x_train_full,
+                        subsample=subsample,
+                        seed=mask_seed,
+                        interp_method=args.interp,
+                    )
+
+                    x_test_sparse, keep_mask_test = apply_burst_sparsity(
+                        x_test_full,
+                        subsample=subsample,
+                        seed=mask_seed,
+                        interp_method=args.interp,
+                    )
+
+                    clf = clf_factory()
+                    result, _metric_results = evaluate_classifier_on_dataset(
+                        clf_name=clf_name,
+                        clf=clf,
+                        x_train=x_train_sparse,
+                        x_test=x_test_sparse,
+                        y_test=y_test,
+                        benchmark_name=benchmark_name,
+                        dataset_id=dataset_id,
+                    )
+                    row = {
+                        **result,
+                        "subsample": subsample,
+                        "interp_method": args.interp,
+                        "seed_idx": seed_idx,
+                        "run_seed": run_seed,
+                        "n_train_full": x_train_full.shape[0],
+                        "n_train_sparse": int(keep_mask_train.sum()),
+                        "n_train_interpolated": int((~keep_mask_train).sum()),
+                        "n_test_full": x_test_full.shape[0],
+                        "n_test_sparse": int(keep_mask_test.sum()),
+                        "n_test_interpolated": int((~keep_mask_test).sum()),
+                    }
+                    rows.append(row)
+
+                    elapsed_seconds = time.perf_counter() - started_at
+                    wandb_step += 1
+                    if run_wandb is not None and not _wandb_log_evaluation(
+                        run_wandb,
+                        wandb_step,
+                        row,
+                        subsample,
+                        seed_idx,
+                        run_seed,
+                        elapsed_seconds,
+                        status="success",
+                    ):
+                        run_wandb = None
+                except Exception as exc:
+                    elapsed_seconds = time.perf_counter() - started_at
+                    LOGGER.exception(
+                        "[%s/%s] %s failed (subsample=%.3f, seed=%d)",
+                        benchmark_name, dataset_id, clf_name, subsample, run_seed,
+                    )
+                    failed_row = {
+                        "benchmark": benchmark_name,
+                        "dataset_id": dataset_id,
+                        "clf_name": clf_name,
+                        "subsample": subsample,
+                        "seed_idx": seed_idx,
+                        "run_seed": run_seed,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                    failed_rows.append(failed_row)
+
+                    wandb_step += 1
+                    if run_wandb is not None and not _wandb_log_evaluation(
+                        run_wandb,
+                        wandb_step,
+                        {"benchmark": benchmark_name, "dataset_id": dataset_id, "clf_name": clf_name},
+                        subsample,
+                        seed_idx,
+                        run_seed,
+                        elapsed_seconds,
+                        status="failed",
+                    ):
+                        run_wandb = None
+
+        set_round_context()
+
+        out_file = os.path.join(out_dir, f"{task_label}.json")
+        existing_rows = _load_existing_result_rows(out_file)
+        combined_rows = existing_rows + rows
+        with open(out_file, "w") as fh:
+            json.dump(combined_rows, fh, indent=2)
+        LOGGER.info(
+            "Saved %d new result(s) to %s (%d total)",
+            len(rows),
+            out_file,
+            len(combined_rows),
+        )
+
+        if not _wandb_log_task_summary(run_wandb, rows, failed_rows, out_file):
+            run_wandb = None
+    finally:
+        if run_wandb is not None:
+            run_wandb.finish()
+
     return rows
 
 
@@ -425,8 +779,9 @@ def run_all(args, subsamples: list[float]):
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def aggregate(out_dir: str, benchmark: str | None = None):
+def aggregate(args, benchmark: str | None = None):
     """Collect task JSON files, optionally filter by benchmark, and plot."""
+    out_dir = args.results_dir
     os.makedirs(out_dir, exist_ok=True)
     json_files = sorted(
         f for f in os.listdir(out_dir) if f.endswith(".json")
@@ -434,49 +789,61 @@ def aggregate(out_dir: str, benchmark: str | None = None):
     if not json_files:
         raise FileNotFoundError(f"No JSON result files found in {out_dir}")
 
-    all_rows = []
-    for fname in json_files:
-        with open(os.path.join(out_dir, fname)) as fh:
-            data = json.load(fh)
-        if isinstance(data, list):
-            all_rows.extend(data)
-        else:
-            all_rows.append(data)
+    run_wandb = _wandb_init_aggregate_run(args)
 
-    if not all_rows:
-        raise ValueError("All JSON files were empty.")
+    try:
+        all_rows = []
+        for fname in json_files:
+            with open(os.path.join(out_dir, fname)) as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                all_rows.extend(data)
+            else:
+                all_rows.append(data)
 
-    results_df = pd.DataFrame(all_rows)
-    if benchmark is not None:
-        if "benchmark" not in results_df.columns:
-            raise ValueError("Cannot filter aggregate results: 'benchmark' column is missing in input JSON rows.")
-        results_df = results_df[results_df["benchmark"] == benchmark].copy()
-        if results_df.empty:
-            raise ValueError(
-                f"No rows found for benchmark '{benchmark}' in {out_dir}. "
-                "Check --benchmark or results-dir contents."
-            )
-        LOGGER.info("Aggregate filter active: benchmark=%s (rows=%d)", benchmark, len(results_df))
-    csv_path = os.path.join(out_dir, "sparsity_baselines_raw.csv")
-    results_df.to_csv(csv_path, index=False)
-    print(f"Saved raw results CSV to {csv_path}")
+        if not all_rows:
+            raise ValueError("All JSON files were empty.")
 
-    # For multi-trace benchmarks, first average metrics over traces per run
-    # (seed), then compute mean/std over these run-level means.
-    collapsed_df = _collapse_traces_to_run_means(results_df)
+        results_df = pd.DataFrame(all_rows)
+        if benchmark is not None:
+            if "benchmark" not in results_df.columns:
+                raise ValueError("Cannot filter aggregate results: 'benchmark' column is missing in input JSON rows.")
+            results_df = results_df[results_df["benchmark"] == benchmark].copy()
+            if results_df.empty:
+                raise ValueError(
+                    f"No rows found for benchmark '{benchmark}' in {out_dir}. "
+                    "Check --benchmark or results-dir contents."
+                )
+            LOGGER.info("Aggregate filter active: benchmark=%s (rows=%d)", benchmark, len(results_df))
+        csv_path = os.path.join(out_dir, "sparsity_baselines_raw.csv")
+        results_df.to_csv(csv_path, index=False)
+        print(f"Saved raw results CSV to {csv_path}")
 
-    group_cols = ["benchmark", "clf_name", "subsample"]
-    summary_df = aggregate_mean_std(collapsed_df, group_cols)
-    summary_csv = os.path.join(out_dir, "sparsity_baselines_summary.csv")
-    summary_df.to_csv(summary_csv, index=False)
-    print(f"Saved summary CSV (mean ± std) to {summary_csv}")
+        # For multi-trace benchmarks, first average metrics over traces per run
+        # (seed), then compute mean/std over these run-level means.
+        collapsed_df = _collapse_traces_to_run_means(results_df)
 
-    print(
-        "\nMean ± std report:\n",
-        build_mean_std_report(summary_df, group_cols).to_string(index=False),
-    )
+        group_cols = ["benchmark", "clf_name", "subsample"]
+        summary_df = aggregate_mean_std(collapsed_df, group_cols)
+        summary_csv = os.path.join(out_dir, "sparsity_baselines_summary.csv")
+        summary_df.to_csv(summary_csv, index=False)
+        print(f"Saved summary CSV (mean ± std) to {summary_csv}")
 
-    _plot_results(collapsed_df, out_dir, group_cols)
+        print(
+            "\nMean ± std report:\n",
+            build_mean_std_report(summary_df, group_cols).to_string(index=False),
+        )
+
+        _plot_results(collapsed_df, out_dir, group_cols)
+        png_path = os.path.join(out_dir, "sparsity_baselines.png")
+
+        if not _wandb_log_aggregate_outputs(
+            run_wandb, results_df, summary_df, group_cols, csv_path, summary_csv, png_path,
+        ):
+            run_wandb = None
+    finally:
+        if run_wandb is not None:
+            run_wandb.finish()
 
 
 def _collapse_traces_to_run_means(df: pd.DataFrame) -> pd.DataFrame:
@@ -485,7 +852,7 @@ def _collapse_traces_to_run_means(df: pd.DataFrame) -> pd.DataFrame:
     This ensures mean/std are computed across runs (seeds) of benchmark-level
     scores instead of mixing trace-level variability into run variability.
     """
-    metric_cols = [c for c in ["auroc", "auprc", "f1"] if c in df.columns]
+    metric_cols = [c for c in ["auc_roc", "auc_pr", "f1"] if c in df.columns]
     if not metric_cols:
         return df
 
@@ -513,7 +880,8 @@ def _plot_results(df: pd.DataFrame, out_dir: str, group_cols: list[str]):
     For each sparsity level, values are aggregated across all datasets within a
     benchmark (and all seeds), so each line reflects benchmark-level behavior.
     """
-    metrics = ["auroc", "auprc", "f1"]
+    metrics = ["auc_roc", "auc_pr", "f1", "rrecall", "vus_roc", "vus_pr", "rrecall", "rprecision", "rf", "recall",
+               "r_auc_roc", "r_auc_pr", "precision"]
     available_metrics = [m for m in metrics if m in df.columns]
     if not available_metrics:
         LOGGER.warning("No metric columns found in results; skipping plots.")
@@ -727,6 +1095,51 @@ def parse_args():
         default="INFO",
     )
 
+    # Weights & Biases logging
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="latent-sde-on-hs-sparsity-baselines",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity / team name.",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Optional explicit W&B run name prefix. If omitted, a descriptive name is generated.",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        type=str,
+        default=None,
+        help="Optional W&B group name. Defaults to the selected benchmark/classifier combination.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="*",
+        default=[],
+        help="Optional W&B tags.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B mode.",
+    )
+    parser.add_argument(
+        "--wandb-disabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable W&B logging entirely.",
+    )
+
     return parser.parse_args()
 
 
@@ -774,7 +1187,7 @@ def main():
         run_all(args, subsamples)
 
     elif args.mode == "aggregate":
-        aggregate(args.results_dir, benchmark=args.benchmark)
+        aggregate(args, benchmark=args.benchmark)
 
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
