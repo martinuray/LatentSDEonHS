@@ -63,6 +63,77 @@ def set_round_context(run_number: int | None = None, total_runs: int | None = No
         CURRENT_ROUND = f"{run_number}/{total_runs}"
 
 
+_DEEPOD_INFERENCE_PATCHED = False
+
+
+def _patch_deepod_inference_memory():
+    """Patch deepod's inference loops to move each batch off the GPU immediately.
+
+    deepod's decision_function() always windows its input with stride=1
+    regardless of the configured `stride` (see deepod.utils.utility.get_sub_seqs),
+    including the internal call `fit()` makes on the *full* training set at the
+    end of training. For large benchmarks like SWaT/WaDi this produces hundreds
+    of thousands of overlapping windows. The stock inference loops append every
+    batch's representation/score tensor to a Python list and only move them to
+    CPU once, after the whole test_loader has been consumed - so peak GPU memory
+    grows with the entire windowed dataset size, not with batch_size, which
+    reliably causes CUDA OOM on SWaT/WaDi. Detaching and moving each batch to
+    CPU right away bounds peak GPU memory by batch_size instead.
+
+    Two independent code paths need this:
+    - `BaseDeepAD._inference` (used by TcnED, DeepSVDDTS, COUTA, TranAD,
+      TimesNet, AnomalyTransformer, DeepIsolationForestTS, ...).
+    - `USAD.testing` (USAD overrides fit/decision_function entirely and has
+      its own accumulation loop with the same bug).
+    """
+    global _DEEPOD_INFERENCE_PATCHED
+    if _DEEPOD_INFERENCE_PATCHED:
+        return
+
+    from deepod.core.base_model import BaseDeepAD
+    from deepod.models.time_series import USAD
+    from tqdm import tqdm
+
+    def _inference(self):
+        self.net.eval()
+        with torch.no_grad():
+            z_lst = []
+            score_lst = []
+
+            if self.verbose >= 2:
+                _iter_ = tqdm(self.test_loader, desc="testing: ")
+            else:
+                _iter_ = self.test_loader
+
+            for batch_x in _iter_:
+                batch_z, s = self.inference_forward(batch_x, self.net, self.criterion)
+                z_lst.append(batch_z.detach().cpu())
+                score_lst.append(s.detach().cpu())
+
+        z = torch.cat(z_lst).numpy()
+        scores = torch.cat(score_lst).numpy()
+
+        return z, scores
+
+    def _usad_testing(self, test_loader, alpha=0.5, beta=0.5):
+        results = []
+        for [batch] in test_loader:
+            batch = batch.to(self.device)
+            w1 = self.model.decoder1(self.model.encoder(batch))
+            w2 = self.model.decoder2(self.model.encoder(w1))
+            score = alpha * torch.mean((batch - w1) ** 2, axis=1) + beta * torch.mean((batch - w2) ** 2, axis=1)
+            results.append(score.detach().cpu())
+        return results
+
+    BaseDeepAD._inference = _inference
+    USAD.testing = _usad_testing
+    _DEEPOD_INFERENCE_PATCHED = True
+    LOGGER.info(
+        "Patched deepod BaseDeepAD._inference and USAD.testing to move batches off "
+        "the GPU immediately (avoids GPU memory accumulating over the whole dataset)."
+    )
+
+
 def build_classifier_factories(
     device: str = "cpu",
     random_state: int | None = None,
@@ -89,6 +160,8 @@ def build_classifier_factories(
         # DCdetector, NCAD
     )
 
+    _patch_deepod_inference_memory()
+
     ts_kwargs = {"seq_len": seq_len, "stride": seq_len, "device": device, "random_state": random_state, "verbose": 1}
 
     return {
@@ -100,7 +173,7 @@ def build_classifier_factories(
         "OCSVM": lambda: OCSVM(),
         "TimesNet": lambda: TimesNet(**ts_kwargs),
         "DeepSVDD": lambda: DeepSVDDTS(**ts_kwargs),
-        "USAD": lambda: USAD(batch_size=2048, **ts_kwargs),
+        "USAD": lambda: USAD(batch_size=512, **ts_kwargs),
         "AnomalyTransformer": lambda: AnomalyTransformer(**ts_kwargs),
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
         "TranAD": lambda: TranAD(**ts_kwargs),

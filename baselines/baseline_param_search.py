@@ -78,6 +78,8 @@ def build_classifier_factory(clf_name: str, params: dict, device: str, random_st
     from pyod.models.knn import KNN
     from deepod.models.time_series import TcnED
 
+    bl._patch_deepod_inference_memory()
+
     merged_params = {**CLASSIFIER_BASE_KWARGS.get(clf_name, {}), **params}
 
     if clf_name == "KNN":
