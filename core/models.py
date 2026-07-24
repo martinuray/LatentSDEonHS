@@ -580,9 +580,7 @@ class SOnPathDistributionEncoder(nn.Module):
         scl = self._scl_map(h)        
         scl = scl.square() * 100.0
         scl = torch.minimum(scl, torch.tensor(50000.0, device=scl.device))
-        scl = torch.maximum(scl, torch.tensor(1e-7, device=scl.device))
-        scl = scl.expand_as(loc)
-        p0 = torch.distributions.MultivariateNormal(loc, torch.diag_embed(scl.squeeze(dim=1)))
+        p0 = PowerSpherical(F.normalize(loc), scl.squeeze(dim=1))
 
         def K(arg_t: Tensor) -> Tensor: return self._time_fn(h, arg_t)
         posterior = SOnPathDistribution(p0, K, self._sigma, t, sde=self._sde)
