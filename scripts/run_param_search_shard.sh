@@ -39,8 +39,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_DIR}"
 
 # ---- Activate environment ----
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate baseline-latent
+source .venv/bin/activate
 
 OUTPUT_DIR="out/param_search_${BENCHMARK}_${CLASSIFIER}"
 LOG_DIR="logs_param_search"
