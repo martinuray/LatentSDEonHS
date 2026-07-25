@@ -112,6 +112,17 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Base random seed; run i uses seed + i.")
     parser.add_argument("--seq-len-default", type=positive_int, default=bl.DEFAULT_SEQ_LEN, help="Default sequence length for TcnED; stride is set equal to seq_len.")
     parser.add_argument("--benchmark-seq-lens", type=str, default="", help="Optional benchmark-specific seq lens, e.g. 'SWaT:200,WaDi:128'.")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="out",
+        help=(
+            "Directory (relative to the repo root, or absolute) for local CSV outputs. "
+            "Give each parallel shard (e.g. one per --classifiers/--benchmarks split) its own "
+            "--output-dir - the CSVs are appended to with no file locking, so concurrent shards "
+            "writing to the same directory on a shared filesystem will corrupt each other's output."
+        ),
+    )
 
     parser.add_argument("--wandb-project", type=str, default="latent-sde-on-hs-baselines-param-search", help="Weights & Biases project name.")
     parser.add_argument("--wandb-entity", type=str, default=None, help="Optional W&B entity / team name.")
@@ -164,7 +175,9 @@ if __name__ == "__main__":
         for benchmark_name in selected_benchmarks
     }
 
-    output_dir = ROOT_DIR / "out"
+    output_dir = Path(args.output_dir)
+    if not output_dir.is_absolute():
+        output_dir = ROOT_DIR / output_dir
     os.makedirs(output_dir, exist_ok=True)
     per_dataset_path = output_dir / "baseline_param_search_per_dataset.csv"
     macro_path = output_dir / "baseline_param_search_macro.csv"
