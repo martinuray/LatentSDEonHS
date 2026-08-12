@@ -102,6 +102,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--dec-hidden-dim", type=int, default=32)
     group.add_argument("--n-dec-layers", type=int, default=2)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
+    group.add_argument("--log-every-n-epochs", type=int, default=10)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument("--dataset", choices=DATASET_CHOICES, default="SWaT")
     group.add_argument(
@@ -346,65 +347,66 @@ def train_one_dataset(
             optimizer, desired_t, args.device
         )
 
-        normalization_scores = None
-        if args.normalize_score:
-            normalization_scores = calculate_z_normalization_values(
-                args, dl_trn, modules, desired_t, args.device)
+        if epoch % args.log_every_n_epochs == 0 or epoch == args.n_epochs:
+            normalization_scores = None
+            if args.normalize_score:
+                normalization_scores = calculate_z_normalization_values(
+                    args, dl_trn, modules, desired_t, args.device)
 
-        tst_stats = evaluate(
-            args, dl_tst, modules, elbo_loss, desired_t, args.device,
-            normalization_stats=normalization_scores, epoch=epoch
-        )
+            tst_stats = evaluate(
+                args, dl_tst, modules, elbo_loss, desired_t, args.device,
+                normalization_stats=normalization_scores, epoch=epoch
+            )
 
-        val_stats = evaluate(
-            args, dl_val, modules, elbo_loss, desired_t, args.device,
-            normalization_stats=normalization_scores, epoch=epoch, test=False
-        )
+            val_stats = evaluate(
+                args, dl_val, modules, elbo_loss, desired_t, args.device,
+                normalization_stats=normalization_scores, epoch=epoch, test=False
+            )
 
-        val_loss = val_stats["loss"]
-        to_append = {"lr": scheduler.get_last_lr()[-1],
-                     "esc": es_counter,
-                     "sig": modules['pxz_net'].sigma.item()}
-        if val_loss < (best_val_loss - args.early_stopping_min_delta):
-            best_val_loss = val_loss
-            best_stats = tst_stats
-            es_counter = 0
-        else:
-            es_counter += 1
-            if es_counter >= 4*args.restart: # early stopping patience shall be longer than one cosine sheduling
-                logging.info(f"Early stopping triggered at epoch {epoch}.")
-                stats["trn"].append(trn_stats)
-                stats["tst"].append(tst_stats)
-                stats["val"].append(val_stats)
-                stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
-                if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
-                    wandb_run = None
-                break
+            val_loss = val_stats["loss"]
+            to_append = {"lr": scheduler.get_last_lr()[-1],
+                         "esc": es_counter,
+                         "sig": modules['pxz_net'].sigma.item()}
+            if val_loss < (best_val_loss - args.early_stopping_min_delta):
+                best_val_loss = val_loss
+                best_stats = tst_stats
+                es_counter = 0
+            else:
+                es_counter += 1
+                if es_counter >= 4*args.restart: # early stopping patience shall be longer than one cosine sheduling
+                    logging.info(f"Early stopping triggered at epoch {epoch}.")
+                    stats["trn"].append(trn_stats)
+                    stats["tst"].append(tst_stats)
+                    stats["val"].append(val_stats)
+                    stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+                    if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
+                        wandb_run = None
+                    break
 
-        to_append["esc"] = es_counter
+            to_append["esc"] = es_counter
 
-        stats["oth"].append(to_append)
-        scheduler.step()
+            stats["oth"].append(to_append)
+            scheduler.step()
 
-        stats["trn"].append(trn_stats)
-        stats["tst"].append(tst_stats)
-        stats["val"].append(val_stats)
-        stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
-        if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
-            wandb_run = None
+            stats["trn"].append(trn_stats)
+            stats["tst"].append(tst_stats)
+            stats["val"].append(val_stats)
+            stats2tensorboard(trn_stats, val_stats, tst_stats, writer, epoch)
+            if wandb_run is not None and not _wandb_log_epoch(wandb_run, epoch, stats_prefix, trn_stats, val_stats, tst_stats, to_append):
+                wandb_run = None
 
-        if args.checkpoint_at and (epoch in args.checkpoint_at):
-            ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
-            save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
+            if args.checkpoint_at and (epoch in args.checkpoint_at):
+                ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
+                save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
 
-        msg = pm.build_progress_message(stats, epoch)
-        if stats_prefix:
-            msg = f"[{stats_prefix}] {msg}"
-        logging.debug(msg)
+            msg = pm.build_progress_message(stats, epoch // args.log_every_n_epochs)
+            if stats_prefix:
+                msg = f"[{stats_prefix}] {msg}"
+            logging.debug(msg)
 
-        if args.enable_file_logging:
-            fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
-            save_stats(args, stats, fname)
+            if args.enable_file_logging:
+                fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
+                save_stats(args, stats, fname)
 
     return (best_stats if best_stats is not None else tst_stats), stats
 
