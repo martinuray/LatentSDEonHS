@@ -712,7 +712,7 @@ def eval_scores_for_all_score_normalizations(
     #normalisations = ["median-iqr", "mean-std", None]
     #aggregation_strategies = ["l1", "l2", "linfty", "mean", "max", "median", "p75", "p95"]
     normalisations = [None]
-    aggregation_strategies = ["l1"]
+    aggregation_strategies = ["max"]
 
     AGG_STRATEGIES = {
         'l1': lambda x: np.linalg.norm(x, ord=1, axis=1),
