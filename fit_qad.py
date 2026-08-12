@@ -165,11 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
     recon.add_argument("--reconstruct-dir", type=str, default="out/reconstructions/qad_fit")
     recon.add_argument(
         "--reconstruct-n-windows", type=int, default=10,
-        help="Number of (middle) windows to reconstruct and plot.",
+        help="Number of windows to reconstruct and plot: the (middle) windows for train, "
+             "and a contiguous block containing the labeled anomalous segment for test.",
     )
     recon.add_argument(
-        "--reconstruct-mc-samples", type=int, default=1,
-        help="Number of MC samples averaged over when decoding the reconstruction.",
+        "--reconstruct-mc-samples", type=int, default=100,
+        help="Number of MC samples drawn when decoding the reconstruction; each is plotted "
+             "as its own low-alpha trace (see notebooks/analyze_irregular_sine_exp.ipynb).",
     )
     recon.add_argument(
         "--reconstruct-gif", action=argparse.BooleanOptionalAction, default=True,
@@ -237,27 +239,58 @@ def build_modules_and_optim(args, input_dim, desired_t):
     return modules, optimizer, scheduler, elbo_loss
 
 
-def plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id):
-    """Reconstruct the middle `args.reconstruct_n_windows` windows of the training
-    trace, for all variates, and save the actual-vs-reconstructed plot to disk.
-
-    Ground truth is `evd_obs` (the complete, unmasked window) rather than the
-    subsampled `inp_obs` fed to the encoder, so the plot reflects reconstruction
-    quality against the full underlying signal.
-    """
-    ds = provider._ds_trn
+def _select_middle_window_indices(ds, n_select):
     n_windows = len(ds)
-    n_select = min(args.reconstruct_n_windows, n_windows)
+    n_select = min(n_select, n_windows)
     start = max(0, (n_windows - n_select) // 2)
-    indices = list(range(start, start + n_select))
+    return list(range(start, start + n_select))
 
+
+def _select_anomalous_window_indices(ds, n_select):
+    """Pick a contiguous block of `n_select` windows that contains the
+    labeled anomalous segment (if any), centering the block on it when the
+    segment itself is shorter than the requested block size.
+
+    Falls back to the middle of the trace when no window is labeled
+    anomalous (e.g. a test trace without any injected anomaly).
+    """
+    n_windows = len(ds)
+    n_select = min(n_select, n_windows)
+
+    anomalous = [i for i in range(n_windows) if bool((ds[i]["aux_tgt"] > 0).any())]
+    if not anomalous:
+        return _select_middle_window_indices(ds, n_select)
+
+    first, last = anomalous[0], anomalous[-1]
+    span = last - first + 1
+    start = first if span >= n_select else first - (n_select - span) // 2
+    start = max(0, min(start, n_windows - n_select))
+    return list(range(start, start + n_select))
+
+
+def _gather_window_batch(ds, indices, device):
     samples = [ds[i] for i in indices]
     batch = {
         key: torch.stack([sample[key] for sample in samples], dim=0)
         for key in samples[0]
         if isinstance(samples[0][key], torch.Tensor)
     }
-    parts = {key: val.to(args.device) for key, val in batch.items()}
+    return {key: val.to(device) for key, val in batch.items()}
+
+
+def _decode_reconstruction(args, modules, desired_t, parts):
+    """Encode+decode a batch of windows at `desired_t`, the same decoding
+    timepoints used for training, so train/test reconstructions are directly
+    comparable.
+
+    Draws `args.reconstruct_mc_samples` decoder samples (kept separate,
+    not averaged) so the plot can show the reconstruction spread as a
+    spaghetti fan, matching notebooks/analyze_irregular_sine_exp.ipynb.
+
+    Ground truth is `evd_obs` (the complete, unmasked window) rather than the
+    subsampled `inp_obs` fed to the encoder, so the plot reflects reconstruction
+    quality against the full underlying signal.
+    """
     inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
 
     modules.eval()
@@ -268,10 +301,33 @@ def plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id
         pxz = modules["pxz_net"](zis)
     modules.train()
 
-    recon = pxz.mean.mean(axis=0).detach().cpu()
+    recon_samples = pxz.mean.detach().cpu()  # (mc_samples, n_windows, n_time, dim)
     actual = parts["evd_obs"].detach().cpu()
+    return actual, recon_samples
 
+
+def _highlight_anomalous_regions(ax, anomaly_mask):
+    """Shade contiguous stretches of `anomaly_mask` (1D bool array aligned
+    with the plotted x-axis) as a low-alpha red background band.
+    """
+    in_segment = False
+    seg_start = 0
+    for idx, flagged in enumerate(anomaly_mask.tolist()):
+        if flagged and not in_segment:
+            in_segment, seg_start = True, idx
+        elif not flagged and in_segment:
+            in_segment = False
+            ax.axvspan(seg_start - 0.5, idx - 0.5, color="red", alpha=0.15, zorder=0)
+    if in_segment:
+        ax.axvspan(seg_start - 0.5, len(anomaly_mask) - 0.5, color="red", alpha=0.15, zorder=0)
+
+
+def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, out_path):
     input_dim = actual.shape[-1]
+    n_mc = recon_samples.shape[0]
+    # Same alpha scale as the notebook's spaghetti plot (500 samples @ alpha=0.01).
+    recon_alpha = min(0.3, max(0.01, 5.0 / n_mc))
+
     fig, axs = plt.subplots(nrows=input_dim//2, ncols=2, figsize=(10, 1.6 * input_dim//2), sharex=True)
     if input_dim == 1:
         axs = [axs]
@@ -279,23 +335,71 @@ def plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id
     axs = axs.flatten()
     for var_idx in range(input_dim):
         ax = axs[var_idx]
-        ax.plot(actual[:, :, var_idx].flatten(), color="tab:blue", linewidth=1.2, alpha=.5,
+        if anomaly_mask is not None:
+            _highlight_anomalous_regions(ax, anomaly_mask)
+        for mc_idx in range(n_mc):
+            ax.plot(recon_samples[mc_idx, :, :, var_idx].flatten(), color="tab:green",
+                     alpha=recon_alpha, linewidth=1.2,
+                     label="reconstructed" if var_idx == 0 and mc_idx == 0 else None)
+        ax.plot(actual[:, :, var_idx].flatten(), color="tab:blue", linewidth=1.2, alpha=.7,
                  label="actual" if var_idx == 0 else None)
-        ax.plot(recon[:, :, var_idx].flatten(), color="tab:green", alpha=1, linewidth=1.2,
-                 label="reconstructed" if var_idx == 0 else None)
         ax.set_ylabel(f"var {var_idx}", fontsize=8)
 
     axs[0].legend(loc="upper right")
-    axs[-1].set_xlabel("timepoint (concatenated middle windows)")
-    fig.suptitle(f"Reconstruction @ epoch {epoch} (windows {indices[0]}-{indices[-1]})")
+    axs[-1].set_xlabel("timepoint (concatenated windows)")
+    fig.suptitle(title)
     fig.tight_layout()
 
-    os.makedirs(args.reconstruct_dir, exist_ok=True)
-    out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_epoch{epoch:04d}.png")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+
+def plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id):
+    """Reconstruct the middle `args.reconstruct_n_windows` windows of the training
+    trace, for all variates, and save the actual-vs-reconstructed plot to disk.
+    """
+    ds = provider._ds_trn
+    indices = _select_middle_window_indices(ds, args.reconstruct_n_windows)
+
+    parts = _gather_window_batch(ds, indices, args.device)
+    actual, recon = _decode_reconstruction(args, modules, desired_t, parts)
+
+    out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_epoch{epoch:04d}.png")
+    _plot_actual_vs_reconstructed(
+        actual, recon, anomaly_mask=None,
+        title=f"Reconstruction @ epoch {epoch} (train windows {indices[0]}-{indices[-1]})",
+        out_path=out_path,
+    )
+
     logging.info("Saved reconstruction plot to %s", out_path)
+    return out_path
+
+
+def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experiment_id):
+    """Reconstruct `args.reconstruct_n_windows` windows of the test trace, at
+    the same decoding timepoints (`desired_t`) used for the training
+    reconstruction, and save the actual-vs-reconstructed plot to disk.
+
+    The plotted windows are chosen to contain the labeled anomalous segment
+    (see `_select_anomalous_window_indices`), which is highlighted as a
+    low-alpha red background band.
+    """
+    ds = provider._ds_tst
+    indices = _select_anomalous_window_indices(ds, args.reconstruct_n_windows)
+
+    parts = _gather_window_batch(ds, indices, args.device)
+    actual, recon = _decode_reconstruction(args, modules, desired_t, parts)
+    anomaly_mask = (parts["aux_tgt"].detach().cpu().flatten() > 0).numpy()
+
+    out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_test_epoch{epoch:04d}.png")
+    _plot_actual_vs_reconstructed(
+        actual, recon, anomaly_mask=anomaly_mask,
+        title=f"Test reconstruction @ epoch {epoch} (test windows {indices[0]}-{indices[-1]})",
+        out_path=out_path,
+    )
+
+    logging.info("Saved test reconstruction plot to %s", out_path)
     return out_path
 
 
@@ -336,6 +440,10 @@ def main():
 
     experiment_id = f"qad_fit_trace{args.trace_id}_{datetime.datetime.now().strftime('%y%m%d-%H%M%S')}"
     logging.info("Fitting QAD trace %d (experiment_id=%s)", args.trace_id, experiment_id)
+
+    # Keep each run's reconstruction images/GIFs in their own subfolder.
+    args.reconstruct_dir = os.path.join(args.reconstruct_dir, experiment_id)
+
     logging.info("Parameters: %s", vars(args))
 
     provider = QADProvider(
@@ -367,6 +475,7 @@ def main():
         os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     reconstruction_paths = []
+    test_reconstruction_paths = []
     try:
         for epoch in range(1, args.n_epochs + 1):
             trn_stats = generic_train(args, dl_trn, modules, elbo_loss, None, optimizer, desired_t, args.device)
@@ -386,6 +495,9 @@ def main():
                 reconstruction_paths.append(
                     plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id)
                 )
+                test_reconstruction_paths.append(
+                    plot_test_reconstruction(args, provider, modules, desired_t, epoch, experiment_id)
+                )
 
         save_checkpoint(args, args.n_epochs, experiment_id, modules, desired_t)
     finally:
@@ -396,6 +508,11 @@ def main():
             gif_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_reconstruction.gif")
             make_reconstruction_gif(reconstruction_paths, gif_path, args.reconstruct_gif_duration_ms)
             logging.info("Saved reconstruction GIF (%d frames) to %s", len(reconstruction_paths), gif_path)
+
+        if args.reconstruct_gif and test_reconstruction_paths:
+            test_gif_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_test_reconstruction.gif")
+            make_reconstruction_gif(test_reconstruction_paths, test_gif_path, args.reconstruct_gif_duration_ms)
+            logging.info("Saved test reconstruction GIF (%d frames) to %s", len(test_reconstruction_paths), test_gif_path)
 
     logging.info("Done fitting QAD trace %d.", args.trace_id)
 
