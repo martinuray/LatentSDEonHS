@@ -299,11 +299,14 @@ def _decode_reconstruction(args, modules, desired_t, parts):
         qzx, _ = modules["qzx_net"](h, desired_t)
         zis = qzx.rsample((args.reconstruct_mc_samples,))
         pxz = modules["pxz_net"](zis)
+        # Same score as anomaly_detection.py's evaluate(): negative log-likelihood
+        # of the ground truth under the decoder, averaged over MC samples.
+        nll = (-pxz.log_prob(parts["evd_obs"])).mean(dim=0).detach().cpu()  # (n_windows, n_time, dim)
     modules.train()
 
     recon_samples = pxz.mean.detach().cpu()  # (mc_samples, n_windows, n_time, dim)
     actual = parts["evd_obs"].detach().cpu()
-    return actual, recon_samples
+    return actual, recon_samples, nll
 
 
 def _highlight_anomalous_regions(ax, anomaly_mask):
@@ -322,7 +325,7 @@ def _highlight_anomalous_regions(ax, anomaly_mask):
         ax.axvspan(seg_start - 0.5, len(anomaly_mask) - 0.5, color="red", alpha=0.15, zorder=0)
 
 
-def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, out_path):
+def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, out_path, likelihood=None):
     input_dim = actual.shape[-1]
     n_mc = recon_samples.shape[0]
     # Same alpha scale as the notebook's spaghetti plot (500 samples @ alpha=0.01).
@@ -333,6 +336,11 @@ def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, ou
         axs = [axs]
 
     axs = axs.flatten()
+    # Fix one common y-range across all per-variate twin axes so the
+    # likelihood traces stay directly comparable across variates.
+    likelihood_range = (likelihood.min().item(), likelihood.max().item()) if likelihood is not None else None
+
+    twin_handles, twin_labels = [], []
     for var_idx in range(input_dim):
         ax = axs[var_idx]
         if anomaly_mask is not None:
@@ -344,8 +352,24 @@ def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, ou
         ax.plot(actual[:, :, var_idx].flatten(), color="tab:blue", linewidth=1.2, alpha=.7,
                  label="actual" if var_idx == 0 else None)
         ax.set_ylabel(f"var {var_idx}", fontsize=8)
+        ax.set_zorder(1)
+        ax.patch.set_visible(False)  # keep anomaly shading visible through the twin axis
 
-    axs[0].legend(loc="upper right")
+        if likelihood is not None:
+            ax_twin = ax.twinx()
+            # Distinct from the anomaly-highlight red so the two don't blend.
+            line, = ax_twin.plot(
+                likelihood[:, :, var_idx].flatten(), color="tab:orange", linewidth=0.8, alpha=.7,
+                label="NLL" if var_idx == 0 else None,
+            )
+            ax_twin.set_ylim(*likelihood_range)
+            ax_twin.set_ylabel("NLL", fontsize=7, color="tab:orange")
+            ax_twin.tick_params(axis="y", labelcolor="tab:orange", labelsize=6)
+            if var_idx == 0:
+                twin_handles, twin_labels = [line], ["NLL"]
+
+    handles, labels = axs[0].get_legend_handles_labels()
+    axs[0].legend(handles + twin_handles, labels + twin_labels, loc="upper right", fontsize=7)
     axs[-1].set_xlabel("timepoint (concatenated windows)")
     fig.suptitle(title)
     fig.tight_layout()
@@ -363,7 +387,7 @@ def plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id
     indices = _select_middle_window_indices(ds, args.reconstruct_n_windows)
 
     parts = _gather_window_batch(ds, indices, args.device)
-    actual, recon = _decode_reconstruction(args, modules, desired_t, parts)
+    actual, recon, _ = _decode_reconstruction(args, modules, desired_t, parts)
 
     out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_epoch{epoch:04d}.png")
     _plot_actual_vs_reconstructed(
@@ -383,13 +407,16 @@ def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experime
 
     The plotted windows are chosen to contain the labeled anomalous segment
     (see `_select_anomalous_window_indices`), which is highlighted as a
-    low-alpha red background band.
+    low-alpha red background band. Each variate additionally gets a twin
+    y-axis showing the per-timepoint decoder negative log-likelihood (the
+    same score used as `aux_log_prob` in anomaly_detection.py's evaluate()),
+    with all twin axes sharing one common y-range for comparability.
     """
     ds = provider._ds_tst
     indices = _select_anomalous_window_indices(ds, args.reconstruct_n_windows)
 
     parts = _gather_window_batch(ds, indices, args.device)
-    actual, recon = _decode_reconstruction(args, modules, desired_t, parts)
+    actual, recon, nll = _decode_reconstruction(args, modules, desired_t, parts)
     anomaly_mask = (parts["aux_tgt"].detach().cpu().flatten() > 0).numpy()
 
     out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_test_epoch{epoch:04d}.png")
@@ -397,6 +424,7 @@ def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experime
         actual, recon, anomaly_mask=anomaly_mask,
         title=f"Test reconstruction @ epoch {epoch} (test windows {indices[0]}-{indices[-1]})",
         out_path=out_path,
+        likelihood=nll,
     )
 
     logging.info("Saved test reconstruction plot to %s", out_path)
