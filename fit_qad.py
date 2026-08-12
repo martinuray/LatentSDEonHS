@@ -153,18 +153,18 @@ def build_parser() -> argparse.ArgumentParser:
     ckpt = parser.add_argument_group("Checkpointing/logging arguments")
     ckpt.add_argument("--enable-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     ckpt.add_argument("--checkpoint-dir", type=str, default="checkpoints/qad_fit")
-    ckpt.add_argument("--checkpoint-every-n-epochs", type=int, default=50, help="0 disables periodic checkpoints; the final epoch is always saved.")
+    ckpt.add_argument("--checkpoint-every-n-epochs", type=int, default=0, help="0 disables periodic checkpoints; the final epoch is always saved.")
     ckpt.add_argument("--log-every-n-epochs", type=int, default=10)
     ckpt.add_argument("--loglevel", choices=["debug", "info", "warning", "error", "critical"], default="info")
 
     recon = parser.add_argument_group("Reconstruction plotting arguments")
     recon.add_argument(
-        "--reconstruct-at-k", type=int, default=5,
+        "--reconstruct-at-k", type=int, default=20,
         help="If >0, plot a data reconstruction every k-th epoch. 0 disables reconstruction plotting.",
     )
     recon.add_argument("--reconstruct-dir", type=str, default="out/reconstructions/qad_fit")
     recon.add_argument(
-        "--reconstruct-n-windows", type=int, default=10,
+        "--reconstruct-n-windows", type=int, default=15,
         help="Number of windows to reconstruct and plot: the (middle) windows for train, "
              "and a contiguous block containing the labeled anomalous segment for test.",
     )
