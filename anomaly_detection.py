@@ -386,7 +386,6 @@ def train_one_dataset(
             to_append["esc"] = es_counter
 
             stats["oth"].append(to_append)
-            scheduler.step()
 
             stats["trn"].append(trn_stats)
             stats["tst"].append(tst_stats)
@@ -407,6 +406,8 @@ def train_one_dataset(
             if args.enable_file_logging:
                 fname = os.path.join(args.log_dir, f"{experiment_id_str}.json")
                 save_stats(args, stats, fname)
+
+        scheduler.step()
 
     return (best_stats if best_stats is not None else tst_stats), stats
 
