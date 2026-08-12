@@ -159,6 +159,12 @@ class QADData:
             raw_data = raw_data.drop(columns=['Enable'])
 
         raw_data = raw_data.iloc[::subsample_factor]
+        # Fit (train) / apply (test, val) the configured scaler on the flat,
+        # un-windowed data. QAD features can be negative (e.g. Voltage0,
+        # MotorSpeed0/1), so this must run before normalize_masked_data's
+        # (x - min) / max downstream step, which only lands in [0, 1] when
+        # min is already ~0.
+        raw_data = self.normalize_data(raw_data)
         raw_data = reshape_data(raw_data, self.window_length)
 
         if self.mode == 'test':
