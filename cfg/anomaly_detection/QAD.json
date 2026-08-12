@@ -10,7 +10,7 @@
   "data_window_overlap": 0.0,
   "batch_size": 4096,
   "lr": 1e-2,
-  "n_epochs": 2100,
+  "n_epochs": 1500,
   "kl0_weight": 0.0001,
   "klp_weight": 0.0001,
   "pxz_weight": 1.0,
