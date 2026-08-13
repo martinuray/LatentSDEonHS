@@ -160,13 +160,13 @@ class ProgressMessage(object):
         self.separator = separator
         self.precision = precision
 
-    def build_progress_message(self, stats: dict, epoch: int) -> str:
+    def build_progress_message(self, stats: dict, epoch: int, epoch_key:int) -> str:
         """Builds up a message for command-line output."""
         assert set(stats.keys()).issubset({"trn", "tst", "val", "oth"})
         msg = f"{epoch:04d} {self.separator}"
         for mode, keys in self.mask.items():
             for key in keys:
-                val = stats[mode][epoch - 1][key]
+                val = stats[mode][epoch_key - 1][key]
                 if mode == "oth":
                     if type(val) == float:
                         msg += f" {key}={val:0.6f} {self.separator}"

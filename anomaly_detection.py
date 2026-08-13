@@ -398,7 +398,7 @@ def train_one_dataset(
                 ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
                 save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
 
-            msg = pm.build_progress_message(stats, epoch // args.log_every_n_epochs)
+            msg = pm.build_progress_message(stats, epoch_key=epoch // args.log_every_n_epochs, epoch=epoch)
             if stats_prefix:
                 msg = f"[{stats_prefix}] {msg}"
             logging.debug(msg)
@@ -825,7 +825,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
         else None,
         logfile_log_level=args.loglevel,
         logfile_log_color=False,
-        log_line_template="%(color_on)s[%(created)d] [%(levelname)-8s] %(message)s%(color_off)s",
+        log_line_template="%(color_on)s[%(asctime)s] [%(levelname)-8s] %(message)s%(color_off)s",
     )
 
     # temp
