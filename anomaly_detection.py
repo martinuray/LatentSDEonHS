@@ -878,7 +878,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
             )
         elif args.dataset == 'QAD':
             dataset_number = None
-            if len(args.trace_ids) == 1:
+            if args.trace_ids is not None and len(args.trace_ids) == 1:
                 dataset_number = int(args.trace_ids[0])
             provider = QADProvider(
                 data_dir=data_dir,
