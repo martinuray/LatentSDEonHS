@@ -150,7 +150,7 @@ class QADData:
             data_ = self.scaler.transform(data_)
         return data_
 
-    def _process_QAD_data(self, n_samples=None, subsample_factor=10):
+    def _process_QAD_data(self, n_samples=None, subsample_factor=1):
         logging.warning(f"Processing QAD Data {self.mode} {self.dataset_number} with subsample factor {subsample_factor}")
         raw_data = load_qad_txt(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.txt'))
 
