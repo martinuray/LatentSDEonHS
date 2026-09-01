@@ -914,7 +914,11 @@ def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, devic
 
     inverse_mse = 1.0 / (feature_mse + epsilon)
     if weighting == "exp-inverse":
-        raw_weights = np.exp(inverse_mse)
+        # softmax of inverse_mse: subtract the max before exponentiating so the
+        # largest exponent is 0 (avoids float64 overflow for well-reconstructed
+        # features, e.g. exp(1/mse) already overflows once mse < ~1.4e-3). This
+        # shift leaves the normalized weights unchanged (softmax(z) == softmax(z - max(z))).
+        raw_weights = np.exp(inverse_mse - inverse_mse.max())
     elif weighting == "inverse":
         raw_weights = inverse_mse
     else:
