@@ -100,7 +100,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument(
         "--score-aggregation",
-        choices=["max", "weighted-mse"],
+        choices=["max", "weighted-mse", "weighted-mse-exp"],
         default="max",
         help=(
             "Strategy used to aggregate per-feature anomaly scores into a single "
@@ -108,7 +108,11 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "(default). 'weighted-mse': soft-voting ensemble that sums per-feature "
             "scores weighted by the inverse of each feature's reconstruction MSE "
             "observed during training (features the model reconstructs more "
-            "faithfully on nominal training data contribute proportionally more)."
+            "faithfully on nominal training data contribute proportionally more). "
+            "'weighted-mse-exp': same soft-voting ensemble, but weights are the "
+            "exponential of the inverse per-feature MSE instead of the inverse "
+            "directly, sharpening the contrast between well- and poorly-"
+            "reconstructed features."
         ),
     )
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
@@ -367,12 +371,13 @@ def train_one_dataset(
                     args, dl_trn, modules, desired_t, args.device)
 
             feature_weights = None
-            if args.score_aggregation == "weighted-mse":
+            if args.score_aggregation in ("weighted-mse", "weighted-mse-exp"):
+                weighting = "exp-inverse" if args.score_aggregation == "weighted-mse-exp" else "inverse"
                 weight_stats = calculate_feature_reconstruction_weights(
-                    args, dl_trn, modules, desired_t, args.device)
+                    args, dl_trn, modules, desired_t, args.device, weighting=weighting)
                 feature_weights = weight_stats["feature_weights"]
                 logging.debug(
-                    "Updated weighted-mse feature weights at epoch %d: %s", epoch, feature_weights
+                    "Updated %s feature weights at epoch %d: %s", args.score_aggregation, epoch, feature_weights
                 )
 
             tst_stats = evaluate(
@@ -743,7 +748,7 @@ def eval_scores_for_all_score_normalizations(
     def _weighted_mse_agg(x):
         if feature_weights is None:
             raise ValueError(
-                "aggregation_strategy='weighted-mse' requires feature_weights "
+                f"aggregation_strategy='{aggregation_strategy}' requires feature_weights "
                 "(per-feature weights derived from training reconstruction MSE, "
                 "see calculate_feature_reconstruction_weights)."
             )
@@ -762,7 +767,11 @@ def eval_scores_for_all_score_normalizations(
         # Soft-voting ensemble: each feature's (normalized) error contributes to
         # the aggregated score in proportion to a weight learned from training
         # reconstruction error, instead of an unweighted reduction like max/mean.
+        # Both variants share the same weighted-sum aggregation below; they only
+        # differ in how `feature_weights` was derived (see
+        # calculate_feature_reconstruction_weights's `weighting` argument).
         'weighted-mse': _weighted_mse_agg,
+        'weighted-mse-exp': _weighted_mse_agg,
     }
 
     if aggregation_strategy not in AGG_STRATEGIES:
@@ -847,7 +856,7 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
     return stats
 
 
-def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, device, epsilon=1e-6):
+def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, device, epsilon=1e-6, weighting="inverse"):
     """Derive per-feature soft-voting weights from training reconstruction error.
 
     Runs one pass over `dl` (the training data) and, independently for every
@@ -857,9 +866,16 @@ def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, devic
     error signal carries a cleaner anomaly signature on unseen data; channels
     that are inherently noisy/hard to reconstruct (high training MSE) contribute
     less to the aggregated score, so they cannot dominate it with an inflated
-    baseline error. Weights are the inverse per-feature MSE, normalized to sum
-    to one, so they directly express the proportion of the final score each
-    feature is allowed to contribute (a soft-voting ensemble).
+    baseline error. Raw (pre-normalization) weights are derived from the inverse
+    per-feature MSE, then normalized to sum to one, so they directly express the
+    proportion of the final score each feature is allowed to contribute (a
+    soft-voting ensemble).
+
+    Args:
+        weighting: 'inverse' (default) uses the inverse per-feature MSE directly
+            as the raw weight. 'exp-inverse' instead uses exp(1 / (mse + epsilon)),
+            which sharpens the contrast between well- and poorly-reconstructed
+            features before normalization.
 
     Returns:
         dict with:
@@ -897,7 +913,13 @@ def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, devic
     feature_mse = (se_sum / se_count.clamp_min(1.0)).detach().cpu().numpy()
 
     inverse_mse = 1.0 / (feature_mse + epsilon)
-    feature_weights = inverse_mse / inverse_mse.sum()
+    if weighting == "exp-inverse":
+        raw_weights = np.exp(inverse_mse)
+    elif weighting == "inverse":
+        raw_weights = inverse_mse
+    else:
+        raise ValueError(f"Unknown weighting '{weighting}'. Expected 'inverse' or 'exp-inverse'.")
+    feature_weights = raw_weights / raw_weights.sum()
 
     return {"feature_mse": feature_mse, "feature_weights": feature_weights}
 
