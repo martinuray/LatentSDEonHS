@@ -21,7 +21,7 @@
   "h_dim": 12,
   "n_deg": 10,
   "learnable_prior": false,
-  "freeze_sigma": true,
+  "freeze_sigma": false,
   "initial_sigma": 0.05,
   "mc_eval_samples": 10,
   "mc_train_samples": 10,
