@@ -178,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Combine all reconstruction PNGs generated during the run into a single chronological GIF at the end.",
     )
     recon.add_argument(
+        "--plot-latent-sphere", action=argparse.BooleanOptionalAction, default=True,
+        help="Every k-th epoch (same cadence as reconstructions), plot the sampled latent "
+             "paths of a representative train window projected onto the unit sphere "
+             "(cf. notebooks/analyze_irregular_sine_exp.py). Combined into its own GIF at the end.",
+    )
+    recon.add_argument(
         "--reconstruct-gif-duration-ms", type=int, default=400,
         help="Per-frame display duration (milliseconds) for the reconstruction GIF.",
     )
@@ -431,6 +437,90 @@ def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experime
     return out_path
 
 
+def _plot_latent_path_on_sphere(latents, title, out_path, elev=20, azim=45):
+    """Plot the first three coordinates of a set of sampled latent paths as
+    trajectories on/near the unit sphere (the SOn encoder places the latent
+    state on S^(z_dim-1); for z_dim > 3 this is a projection onto the leading
+    three axes). Mirrors the sphere visualisation in
+    notebooks/analyze_irregular_sine_exp.py.
+
+    Args:
+        latents: array of shape (n_samples, n_time, z_dim>=3).
+    """
+    latents = np.asarray(latents)
+    n_samples = latents.shape[0]
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(projection="3d")
+
+    u, v = np.mgrid[0:2 * np.pi:60j, 0:np.pi:30j]
+    ax.plot_wireframe(
+        np.cos(u) * np.sin(v), np.sin(u) * np.sin(v), np.cos(v),
+        color="k", alpha=0.15, linewidth=0.5,
+    )
+
+    path_alpha = min(0.4, max(0.02, 8.0 / n_samples))
+    for idx in range(n_samples):
+        xs, ys, zs = latents[idx, :, 0], latents[idx, :, 1], latents[idx, :, 2]
+        ax.plot(xs, ys, zs, color="tab:blue", alpha=path_alpha, linewidth=1.0)
+        ax.scatter(xs[0], ys[0], zs[0], color="tab:green", alpha=path_alpha, s=8)
+        ax.scatter(xs[-1], ys[-1], zs[-1], color="tab:red", alpha=path_alpha, s=8)
+
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_zlim(-1, 1)
+    ax.set_box_aspect((1, 1, 1))
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlabel("z0")
+    ax.set_ylabel("z1")
+    ax.set_zlabel("z2")
+    fig.suptitle(title)
+    fig.tight_layout()
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_latent_sphere(args, provider, modules, desired_t, epoch, experiment_id):
+    """Sample latent paths for a representative middle training window and plot
+    their leading three coordinates on the unit sphere.
+
+    Saved on the same cadence as the reconstruction plots (`--reconstruct-at-k`)
+    so the frames line up with the reconstruction GIF; the frames are themselves
+    combined into a `_latent_sphere.gif` at the end of the run.
+    """
+    ds = provider._ds_trn
+    indices = _select_middle_window_indices(ds, args.reconstruct_n_windows)
+
+    parts = _gather_window_batch(ds, indices, args.device)
+    inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
+
+    modules.eval()
+    with torch.no_grad():
+        h = modules["recog_net"](inp)
+        qzx, _ = modules["qzx_net"](h, desired_t)
+        # (mc_samples, n_windows, n_time, z_dim)
+        latents = qzx.rsample((args.reconstruct_mc_samples,)).detach().cpu()
+    modules.train()
+
+    if latents.shape[-1] < 3:
+        logging.warning("z_dim=%d < 3; skipping latent-sphere plot.", latents.shape[-1])
+        return None
+
+    win = latents.shape[1] // 2  # representative window within the selected block
+
+    out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_sphere_epoch{epoch:04d}.png")
+    _plot_latent_path_on_sphere(
+        latents[:, win, :, :],
+        title=f"Latent paths on the sphere @ epoch {epoch} (train window {indices[win]})",
+        out_path=out_path,
+    )
+
+    logging.info("Saved latent-sphere plot to %s", out_path)
+    return out_path
+
+
 def make_reconstruction_gif(image_paths, out_path, duration_ms):
     """Combine PNGs (already in chronological order) into a single looping GIF."""
     frames = [Image.open(p).convert("RGB") for p in image_paths]
@@ -504,6 +594,7 @@ def main():
 
     reconstruction_paths = []
     test_reconstruction_paths = []
+    latent_sphere_paths = []
     try:
         for epoch in range(1, args.n_epochs + 1):
             trn_stats = generic_train(args, dl_trn, modules, elbo_loss, None, optimizer, desired_t, args.device)
@@ -526,6 +617,10 @@ def main():
                 test_reconstruction_paths.append(
                     plot_test_reconstruction(args, provider, modules, desired_t, epoch, experiment_id)
                 )
+                if args.plot_latent_sphere:
+                    sphere_path = plot_latent_sphere(args, provider, modules, desired_t, epoch, experiment_id)
+                    if sphere_path is not None:
+                        latent_sphere_paths.append(sphere_path)
 
         save_checkpoint(args, args.n_epochs, experiment_id, modules, desired_t)
     finally:
@@ -541,6 +636,11 @@ def main():
             test_gif_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_test_reconstruction.gif")
             make_reconstruction_gif(test_reconstruction_paths, test_gif_path, args.reconstruct_gif_duration_ms)
             logging.info("Saved test reconstruction GIF (%d frames) to %s", len(test_reconstruction_paths), test_gif_path)
+
+        if args.reconstruct_gif and latent_sphere_paths:
+            sphere_gif_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_latent_sphere.gif")
+            make_reconstruction_gif(latent_sphere_paths, sphere_gif_path, args.reconstruct_gif_duration_ms)
+            logging.info("Saved latent-sphere GIF (%d frames) to %s", len(latent_sphere_paths), sphere_gif_path)
 
     logging.info("Done fitting QAD trace %d.", args.trace_id)
 
