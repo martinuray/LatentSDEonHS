@@ -15,6 +15,8 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.lines import Line2D
 from PIL import Image
 import torch
 import torch.nn as nn
@@ -180,8 +182,16 @@ def build_parser() -> argparse.ArgumentParser:
     recon.add_argument(
         "--plot-latent-sphere", action=argparse.BooleanOptionalAction, default=True,
         help="Every k-th epoch (same cadence as reconstructions), plot the sampled latent "
-             "paths of a representative train window projected onto the unit sphere "
+             "paths of several train windows projected onto the unit sphere "
              "(cf. notebooks/analyze_irregular_sine_exp.py). Combined into its own GIF at the end.",
+    )
+    recon.add_argument(
+        "--latent-sphere-n-windows", type=int, default=10,
+        help="Number of (middle) training windows drawn on the latent sphere, one colour each.",
+    )
+    recon.add_argument(
+        "--latent-sphere-mc-samples", type=int, default=25,
+        help="Number of latent-path samples drawn per window for the latent-sphere plot.",
     )
     recon.add_argument(
         "--reconstruct-gif-duration-ms", type=int, default=400,
@@ -437,20 +447,24 @@ def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experime
     return out_path
 
 
-def _plot_latent_path_on_sphere(latents, title, out_path, elev=20, azim=45):
-    """Plot the first three coordinates of a set of sampled latent paths as
-    trajectories on/near the unit sphere (the SOn encoder places the latent
-    state on S^(z_dim-1); for z_dim > 3 this is a projection onto the leading
-    three axes). Mirrors the sphere visualisation in
+def _plot_latent_path_on_sphere(latents, window_indices, title, out_path, elev=20, azim=45):
+    """Plot the first three coordinates of sampled latent paths as trajectories
+    on/near the unit sphere (the SOn encoder places the latent state on
+    S^(z_dim-1); for z_dim > 3 this is a projection onto the leading three
+    axes). Mirrors the sphere visualisation in
     notebooks/analyze_irregular_sine_exp.py.
 
+    One colour per window; the full path between the start (circle) and end
+    (square) marker of every sample is drawn.
+
     Args:
-        latents: array of shape (n_samples, n_time, z_dim>=3).
+        latents: array of shape (n_windows, n_samples, n_time, z_dim>=3).
+        window_indices: dataset indices of the plotted windows (for the legend).
     """
     latents = np.asarray(latents)
-    n_samples = latents.shape[0]
+    n_windows, n_samples = latents.shape[0], latents.shape[1]
 
-    fig = plt.figure(figsize=(6, 6))
+    fig = plt.figure(figsize=(7, 7))
     ax = fig.add_subplot(projection="3d")
 
     u, v = np.mgrid[0:2 * np.pi:60j, 0:np.pi:30j]
@@ -459,12 +473,20 @@ def _plot_latent_path_on_sphere(latents, title, out_path, elev=20, azim=45):
         color="k", alpha=0.15, linewidth=0.5,
     )
 
-    path_alpha = min(0.4, max(0.02, 8.0 / n_samples))
-    for idx in range(n_samples):
-        xs, ys, zs = latents[idx, :, 0], latents[idx, :, 1], latents[idx, :, 2]
-        ax.plot(xs, ys, zs, color="tab:blue", alpha=path_alpha, linewidth=1.0)
-        ax.scatter(xs[0], ys[0], zs[0], color="tab:green", alpha=path_alpha, s=8)
-        ax.scatter(xs[-1], ys[-1], zs[-1], color="tab:red", alpha=path_alpha, s=8)
+    cmap = plt.get_cmap("tab10" if n_windows <= 10 else "turbo")
+    path_alpha = min(0.4, max(0.02, 6.0 / n_samples))
+
+    legend_handles = []
+    for w in range(n_windows):
+        color = cmap(w % 10) if n_windows <= 10 else cmap(w / max(1, n_windows - 1))
+        for s in range(n_samples):
+            xs, ys, zs = latents[w, s, :, 0], latents[w, s, :, 1], latents[w, s, :, 2]
+            ax.plot(xs, ys, zs, color=color, alpha=path_alpha, linewidth=1.0)
+            ax.scatter(xs[0], ys[0], zs[0], color=color, alpha=path_alpha, s=10, marker="o")
+            ax.scatter(xs[-1], ys[-1], zs[-1], color=color, alpha=path_alpha, s=12, marker="s")
+        legend_handles.append(
+            Line2D([0], [0], color=color, lw=2, label=f"window {window_indices[w]}")
+        )
 
     ax.set_xlim(-1, 1)
     ax.set_ylim(-1, 1)
@@ -474,6 +496,7 @@ def _plot_latent_path_on_sphere(latents, title, out_path, elev=20, azim=45):
     ax.set_xlabel("z0")
     ax.set_ylabel("z1")
     ax.set_zlabel("z2")
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=7, framealpha=0.6)
     fig.suptitle(title)
     fig.tight_layout()
 
@@ -483,15 +506,17 @@ def _plot_latent_path_on_sphere(latents, title, out_path, elev=20, azim=45):
 
 
 def plot_latent_sphere(args, provider, modules, desired_t, epoch, experiment_id):
-    """Sample latent paths for a representative middle training window and plot
-    their leading three coordinates on the unit sphere.
+    """Sample latent paths for `args.latent_sphere_n_windows` middle training
+    windows and plot their leading three coordinates on the unit sphere, one
+    colour per window.
 
     Saved on the same cadence as the reconstruction plots (`--reconstruct-at-k`)
     so the frames line up with the reconstruction GIF; the frames are themselves
     combined into a `_latent_sphere.gif` at the end of the run.
     """
     ds = provider._ds_trn
-    indices = _select_middle_window_indices(ds, args.reconstruct_n_windows)
+    n_windows = max(1, args.latent_sphere_n_windows)
+    indices = _select_middle_window_indices(ds, n_windows)
 
     parts = _gather_window_batch(ds, indices, args.device)
     inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
@@ -501,19 +526,22 @@ def plot_latent_sphere(args, provider, modules, desired_t, epoch, experiment_id)
         h = modules["recog_net"](inp)
         qzx, _ = modules["qzx_net"](h, desired_t)
         # (mc_samples, n_windows, n_time, z_dim)
-        latents = qzx.rsample((args.reconstruct_mc_samples,)).detach().cpu()
+        latents = qzx.rsample((args.latent_sphere_mc_samples,)).detach().cpu()
     modules.train()
 
     if latents.shape[-1] < 3:
         logging.warning("z_dim=%d < 3; skipping latent-sphere plot.", latents.shape[-1])
         return None
 
-    win = latents.shape[1] // 2  # representative window within the selected block
+    # -> (n_windows, mc_samples, n_time, z_dim)
+    latents = latents.permute(1, 0, 2, 3).numpy()
 
     out_path = os.path.join(args.reconstruct_dir, f"{experiment_id}_sphere_epoch{epoch:04d}.png")
     _plot_latent_path_on_sphere(
-        latents[:, win, :, :],
-        title=f"Latent paths on the sphere @ epoch {epoch} (train window {indices[win]})",
+        latents,
+        window_indices=indices,
+        title=f"Latent paths on the sphere @ epoch {epoch} "
+              f"(train windows {indices[0]}-{indices[-1]})",
         out_path=out_path,
     )
 
