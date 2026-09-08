@@ -602,6 +602,7 @@ def main():
         seed=args.seed,
         raw_subdir=args.raw_subdir,
         fixed_subsample_mask=args.fixed_subsample_mask,
+        train_shuffle = True
     )
 
     dl_trn = provider.get_train_loader(
@@ -611,6 +612,19 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
+    )
+
+    provider_viz = QADProvider(
+        data_dir=args.data_dir,
+        dataset_number=args.trace_id,
+        window_length=args.data_window_length,
+        window_overlap=args.data_window_overlap,
+        data_normalization_strategy=args.data_normalization_strategy,
+        subsample=args.subsample,
+        seed=args.seed,
+        raw_subdir=args.raw_subdir,
+        fixed_subsample_mask=args.fixed_subsample_mask,
+        train_shuffle = False
     )
 
     desired_t = torch.linspace(0, 1.00, provider.num_timepoints, device=args.device).float()
@@ -640,13 +654,13 @@ def main():
 
             if args.reconstruct_at_k and epoch % args.reconstruct_at_k == 0:
                 reconstruction_paths.append(
-                    plot_reconstruction(args, provider, modules, desired_t, epoch, experiment_id)
+                    plot_reconstruction(args, provider_viz, modules, desired_t, epoch, experiment_id)
                 )
                 test_reconstruction_paths.append(
-                    plot_test_reconstruction(args, provider, modules, desired_t, epoch, experiment_id)
+                    plot_test_reconstruction(args, provider_viz, modules, desired_t, epoch, experiment_id)
                 )
                 if args.plot_latent_sphere:
-                    sphere_path = plot_latent_sphere(args, provider, modules, desired_t, epoch, experiment_id)
+                    sphere_path = plot_latent_sphere(args, provider_viz, modules, desired_t, epoch, experiment_id)
                     if sphere_path is not None:
                         latent_sphere_paths.append(sphere_path)
 

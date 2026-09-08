@@ -31,6 +31,7 @@ class QADData:
             data_normalization_strategy: str = "none",
             raw_subdir: str = "qad_clean_txt_100Hz",
             processed_root: str = None,
+            shuffle: bool = True,
     ):
 
         self.scaler = normalizer
@@ -41,6 +42,7 @@ class QADData:
         self.window_length = window_length
         self.raw_subdir = raw_subdir
         self._processed_root = processed_root
+        self.shuffle = shuffle
 
         self.overlapping_windows = window_overlap
 
@@ -202,7 +204,11 @@ class QADData:
 
         if self.mode == 'train':
             data_len = len(data)
-            indices = np.random.permutation(data_len)
+            if self.shuffle:
+                indices = np.random.permutation(data_len)
+            else:
+                indices = np.arange(data_len)
+
             split_idx = int(data_len * 0.9)
             train_indices = indices[:split_idx]
             val_indices = indices[split_idx:]
@@ -223,7 +229,7 @@ class QADDataset(Dataset):
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0, seed=-1,
                  data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz",
-                 fixed_subsample_mask: bool = False, processed_root: str = None):
+                 fixed_subsample_mask: bool = False, processed_root: str = None, train_shuffle:bool = True):
 
         self.mode = mode
         self.subsample = subsample
@@ -241,7 +247,7 @@ class QADDataset(Dataset):
                 data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy,
-                raw_subdir=raw_subdir, processed_root=processed_root)
+                raw_subdir=raw_subdir, processed_root=processed_root, shuffle=train_shuffle)
 
             objs = {
                 'train': train_data,
@@ -439,7 +445,8 @@ class QADProvider(DatasetProvider):
                  window_overlap: float = 0.0,
                  data_normalization_strategy: str = "none", subsample: float = 1.0, seed=-1,
                  raw_subdir: str = "qad_clean_txt_100Hz",
-                 fixed_subsample_mask: bool = False):
+                 fixed_subsample_mask: bool = False,
+                 train_shuffle:bool = False,):
         super().__init__()
 
         self._dataset = dataset_number
@@ -452,6 +459,7 @@ class QADProvider(DatasetProvider):
             'data_normalization_strategy': data_normalization_strategy,
             'raw_subdir': raw_subdir,
             'processed_root': self._processed_root,
+            'train_shuffle': train_shuffle
         }
 
         self._ds_trn = QADDataset(
