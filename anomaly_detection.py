@@ -376,9 +376,9 @@ def train_one_dataset(
                 weight_stats = calculate_feature_reconstruction_weights(
                     args, dl_trn, modules, desired_t, args.device, weighting=weighting)
                 feature_weights = weight_stats["feature_weights"]
-                logging.debug(
-                    "Updated %s feature weights at epoch %d: %s", args.score_aggregation, epoch, feature_weights
-                )
+                #logging.trace(
+                #    "Updated weighted-mse feature weights at epoch %d: %s", epoch, feature_weights
+                #)
 
             tst_stats = evaluate(
                 args, dl_tst, modules, elbo_loss, desired_t, args.device,
@@ -1016,7 +1016,6 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
-                raw_subdir="qad_clean_txt_100Hz",
             )
         elif args.dataset == 'TSB-AD-M':
             dataset_number = None

@@ -43,10 +43,22 @@ def _validate_numpy_version() -> None:
 
 def _load_pickl(dataset_path: Path):
     with dataset_path.open("rb") as f:
-        data = pickle.load(f)
+        data = _QADCompatUnpickler(f).load()
     if isinstance(data, pd.Series):
         data = data.to_frame(name="labels")
     return data
+
+
+class _QADCompatUnpickler(pickle.Unpickler):
+    _MODULE_REMAPS = {
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+    }
+
+    def find_class(self, module: str, name: str):
+        module = self._MODULE_REMAPS.get(module, module)
+        return super().find_class(module, name)
 
 
 def _to_dataframe(data) -> pd.DataFrame:

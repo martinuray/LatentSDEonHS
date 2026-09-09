@@ -4,6 +4,7 @@ import glob
 import re
 import shutil
 import tempfile
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -29,7 +30,6 @@ class QADData:
             window_length: int = 100, window_overlap: float = 0.0,
             normalizer=None,
             data_normalization_strategy: str = "none",
-            raw_subdir: str = "qad_clean_txt_100Hz",
             processed_root: str = None,
             shuffle: bool = True,
     ):
@@ -40,7 +40,6 @@ class QADData:
         self.dataset_number = dataset_number
         self.mode = mode
         self.window_length = window_length
-        self.raw_subdir = raw_subdir
         self._processed_root = processed_root
         self.shuffle = shuffle
 
@@ -65,9 +64,9 @@ class QADData:
         os.makedirs(self.processed_folder, exist_ok=True)
 
         required_files = [
-            os.path.join(self.raw_folder, f'train_{self.dataset_number}.txt'),
-            os.path.join(self.raw_folder, f'test_{self.dataset_number}.txt'),
-            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.txt')
+            os.path.join(self.raw_folder, f'train_{self.dataset_number}.pkl'),
+            os.path.join(self.raw_folder, f'test_{self.dataset_number}.pkl'),
+            os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl')
         ]
 
         return all(os.path.isfile(f) for f in required_files)
@@ -77,31 +76,16 @@ class QADData:
             self.processed_folder, f'{self.mode}_{self.dataset_number}.pt')
         )
 
-    def _resolve_raw_subdir(self):
-        requested = os.path.join(self.root_path, "QAD", "raw", self.raw_subdir)
-        if os.path.isdir(requested):
-            return self.raw_subdir
-
-        fallback = "qad_clean_txt_100Hz"
-        fallback_path = os.path.join(self.root_path, "QAD", "raw", fallback)
-        if os.path.isdir(fallback_path):
-            logging.warning(
-                f"Requested QAD folder '{self.raw_subdir}' not found. Falling back to '{fallback}'."
-            )
-            return fallback
-
-        return self.raw_subdir
-
     @property
     def raw_folder(self):
-        return os.path.join(self.root_path, "QAD", "raw", self._resolve_raw_subdir())
+        return os.path.join(self.root_path, "QAD", "raw")
 
     @property
     def processed_folder(self):
         if self._processed_root is not None:
             return self._processed_root
         # Keep processed namespace aligned with the actual raw folder name.
-        return os.path.join(self.root_path, "QAD", "processed", self._resolve_raw_subdir())
+        return os.path.join(self.root_path, "QAD", "processed")
 
     @property
     def training_file(self):
@@ -154,7 +138,7 @@ class QADData:
 
     def _process_QAD_data(self, n_samples=None, subsample_factor=1):
         logging.warning(f"Processing QAD Data {self.mode} {self.dataset_number} with subsample factor {subsample_factor}")
-        raw_data = load_qad_txt(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.txt'))
+        raw_data = load_qad_pkl(os.path.join(self.raw_folder, f'{self.mode}_{self.dataset_number}.pkl'))
 
         # Drop the Enable feature
         if 'Enable' in raw_data.columns:
@@ -170,8 +154,8 @@ class QADData:
         raw_data = reshape_data(raw_data, self.window_length)
 
         if self.mode == 'test':
-            self.targets = load_qad_txt(
-                os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.txt'),
+            self.targets = load_qad_pkl(
+                os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl'),
                 is_label=True,
             )
             self.targets = self.targets[::subsample_factor]
@@ -228,7 +212,7 @@ class QADDataset(Dataset):
     
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0, seed=-1,
-                 data_normalization_strategy: str = "none", raw_subdir: str = "qad_clean_txt_100Hz",
+                 data_normalization_strategy: str = "none",
                  fixed_subsample_mask: bool = False, processed_root: str = None, train_shuffle:bool = True):
 
         self.mode = mode
@@ -240,26 +224,26 @@ class QADDataset(Dataset):
         self._lengths = []
         self._cumulative = []
 
-        dataset_ids = self._resolve_dataset_ids(data_dir, dataset_number, raw_subdir)
+        dataset_ids = self._resolve_dataset_ids(data_dir, dataset_number)
 
         for dataset_id in dataset_ids:
             train_data = QADData(
                 data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy,
-                raw_subdir=raw_subdir, processed_root=processed_root, shuffle=train_shuffle)
+                processed_root=processed_root, shuffle=train_shuffle)
 
             objs = {
                 'train': train_data,
                 'test': QADData(
                     data_dir, mode='test', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    normalizer=train_data.scaler,
                     processed_root=processed_root),
                 'val': QADData(
                     data_dir, mode='val', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
-                    normalizer=train_data.scaler, raw_subdir=raw_subdir,
+                    normalizer=train_data.scaler,
                     processed_root=processed_root)
             }
 
@@ -351,17 +335,14 @@ class QADDataset(Dataset):
             self.aux_tgt = ds0['aux_tgt']
 
     @staticmethod
-    def _resolve_dataset_ids(data_dir: str, dataset_number, raw_subdir: str):
+    def _resolve_dataset_ids(data_dir: str, dataset_number):
         if dataset_number is None:
-            raw_folder = os.path.join(data_dir, "QAD", "raw", raw_subdir)
-            if not os.path.isdir(raw_folder):
-                fallback = os.path.join(data_dir, "QAD", "raw", "qad_clean_txt_100Hz")
-                raw_folder = fallback if os.path.isdir(fallback) else raw_folder
+            raw_folder = os.path.join(data_dir, "QAD", "raw")
 
-            train_files = glob.glob(os.path.join(raw_folder, "train_*.txt"))
+            train_files = glob.glob(os.path.join(raw_folder, "train_*.pkl"))
             ids = []
             for file_ in train_files:
-                match = re.match(r"^train_(\d+)\.txt$", os.path.basename(file_))
+                match = re.match(r"^train_(\d+)\.pkl", os.path.basename(file_))
                 if match is not None:
                     ids.append(int(match.group(1)))
 
@@ -444,7 +425,6 @@ class QADProvider(DatasetProvider):
     def __init__(self, data_dir=None, dataset_number=None, window_length: int = 100,
                  window_overlap: float = 0.0,
                  data_normalization_strategy: str = "none", subsample: float = 1.0, seed=-1,
-                 raw_subdir: str = "qad_clean_txt_100Hz",
                  fixed_subsample_mask: bool = False,
                  train_shuffle:bool = False,):
         super().__init__()
@@ -457,7 +437,6 @@ class QADProvider(DatasetProvider):
             'window_length': window_length,
             'window_overlap': window_overlap,
             'data_normalization_strategy': data_normalization_strategy,
-            'raw_subdir': raw_subdir,
             'processed_root': self._processed_root,
             'train_shuffle': train_shuffle
         }
@@ -525,20 +504,35 @@ class QADProvider(DatasetProvider):
         shutil.rmtree(self._processed_root, ignore_errors=True)
 
 
-def load_qad_txt(dataset_path, is_label: bool = False):
-    # sep=None lets pandas infer comma/tab separators from converted TXT files.
-    kwargs = {}
-    if not is_label:
-        kwargs["sep"] = None
-        kwargs["engine"] = "python"
+def load_qad_pkl(dataset_path, is_label: bool = False):
+    with open(dataset_path, "rb") as f:
+        loaded_data = _QADCompatUnpickler(f).load()
 
-    data = pd.read_csv(dataset_path, **kwargs)
-
-    if isinstance(data, pd.Series):
-        data = data.to_frame(name="labels")
+    if isinstance(loaded_data, pd.Series):
+        data = loaded_data.to_frame(name="labels")
+    elif isinstance(loaded_data, pd.DataFrame):
+        data = loaded_data
+    else:
+        data = pd.DataFrame(loaded_data)
 
     # Label files should always expose a canonical `labels` column.
-    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and "labels" not in data.columns:
+    if is_label and len(data.columns) == 1 and "labels" not in data.columns:
         data.columns = ["labels"]
 
     return data
+
+
+class _QADCompatUnpickler(pickle.Unpickler):
+    _MODULE_REMAPS = {
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+    }
+
+    def find_class(self, module: str, name: str):
+        module = self._MODULE_REMAPS.get(module, module)
+        if module.startswith("numpy._core."):
+            module = module.replace("numpy._core.", "numpy.core.", 1)
+        return super().find_class(module, name)
+
+
