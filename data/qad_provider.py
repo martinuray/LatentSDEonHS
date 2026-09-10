@@ -188,14 +188,12 @@ class QADData:
 
         if self.mode == 'train':
             data_len = len(data)
-            if self.shuffle:
-                indices = np.random.permutation(data_len)
-            else:
-                indices = np.arange(data_len)
-
             split_idx = int(data_len * 0.9)
-            train_indices = indices[:split_idx]
-            val_indices = indices[split_idx:]
+            train_indices = np.arange(split_idx)
+            val_indices = np.arange(split_idx, data_len)
+
+            if self.shuffle:
+                train_indices = np.random.permutation(train_indices)
 
             torch.save([data[i] for i in train_indices], os.path.join(self.processed_folder, self.destination_file))
             torch.save([data[i] for i in val_indices], os.path.join(self.processed_folder, self.val_file))
