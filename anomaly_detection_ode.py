@@ -483,6 +483,7 @@ def train_one_dataset(
     stats_prefix,
     experiment_id_str,
     wandb_run=None,
+    log_every_n_epochs=10
 ):
     desired_t = torch.linspace(0, 1.00, num_timepoints, device=args.device).float()
     modules, optimizer, scheduler, elbo_loss = build_modules_and_optim(args, input_dim, desired_t)
@@ -504,6 +505,10 @@ def train_one_dataset(
 
     for epoch in range(1, args.n_epochs + 1):
         trn_stats = generic_train_ode(args, dl_trn, modules, elbo_loss, optimizer, desired_t, args.device)
+        scheduler.step()
+
+        if epoch % log_every_n_epochs != 0:
+            continue
 
         normalization_scores = None
         if args.normalize_score:
@@ -530,7 +535,7 @@ def train_one_dataset(
             es_counter = 0
         else:
             es_counter += 1
-            if es_counter >= 4 * args.restart:  # early stopping patience shall be longer than one cosine sheduling
+            if es_counter >= 4 * (args.restart // log_every_n_epochs):  # early stopping patience shall be longer than one cosine sheduling
                 logging.info(f"Early stopping triggered at epoch {epoch}.")
                 stats["trn"].append(trn_stats)
                 stats["tst"].append(tst_stats)
@@ -543,7 +548,7 @@ def train_one_dataset(
         to_append["esc"] = es_counter
 
         stats["oth"].append(to_append)
-        scheduler.step()
+
 
         stats["trn"].append(trn_stats)
         stats["tst"].append(tst_stats)
@@ -556,7 +561,7 @@ def train_one_dataset(
             ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
             save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
 
-        msg = pm.build_progress_message(stats, epoch)
+        msg = pm.build_progress_message(stats, epoch, epoch_key=epoch % log_every_n_epochs)
         if stats_prefix:
             msg = f"[{stats_prefix}] {msg}"
         logging.debug(msg)
@@ -661,9 +666,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
                 seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-                raw_subdir="qad_clean_txt_100Hz",
-            )
+                data_normalization_strategy=args.data_normalization_strategy            )
         elif args.dataset == 'TSB-AD-M':
             dataset_number = None
             if args.trace_ids is not None:
