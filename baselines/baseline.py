@@ -7,6 +7,7 @@ import gc
 import glob
 import logging
 import os
+import pickle
 import random
 import re
 import sys
@@ -244,16 +245,21 @@ def _build_smd_datasets():
 
 
 def _build_qad_datasets():
-    """Build dataset specs for all QAD 100Hz datasets (qad_*_1 to qad_*_16)."""
-    qad_base_dir = _resolve_qad_raw_subdir()
+    """Build dataset specs for all QAD 100Hz traces (train_*.pkl / test_*.pkl / test_label_*.pkl).
+
+    Mirrors the raw layout consumed by ``data/qad_provider.py``: pickled pandas
+    payloads sit directly in ``data_dir/QAD/raw`` (one train/test/label triple per
+    numeric trace id).
+    """
+    qad_base_dir = _resolve_qad_raw_dir()
     qad_datasets = []
 
-    # Discover all train_*.txt files and create specs for each.
-    train_files = sorted(glob.glob(str(qad_base_dir / "train_*.txt")))
+    # Discover all train_*.pkl files and create specs for each.
+    train_files = sorted(glob.glob(str(qad_base_dir / "train_*.pkl")))
 
     for train_file in train_files:
         file_name = Path(train_file).name
-        match = re.match(r"^train_(\d+)\.txt$", file_name)
+        match = re.match(r"^train_(\d+)\.pkl$", file_name)
         if match is None:
             continue
 
@@ -261,46 +267,63 @@ def _build_qad_datasets():
         qad_datasets.append({
             "dataset_id": f"qad_{dataset_num}",
             "data_dir": qad_base_dir,
-            "train_file": f"train_{dataset_num}.txt",
-            "test_file": f"test_{dataset_num}.txt",
-            "label_file": f"test_label_{dataset_num}.txt",
-            "file_format": "qad_txt",
+            "train_file": f"train_{dataset_num}.pkl",
+            "test_file": f"test_{dataset_num}.pkl",
+            "label_file": f"test_label_{dataset_num}.pkl",
+            "file_format": "qad_pkl",
         })
 
     return qad_datasets
 
 
-def _resolve_qad_raw_subdir(raw_subdir: str = "qad_clean_txt_100Hz"):
-    requested = ROOT_DIR / "data_dir" / "QAD" / "raw" / raw_subdir
-    if requested.is_dir():
-        return requested
+def _resolve_qad_raw_dir():
+    """Locate the QAD raw folder holding the pickled traces.
 
-    fallback = ROOT_DIR / "data_dir" / "QAD" / "raw" / "qad_clean_txt_100Hz"
-    if fallback.is_dir():
-        LOGGER.warning(
-            "Requested QAD folder '%s' not found. Falling back to '%s'.",
-            raw_subdir,
-            fallback.name,
-        )
-        return fallback
+    Newer datasets store the pickles straight in ``data_dir/QAD/raw``; older
+    checkouts kept them under a ``qad_clean_pkl_100Hz`` subfolder, so fall back to
+    that when the flat layout has no ``train_*.pkl``.
+    """
+    flat = ROOT_DIR / "data_dir" / "QAD" / "raw"
+    if list(flat.glob("train_*.pkl")):
+        return flat
 
-    return requested
+    legacy = flat / "qad_clean_pkl_100Hz"
+    if list(legacy.glob("train_*.pkl")):
+        LOGGER.warning("No QAD pickles in '%s'. Falling back to '%s'.", flat, legacy)
+        return legacy
+
+    return flat
 
 
-def _load_qad_txt(dataset_path: Path, is_label: bool = False):
-    # sep=None lets pandas infer comma/tab separators from converted TXT files.
-    kwargs = {}
-    if not is_label:
-        kwargs["sep"] = None
-        kwargs["engine"] = "python"
+class _QADCompatUnpickler(pickle.Unpickler):
+    """Load QAD pickles written with numpy>=2 under an older numpy at runtime."""
 
-    data = pd.read_csv(dataset_path, **kwargs)
+    _MODULE_REMAPS = {
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+    }
 
-    if isinstance(data, pd.Series):
-        data = data.to_frame(name="labels")
+    def find_class(self, module: str, name: str):
+        module = self._MODULE_REMAPS.get(module, module)
+        if module.startswith("numpy._core."):
+            module = module.replace("numpy._core.", "numpy.core.", 1)
+        return super().find_class(module, name)
+
+
+def _load_qad_pkl(dataset_path: Path, is_label: bool = False):
+    with open(dataset_path, "rb") as f:
+        loaded_data = _QADCompatUnpickler(f).load()
+
+    if isinstance(loaded_data, pd.Series):
+        data = loaded_data.to_frame(name="labels")
+    elif isinstance(loaded_data, pd.DataFrame):
+        data = loaded_data.copy()
+    else:
+        data = pd.DataFrame(loaded_data)
 
     # Label files should always expose a canonical `labels` column.
-    if is_label and isinstance(data, pd.DataFrame) and len(data.columns) == 1 and "labels" not in data.columns:
+    if is_label and len(data.columns) == 1 and "labels" not in data.columns:
         data.columns = ["labels"]
 
     return data
@@ -811,11 +834,16 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_test_df = test_df[common_cols].apply(pd.to_numeric, errors="coerce")
         x_train = x_train_df.to_numpy(dtype=float)
         x_test = x_test_df.to_numpy(dtype=float)
-    # Handle QAD TXT files.
-    elif spec.get("file_format") == "qad_txt":
-        x_train_df = _load_qad_txt(data_dir / spec["train_file"])
-        x_test_df = _load_qad_txt(data_dir / spec["test_file"])
-        y_test_df = _load_qad_txt(data_dir / spec["label_file"], is_label=True)
+    # Handle QAD pickle files (see data/qad_provider.py for the raw layout).
+    elif spec.get("file_format") == "qad_pkl":
+        x_train_df = _load_qad_pkl(data_dir / spec["train_file"])
+        x_test_df = _load_qad_pkl(data_dir / spec["test_file"])
+        y_test_df = _load_qad_pkl(data_dir / spec["label_file"], is_label=True)
+
+        # The provider drops the non-sensor `Enable` flag before training; keep
+        # the baseline feature space identical.
+        x_train_df = x_train_df.drop(columns=["Enable"], errors="ignore")
+        x_test_df = x_test_df.drop(columns=["Enable"], errors="ignore")
 
         x_train_df = x_train_df[::10]
         x_test_df = x_test_df[::10]
