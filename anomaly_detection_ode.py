@@ -98,10 +98,10 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("Experiment specific arguments")
     group.add_argument("--use-atanh", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
-    group.add_argument("--subsample", type=float, default=0.4)
-    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=True)
+    group.add_argument("--subsample", type=float, default=0.5)
+    group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
-    group.add_argument("--dec-hidden-dim", type=int, default=32)
+    group.add_argument("--dec-hidden-dim", type=int, default=11)
     group.add_argument("--n-dec-layers", type=int, default=2)
     group.add_argument("--early-stopping-min-delta", type=float, default=0)
     group.add_argument("--non-linear-decoder", action=argparse.BooleanOptionalAction, default=True)
@@ -116,7 +116,7 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     group.add_argument("--runs", type=int, default=1, help="Number of repeated experiment runs to aggregate.")
-    group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=False, help="Delete processed data after each run.")
+    group.add_argument("--delete-processed-data", action=argparse.BooleanOptionalAction, default=True, help="Delete processed data after each run.")
     group.add_argument(
         "--fixed-subsample-mask",
         action=argparse.BooleanOptionalAction,
