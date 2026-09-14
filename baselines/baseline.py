@@ -38,7 +38,8 @@ _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
 WADI_REDUCED_BATCH_SIZE = 16
 USAD_INFERENCE_BATCH_SIZE = 64
 USAD_MIN_INFERENCE_BATCH_SIZE = 8
-DEFAULT_SEQ_LEN = 100
+DEFAULT_SEQ_LEN = 280
+DEFAULT_STRIDE = 140
 
 
 class RoundContextFilter(logging.Filter):
@@ -139,6 +140,7 @@ def build_classifier_factories(
     device: str = "cpu",
     random_state: int | None = None,
     seq_len: int = DEFAULT_SEQ_LEN,
+    stride: int = DEFAULT_STRIDE,
 ):
     # Import deepod models lazily so GPU visibility can be configured first.
     from pyod.models.copod import COPOD
@@ -163,7 +165,7 @@ def build_classifier_factories(
 
     _patch_deepod_inference_memory()
 
-    ts_kwargs = {"seq_len": seq_len, "stride": seq_len, "device": device, "random_state": random_state, "verbose": 1}
+    ts_kwargs = {"seq_len": seq_len, "stride": stride, "device": device, "random_state": random_state, "verbose": 1}
 
     return {
         "KNN": lambda: KNN(),
@@ -172,13 +174,13 @@ def build_classifier_factories(
         "IForest": lambda: IForest(random_state=random_state),
         "LOF": lambda: LOF(),
         "OCSVM": lambda: OCSVM(),
-        "TimesNet": lambda: TimesNet(**ts_kwargs),
+        "TimesNet": lambda: TimesNet(batch_size=16, **ts_kwargs),
         "DeepSVDD": lambda: DeepSVDDTS(**ts_kwargs),
         "USAD": lambda: USAD(batch_size=512, **ts_kwargs),
-        "AnomalyTransformer": lambda: AnomalyTransformer(**ts_kwargs),
+        "AnomalyTransformer": lambda: AnomalyTransformer(batch_size=16, **ts_kwargs),
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
         "TranAD": lambda: TranAD(**ts_kwargs),
-        "DeepIF": lambda: DeepIsolationForestTS(**ts_kwargs),
+        "DeepIF": lambda: DeepIsolationForestTS(batch_size=256, **ts_kwargs),
         "COUTA": lambda: COUTA(batch_size=2, **ts_kwargs),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
