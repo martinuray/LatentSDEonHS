@@ -151,7 +151,7 @@ class QADData:
         # (x - min) / max downstream step, which only lands in [0, 1] when
         # min is already ~0.
         raw_data = self.normalize_data(raw_data)
-        raw_data = reshape_data(raw_data, self.window_length)
+        raw_data = reshape_data(raw_data, self.window_length, remove_zero_column=False)
 
         if self.mode == 'test':
             self.targets = load_qad_pkl(
