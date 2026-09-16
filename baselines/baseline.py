@@ -30,7 +30,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utils.scoring_functions import get_ts_eval
+from utils.scoring_functions import get_ts_eval, smooth_scores
 
 LOGGER = logging.getLogger(__name__)
 CURRENT_ROUND = "-"
@@ -40,6 +40,23 @@ USAD_INFERENCE_BATCH_SIZE = 64
 USAD_MIN_INFERENCE_BATCH_SIZE = 8
 DEFAULT_SEQ_LEN = 280
 DEFAULT_STRIDE = 140
+DEFAULT_DECIMATION = 1
+DEFAULT_SCORE_SMOOTHING = 0
+DEFAULT_EVAL_WINDOW = 100
+
+# Per-benchmark window/scoring defaults, used unless overridden on the CLI.
+# QAD mirrors cfg/anomaly_detection/QAD.json so the baselines see the same
+# data (100 Hz decimated to 10 Hz), the same 20 s windows with a 2 s stride,
+# and the same score smoothing as the latent-SDE model.
+BENCHMARK_WINDOW_DEFAULTS = {
+    "QAD": {
+        "seq_len": 200,
+        "stride": 20,
+        "decimation": 10,
+        "score_smoothing_window": 10,
+        "eval_window": 200,
+    },
+}
 
 
 class RoundContextFilter(logging.Filter):
@@ -273,6 +290,9 @@ def _build_qad_datasets():
             "test_file": f"test_{dataset_num}.pkl",
             "label_file": f"test_label_{dataset_num}.pkl",
             "file_format": "qad_pkl",
+            # Raw traces are 100 Hz; keep every n-th row (overridable via
+            # --benchmark-decimation / BENCHMARK_WINDOW_DEFAULTS).
+            "decimation_factor": BENCHMARK_WINDOW_DEFAULTS["QAD"]["decimation"],
         })
 
     return qad_datasets
@@ -427,7 +447,7 @@ def _wandb_init_run(
     clf_name: str,
     selected_benchmarks: list[str],
     selected_classifiers: list[str],
-    benchmark_seq_len_overrides: dict[str, int],
+    benchmark_window_settings: dict[str, dict[str, int]],
     benchmark_dataset_counts: dict[str, int],
     benchmark_dataset_ids: dict[str, list[str]],
     output_paths: dict[str, Path],
@@ -466,7 +486,7 @@ def _wandb_init_run(
                 "torch": torch.__version__,
                 "cuda_available": bool(torch.cuda.is_available()),
             },
-            "benchmark_seq_len_overrides": benchmark_seq_len_overrides,
+            "benchmark_window_settings": benchmark_window_settings,
             "benchmark_dataset_counts": benchmark_dataset_counts,
             "benchmark_dataset_ids": benchmark_dataset_ids,
             "classifier_defaults": classifier_defaults,
@@ -684,6 +704,61 @@ def parse_args():
         help="Optional benchmark-specific seq lens, e.g. 'SWaT:200,WaDi:128'.",
     )
     parser.add_argument(
+        "--stride-default",
+        type=positive_int,
+        default=DEFAULT_STRIDE,
+        help="Default window stride for time-series deep models.",
+    )
+    parser.add_argument(
+        "--benchmark-strides",
+        type=str,
+        default="",
+        help="Optional benchmark-specific strides, e.g. 'QAD:20'.",
+    )
+    parser.add_argument(
+        "--benchmark-decimation",
+        type=str,
+        default="",
+        help=(
+            "Optional benchmark-specific temporal decimation (keep every n-th raw row of "
+            "train/test/labels), e.g. 'QAD:10'. Only honoured by benchmarks whose loader "
+            "supports it (currently QAD)."
+        ),
+    )
+    parser.add_argument(
+        "--score-smoothing-window-default",
+        type=int,
+        default=DEFAULT_SCORE_SMOOTHING,
+        help=(
+            "Half-width (time steps) of the moving average applied to the test scores "
+            "before computing metrics (same smoothing as anomaly_detection.py); 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-score-smoothing",
+        type=str,
+        default="",
+        help="Optional benchmark-specific score smoothing half-widths, e.g. 'QAD:10'.",
+    )
+    parser.add_argument(
+        "--no-benchmark-window-defaults",
+        action="store_true",
+        help=(
+            "Ignore BENCHMARK_WINDOW_DEFAULTS (per-benchmark seq_len/stride/decimation/"
+            "smoothing presets) and use only the global defaults plus explicit overrides."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="out",
+        help=(
+            "Directory for the baselines*.csv result files (relative paths resolve against the "
+            "repository root). Rows are appended, so use a fresh directory when the evaluation "
+            "protocol changes (e.g. QAD windows/smoothing) to avoid mixing results."
+        ),
+    )
+    parser.add_argument(
         "--wandb-project",
         type=str,
         default="latent-sde-on-hs-baselines",
@@ -739,7 +814,14 @@ def _select_keys(available, requested_csv):
     return requested
 
 
-def _parse_benchmark_seq_lens(mapping_csv: str, available_benchmarks: dict[str, list[dict]]):
+def _parse_benchmark_int_mapping(
+    mapping_csv: str,
+    available_benchmarks: dict[str, list[dict]],
+    option_name: str,
+    value_name: str,
+    min_value: int = 1,
+):
+    """Parse 'BENCHMARK:INT,BENCHMARK:INT' CLI mappings."""
     if mapping_csv is None or not mapping_csv.strip():
         return {}
 
@@ -750,35 +832,67 @@ def _parse_benchmark_seq_lens(mapping_csv: str, available_benchmarks: dict[str, 
             continue
         if ":" not in entry:
             raise ValueError(
-                f"Invalid --benchmark-seq-lens entry '{entry}'. Expected format BENCHMARK:SEQ_LEN."
+                f"Invalid {option_name} entry '{entry}'. Expected format BENCHMARK:{value_name.upper()}."
             )
 
-        benchmark, seq_len_text = entry.split(":", 1)
+        benchmark, value_text = entry.split(":", 1)
         benchmark = benchmark.strip()
-        seq_len_text = seq_len_text.strip()
+        value_text = value_text.strip()
         if benchmark not in available_benchmarks:
             raise ValueError(
-                f"Unknown benchmark '{benchmark}' in --benchmark-seq-lens. "
+                f"Unknown benchmark '{benchmark}' in {option_name}. "
                 f"Available: {list(available_benchmarks.keys())}"
             )
 
         try:
-            seq_len = int(seq_len_text)
+            value = int(value_text)
         except ValueError as exc:
             raise ValueError(
-                f"Invalid seq_len '{seq_len_text}' for benchmark '{benchmark}'. Must be an integer."
+                f"Invalid {value_name} '{value_text}' for benchmark '{benchmark}'. Must be an integer."
             ) from exc
 
-        if seq_len < 1:
+        if value < min_value:
             raise ValueError(
-                f"Invalid seq_len '{seq_len}' for benchmark '{benchmark}'. Must be >= 1."
+                f"Invalid {value_name} '{value}' for benchmark '{benchmark}'. Must be >= {min_value}."
             )
-        parsed[benchmark] = seq_len
+        parsed[benchmark] = value
 
     return parsed
 
 
-def load_dataset(spec, max_train_samples=None, max_test_samples=None):
+def _parse_benchmark_seq_lens(mapping_csv: str, available_benchmarks: dict[str, list[dict]]):
+    return _parse_benchmark_int_mapping(mapping_csv, available_benchmarks, "--benchmark-seq-lens", "seq_len")
+
+
+def resolve_benchmark_window_settings(args, available_benchmarks: dict[str, list[dict]]) -> dict[str, dict[str, int]]:
+    """Resolve seq_len / stride / decimation / score smoothing / eval window per benchmark.
+
+    Precedence: explicit CLI mapping > BENCHMARK_WINDOW_DEFAULTS (unless
+    --no-benchmark-window-defaults) > global CLI default.
+    """
+    seq_len_overrides = _parse_benchmark_seq_lens(args.benchmark_seq_lens, available_benchmarks)
+    stride_overrides = _parse_benchmark_int_mapping(args.benchmark_strides, available_benchmarks, "--benchmark-strides", "stride")
+    decimation_overrides = _parse_benchmark_int_mapping(args.benchmark_decimation, available_benchmarks, "--benchmark-decimation", "decimation")
+    smoothing_overrides = _parse_benchmark_int_mapping(
+        args.benchmark_score_smoothing, available_benchmarks, "--benchmark-score-smoothing", "score_smoothing_window", min_value=0
+    )
+
+    settings = {}
+    for benchmark_name in available_benchmarks:
+        presets = {} if args.no_benchmark_window_defaults else BENCHMARK_WINDOW_DEFAULTS.get(benchmark_name, {})
+        settings[benchmark_name] = {
+            "seq_len": seq_len_overrides.get(benchmark_name, presets.get("seq_len", args.seq_len_default)),
+            "stride": stride_overrides.get(benchmark_name, presets.get("stride", args.stride_default)),
+            "decimation": decimation_overrides.get(benchmark_name, presets.get("decimation", DEFAULT_DECIMATION)),
+            "score_smoothing_window": smoothing_overrides.get(
+                benchmark_name, presets.get("score_smoothing_window", args.score_smoothing_window_default)
+            ),
+            "eval_window": presets.get("eval_window", DEFAULT_EVAL_WINDOW),
+        }
+    return settings
+
+
+def load_dataset(spec, max_train_samples=None, max_test_samples=None, decimation_factor=None):
     data_dir = spec["data_dir"]
     dataset_id = spec.get("dataset_id", "unknown")
 
@@ -847,9 +961,16 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None):
         x_train_df = x_train_df.drop(columns=["Enable"], errors="ignore")
         x_test_df = x_test_df.drop(columns=["Enable"], errors="ignore")
 
-        x_train_df = x_train_df[::10]
-        x_test_df = x_test_df[::10]
-        y_test_df = y_test_df[::10]
+        # Temporal decimation (raw QAD is 100 Hz). Mirrors the
+        # `decimation_factor` of data/qad_provider.py so both pipelines see the
+        # same sampling rate; labels are decimated identically.
+        factor = decimation_factor if decimation_factor is not None else spec.get("decimation_factor", 1)
+        factor = max(1, int(factor))
+        if factor > 1:
+            x_train_df = x_train_df[::factor]
+            x_test_df = x_test_df[::factor]
+            y_test_df = y_test_df[::factor]
+        LOGGER.info("[%s] QAD decimation factor %d -> %d train rows, %d test rows", dataset_id, factor, len(x_train_df), len(x_test_df))
 
         x_train = x_train_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
         x_test = x_test_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
@@ -991,6 +1112,8 @@ def evaluate_classifier_on_dataset(
     y_test,
     benchmark_name,
     dataset_id,
+    score_smoothing_window: int = DEFAULT_SCORE_SMOOTHING,
+    eval_window_length: int = DEFAULT_EVAL_WINDOW,
 ):
     if benchmark_name in ["WaDi", "SWaT"] and hasattr(clf, "batch_size") and False:
         original_batch_size = getattr(clf, "batch_size", None)
@@ -1106,7 +1229,22 @@ def evaluate_classifier_on_dataset(
     else:
         raise last_error if last_error is not None else RuntimeError("Inference failed without a captured error")
 
-    metric_results = get_ts_eval(y_test_scores, y_test)
+    if y_test_scores.shape[0] != y_test.shape[0]:
+        aligned_len = min(y_test_scores.shape[0], y_test.shape[0])
+        LOGGER.warning(
+            "[%s/%s] %s score/label length mismatch (%d vs %d); truncating both to %d",
+            benchmark_name, dataset_id, clf_name, y_test_scores.shape[0], y_test.shape[0], aligned_len,
+        )
+        y_test_scores = y_test_scores[:aligned_len]
+        y_test = y_test[:aligned_len]
+
+    if score_smoothing_window and score_smoothing_window > 0:
+        # Same moving-average post-processing as anomaly_detection.py's
+        # normalise_scores(), so model and baselines are scored identically.
+        y_test_scores = smooth_scores(y_test_scores, score_smoothing_window)
+        LOGGER.info("[%s/%s] %s scores smoothed with half-window %d", benchmark_name, dataset_id, clf_name, score_smoothing_window)
+
+    metric_results = get_ts_eval(y_test_scores, y_test, window_length=eval_window_length)
 
     del clf
     gc.collect()
@@ -1217,16 +1355,20 @@ if __name__ == "__main__":
     args = parse_args()
     configure_logging(args.log_level)
     runtime_device = configure_gpu(args.gpu_id)
-    benchmark_seq_len_overrides = _parse_benchmark_seq_lens(args.benchmark_seq_lens, BENCHMARK_DATASETS)
+    benchmark_window_settings = resolve_benchmark_window_settings(args, BENCHMARK_DATASETS)
 
     classifier_factories = build_classifier_factories(
         device=runtime_device,
         random_state=args.seed,
         seq_len=args.seq_len_default,
+        stride=args.stride_default,
     )
 
-    output_dir = ROOT_DIR / "out"
+    output_dir = Path(args.output_dir)
+    if not output_dir.is_absolute():
+        output_dir = ROOT_DIR / output_dir
     os.makedirs(output_dir, exist_ok=True)
+    LOGGER.info("Writing result CSVs to %s", output_dir)
     per_dataset_path = output_dir / "baselines_per_dataset.csv"
     macro_path = output_dir / "baselines.csv"
     per_dataset_summary_path = output_dir / "baselines_per_dataset_mean_std.csv"
@@ -1235,7 +1377,7 @@ if __name__ == "__main__":
 
     LOGGER.info("Starting baseline evaluation")
     LOGGER.info(
-        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s, seq_len_default=%s, benchmark_seq_lens=%s",
+        "Arguments: benchmarks=%s, classifiers=%s, max_train_samples=%s, max_test_samples=%s, runs=%s, seed=%s, device=%s, seq_len_default=%s, stride_default=%s, score_smoothing_window_default=%s",
         args.benchmarks,
         args.classifiers,
         args.max_train_samples,
@@ -1244,11 +1386,14 @@ if __name__ == "__main__":
         args.seed,
         runtime_device,
         args.seq_len_default,
-        benchmark_seq_len_overrides,
+        args.stride_default,
+        args.score_smoothing_window_default,
     )
 
     selected_benchmarks = _select_keys(BENCHMARK_DATASETS, args.benchmarks)
     selected_classifiers = _select_keys(classifier_factories, args.classifiers)
+    for benchmark_name in selected_benchmarks:
+        LOGGER.info("Window settings for %s: %s", benchmark_name, benchmark_window_settings[benchmark_name])
 
     LOGGER.info("Selected benchmarks: %s", selected_benchmarks)
     LOGGER.info("Selected classifiers: %s", selected_classifiers)
@@ -1268,6 +1413,8 @@ if __name__ == "__main__":
         "device": runtime_device,
         "random_state": args.seed,
         "seq_len_default": args.seq_len_default,
+        "stride_default": args.stride_default,
+        "score_smoothing_window_default": args.score_smoothing_window_default,
         "runs": args.runs,
         "max_train_samples": args.max_train_samples,
         "max_test_samples": args.max_test_samples,
@@ -1292,7 +1439,9 @@ if __name__ == "__main__":
 
         for clf_name in selected_classifiers:
             for benchmark_name in selected_benchmarks:
-                seq_len_for_benchmark = benchmark_seq_len_overrides.get(benchmark_name, args.seq_len_default)
+                window_settings = benchmark_window_settings[benchmark_name]
+                seq_len_for_benchmark = window_settings["seq_len"]
+                stride_for_benchmark = window_settings["stride"]
                 single_benchmark_dataset_counts = {benchmark_name: benchmark_dataset_counts[benchmark_name]}
                 single_benchmark_dataset_ids = {benchmark_name: benchmark_dataset_ids[benchmark_name]}
 
@@ -1304,7 +1453,7 @@ if __name__ == "__main__":
                     clf_name=clf_name,
                     selected_benchmarks=[benchmark_name],
                     selected_classifiers=selected_classifiers,
-                    benchmark_seq_len_overrides=benchmark_seq_len_overrides,
+                    benchmark_window_settings={benchmark_name: window_settings},
                     benchmark_dataset_counts=single_benchmark_dataset_counts,
                     benchmark_dataset_ids=single_benchmark_dataset_ids,
                     output_paths=output_paths,
@@ -1318,13 +1467,15 @@ if __name__ == "__main__":
 
                 try:
                     LOGGER.info(
-                        "Run %d/%d clf=%s benchmark=%s seq_len=%d",
+                        "Run %d/%d clf=%s benchmark=%s seq_len=%d stride=%d decimation=%d score_smoothing=%d",
                         run_number, args.runs, clf_name, benchmark_name, seq_len_for_benchmark,
+                        stride_for_benchmark, window_settings["decimation"], window_settings["score_smoothing_window"],
                     )
                     clf_factories_for_benchmark = build_classifier_factories(
                         device=runtime_device,
                         random_state=run_seed,
                         seq_len=seq_len_for_benchmark,
+                        stride=stride_for_benchmark,
                     )
                     clf_factory = clf_factories_for_benchmark[clf_name]
                     dataset_specs = BENCHMARK_DATASETS[benchmark_name]
@@ -1336,6 +1487,7 @@ if __name__ == "__main__":
                                 dataset_spec,
                                 max_train_samples=args.max_train_samples,
                                 max_test_samples=args.max_test_samples,
+                                decimation_factor=window_settings["decimation"],
                             )
                             clf = clf_factory()
                             row, metric_results = evaluate_classifier_on_dataset(
@@ -1346,6 +1498,8 @@ if __name__ == "__main__":
                                 y_test,
                                 benchmark_name,
                                 dataset_id,
+                                score_smoothing_window=window_settings["score_smoothing_window"],
+                                eval_window_length=window_settings["eval_window"],
                             )
                             per_dataset_rows.append(row)
                             run_per_dataset_rows.append(row)

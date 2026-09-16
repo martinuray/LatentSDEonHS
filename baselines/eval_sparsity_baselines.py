@@ -72,6 +72,8 @@ if str(ROOT_DIR) not in sys.path:
 # Re-use dataset registry and loading helpers from the main baseline module.
 from baselines.baseline import (
     BENCHMARK_DATASETS,
+    BENCHMARK_WINDOW_DEFAULTS,
+    DEFAULT_SCORE_SMOOTHING,
     WADI_REDUCED_BATCH_SIZE,
     _select_keys,
     _wandb_is_available,
@@ -86,6 +88,7 @@ from baselines.baseline import (
     configure_logging,
     evaluate_classifier_on_dataset,
     load_dataset,
+    resolve_benchmark_window_settings,
     set_global_seed,
     set_round_context,
 )
@@ -113,6 +116,11 @@ _NON_METRIC_NUMERIC_COLUMNS = {
     "n_test_full",
     "n_test_sparse",
     "n_test_interpolated",
+    "seq_len",
+    "stride",
+    "decimation",
+    "score_smoothing_window",
+    "eval_window",
 }
 
 
@@ -322,6 +330,7 @@ def _wandb_init_task_run(
     task_label: str,
     selected_classifiers: list[str],
     dataset_ids: list[str],
+    window_settings: dict[str, int] | None = None,
 ):
     if not _wandb_is_available(args):
         if wandb is None:
@@ -363,6 +372,7 @@ def _wandb_init_task_run(
                 "python": sys.version.split()[0],
             },
             "interp_method": args.interp,
+            "window_settings": window_settings,
             "max_train_samples": args.max_train_samples,
             "max_test_samples": args.max_test_samples,
             "results_dir": str(args.results_dir),
@@ -575,6 +585,19 @@ def _wandb_log_aggregate_outputs(
 # Single run
 # ---------------------------------------------------------------------------
 
+# Global window defaults for this script (the plain baseline runner uses
+# 280/140). Per-benchmark presets come from baselines.baseline.
+# BENCHMARK_WINDOW_DEFAULTS, so QAD gets the same decimated 10 Hz data,
+# 200-step windows with stride 20 and score smoothing as
+# anomaly_detection.py / cfg/anomaly_detection/QAD.json; CLI mappings
+# (--benchmark-seq-lens etc.) override the presets.
+DEFAULT_EVAL_SEQ_LEN, DEFAULT_EVAL_STRIDE = 100, 100
+
+
+def _window_settings_for_benchmark(args, benchmark_name: str) -> dict[str, int]:
+    return resolve_benchmark_window_settings(args, BENCHMARK_DATASETS)[benchmark_name]
+
+
 def run_single(args, subsamples: list[float], device: str | None = None):
     """Run one ``(seed, subsample)`` pair and persist results as JSON."""
     out_dir = args.results_dir
@@ -603,7 +626,14 @@ def run_single(args, subsamples: list[float], device: str | None = None):
 
     if device is None:
         device = configure_gpu(args.gpu_id)
-    classifier_factories = build_classifier_factories(device=device, random_state=run_seed)
+    window_settings = _window_settings_for_benchmark(args, args.benchmark)
+    LOGGER.info("Window settings for %s: %s", args.benchmark, window_settings)
+    classifier_factories = build_classifier_factories(
+        device=device,
+        random_state=run_seed,
+        seq_len=window_settings["seq_len"],
+        stride=window_settings["stride"],
+    )
     selected_classifiers = _select_keys(classifier_factories, args.classifiers)
 
     benchmark_name = args.benchmark
@@ -628,6 +658,7 @@ def run_single(args, subsamples: list[float], device: str | None = None):
         task_label=task_label,
         selected_classifiers=selected_classifiers,
         dataset_ids=dataset_ids,
+        window_settings=window_settings,
     )
     wandb_step = 0
 
@@ -644,6 +675,7 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                         dataset_spec,
                         max_train_samples=args.max_train_samples,
                         max_test_samples=args.max_test_samples,
+                        decimation_factor=window_settings["decimation"],
                     )
 
                     # Apply burst-mask sparsity to training data only.
@@ -671,11 +703,14 @@ def run_single(args, subsamples: list[float], device: str | None = None):
                         y_test=y_test,
                         benchmark_name=benchmark_name,
                         dataset_id=dataset_id,
+                        score_smoothing_window=window_settings["score_smoothing_window"],
+                        eval_window_length=window_settings["eval_window"],
                     )
                     row = {
                         **result,
                         "subsample": subsample,
                         "interp_method": args.interp,
+                        **window_settings,
                         "seed_idx": seed_idx,
                         "run_seed": run_seed,
                         "n_train_full": x_train_full.shape[0],
@@ -1061,6 +1096,56 @@ def parse_args():
             "'spline': cubic spline (falls back to linear when < 4 knots); "
             "'forward_fill': last-observation-carried-forward (LOCF)."
         ),
+    )
+
+    # Windowing / decimation / score post-processing (per-benchmark presets in
+    # baselines.baseline.BENCHMARK_WINDOW_DEFAULTS; explicit mappings win).
+    parser.add_argument(
+        "--seq-len-default",
+        type=pos_int,
+        default=DEFAULT_EVAL_SEQ_LEN,
+        help=f"Default sequence length for time-series deep models (default: {DEFAULT_EVAL_SEQ_LEN}).",
+    )
+    parser.add_argument(
+        "--stride-default",
+        type=pos_int,
+        default=DEFAULT_EVAL_STRIDE,
+        help=f"Default window stride for time-series deep models (default: {DEFAULT_EVAL_STRIDE}).",
+    )
+    parser.add_argument(
+        "--benchmark-seq-lens",
+        type=str,
+        default="",
+        help="Optional benchmark-specific seq lens, e.g. 'QAD:200'.",
+    )
+    parser.add_argument(
+        "--benchmark-strides",
+        type=str,
+        default="",
+        help="Optional benchmark-specific strides, e.g. 'QAD:20'.",
+    )
+    parser.add_argument(
+        "--benchmark-decimation",
+        type=str,
+        default="",
+        help="Optional benchmark-specific temporal decimation (keep every n-th raw row), e.g. 'QAD:10'.",
+    )
+    parser.add_argument(
+        "--score-smoothing-window-default",
+        type=int,
+        default=DEFAULT_SCORE_SMOOTHING,
+        help="Half-width of the moving average applied to test scores before metrics; 0 disables.",
+    )
+    parser.add_argument(
+        "--benchmark-score-smoothing",
+        type=str,
+        default="",
+        help="Optional benchmark-specific score smoothing half-widths, e.g. 'QAD:10'.",
+    )
+    parser.add_argument(
+        "--no-benchmark-window-defaults",
+        action="store_true",
+        help="Ignore the per-benchmark presets and use only global defaults plus explicit overrides.",
     )
 
     # Data caps
