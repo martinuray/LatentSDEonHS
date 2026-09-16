@@ -26,7 +26,7 @@ def _windowize(data: np.ndarray, window_length: int, window_overlap: float):
     if data.ndim == 1:
         data = data[:, None]
 
-    stride = max(1, int(window_length * (1.0 - window_overlap)))
+    stride = max(1, int(round(window_length * (1.0 - window_overlap))))
     if window_overlap <= 0.0:
         stride = window_length
 

@@ -115,6 +115,28 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "reconstructed features."
         ),
     )
+    group.add_argument(
+        "--score-smoothing-window",
+        type=int,
+        default=5,
+        help=(
+            "Half-width (in time steps) of the moving average applied to the "
+            "per-feature anomaly scores before aggregation/thresholding "
+            "(see normalise_scores). 0 disables smoothing. Default 5 keeps the "
+            "historical behaviour; for slow anomalies choose a value on the "
+            "order of the anomaly duration."
+        ),
+    )
+    group.add_argument(
+        "--data-decimation-factor",
+        type=int,
+        default=1,
+        help=(
+            "Keep every n-th raw sample before windowing (temporal decimation). "
+            "Currently honoured by the QAD provider only (100 Hz raw; 10 -> 10 Hz, "
+            "matching the baselines). Labels are decimated identically."
+        ),
+    )
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
     group.add_argument("--dec-hidden-dim", type=int, default=32)
     group.add_argument("--n-dec-layers", type=int, default=2)
@@ -722,7 +744,10 @@ def normalise_scores(test_delta, norm="median-iqr", smooth=True,
     """
     Args:
         norm: None, "mean-std" or "median-iqr"
+        smooth_window: half-width of the moving average; <= 0 disables smoothing.
     """
+    if smooth_window is None or smooth_window <= 0:
+        smooth = False
     if norm == "mean-std":
         err_scores = StandardScaler().fit_transform(test_delta)
     elif norm == "median-iqr":
@@ -752,7 +777,8 @@ def eval_scores_for_all_score_normalizations(
         test_labels: np.ndarray,
         window_length:int = 100,
         aggregation_strategy: str = "max",
-        feature_weights: np.ndarray = None):
+        feature_weights: np.ndarray = None,
+        smoothing_window: int = 5):
 
     # Options
     # TODO: then for better performance in the end ?
@@ -800,7 +826,7 @@ def eval_scores_for_all_score_normalizations(
     df_list = []
 
     for n in normalisations:
-        normed_scores = normalise_scores(scores, norm=n, smooth=True)
+        normed_scores = normalise_scores(scores, norm=n, smooth=True, smooth_window=smoothing_window)
         n_key = n if n is not None else 'no'
 
         for aggregation_strategy_ in aggregation_strategies:
@@ -816,7 +842,8 @@ def eval_scores_for_all_score_normalizations(
     return df_list[best_idx][1][1]  # returns the result dictionary
 
 
-def eval_scores(scores, true_labels, window_length=100, aggregation_strategy="max", feature_weights=None):
+def eval_scores(scores, true_labels, window_length=100, aggregation_strategy="max", feature_weights=None,
+                smoothing_window=5):
 
     if type(scores) is list:
         scores = torch.cat(scores, dim=0)
@@ -826,7 +853,8 @@ def eval_scores(scores, true_labels, window_length=100, aggregation_strategy="ma
 
     best_metrics_ = eval_scores_for_all_score_normalizations(
         scores, true_labels, window_length=window_length,
-        aggregation_strategy=aggregation_strategy, feature_weights=feature_weights)
+        aggregation_strategy=aggregation_strategy, feature_weights=feature_weights,
+        smoothing_window=smoothing_window)
     return best_metrics_
 
 
@@ -1028,10 +1056,12 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
                 data_dir=data_dir,
                 dataset_number=dataset_number,
                 window_length=args.data_window_length,
+                window_overlap=args.data_window_overlap,
                 seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
                 data_normalization_strategy=args.data_normalization_strategy,
+                decimation_factor=args.data_decimation_factor,
             )
         elif args.dataset == 'TSB-AD-M':
             dataset_number = None
@@ -1377,6 +1407,7 @@ def evaluate(
         best_metrics = eval_scores(
             all_scores, all_labels, window_length=args.data_window_length,
             aggregation_strategy=args.score_aggregation, feature_weights=feature_weights,
+            smoothing_window=args.score_smoothing_window,
         )
         for key, value in best_metrics.items():
             stats[key.lower()] = value

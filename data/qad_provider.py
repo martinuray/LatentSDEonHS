@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.common import get_data_min_max, normalize_masked_data
 from data.dataset_provider import DatasetProvider
-from data.process_water_treatment_datasets import reshape_data
+from data.smd_provider import _windowize
 from utils.anomaly_detection import create_random_burst_mask
 
 
@@ -32,6 +32,7 @@ class QADData:
             data_normalization_strategy: str = "none",
             processed_root: str = None,
             shuffle: bool = True,
+            decimation_factor: int = 1,
     ):
 
         self.scaler = normalizer
@@ -44,6 +45,9 @@ class QADData:
         self.shuffle = shuffle
 
         self.overlapping_windows = window_overlap
+        # Keep every `decimation_factor`-th raw sample (QAD is recorded at
+        # 100 Hz; 10 -> 10 Hz, which is also what the baselines consume).
+        self.decimation_factor = max(1, int(decimation_factor))
 
         self.labels = ['Anomaly']
         self.labels_dict = {k: i for i, k in enumerate(self.labels)}
@@ -51,7 +55,7 @@ class QADData:
         if not self._check_exists():
             if not self._check_exist_raw_data():
                 raise RuntimeError('Dataset not found.')
-            self._process_QAD_data()
+            self._process_QAD_data(subsample_factor=self.decimation_factor)
 
         self.data = torch.load(os.path.join(self.processed_folder, self.destination_file), weights_only=False)
 
@@ -150,20 +154,41 @@ class QADData:
         # MotorSpeed0/1), so this must run before normalize_masked_data's
         # (x - min) / max downstream step, which only lands in [0, 1] when
         # min is already ~0.
-        raw_data = self.normalize_data(raw_data)
-        raw_data = reshape_data(raw_data, self.window_length, remove_zero_column=False)
+        raw_data = np.asarray(self.normalize_data(raw_data), dtype=np.float32)
 
         if self.mode == 'test':
-            self.targets = load_qad_pkl(
+            labels = load_qad_pkl(
                 os.path.join(self.raw_folder, f'test_label_{self.dataset_number}.pkl'),
                 is_label=True,
             )
-            self.targets = self.targets[::subsample_factor]
-            self.targets = reshape_data(self.targets, self.window_length)
+            labels = labels.iloc[:, 0].to_numpy()[::subsample_factor]
+            n_aligned = min(raw_data.shape[0], labels.shape[0])
+            if raw_data.shape[0] != labels.shape[0]:
+                logging.warning(
+                    f"QAD trace {self.dataset_number}: test/label length mismatch "
+                    f"({raw_data.shape[0]} vs {labels.shape[0]}); truncating both to {n_aligned}")
+            raw_data, labels = raw_data[:n_aligned], labels[:n_aligned]
+
+            starts, raw_data = _windowize(raw_data, self.window_length, self.overlapping_windows)
+            _, label_windows = _windowize(labels[:, None], self.window_length, self.overlapping_windows)
+            self.targets = label_windows[:, :, 0]
         else:
+            # Split the *flat* series 90/10 in time before windowing so overlapping
+            # train and val windows never share samples.
+            split_at = int(raw_data.shape[0] * 0.9)
+            starts_trn, windows_trn = _windowize(raw_data[:split_at], self.window_length, self.overlapping_windows)
+            starts_val, windows_val = _windowize(raw_data[split_at:], self.window_length, self.overlapping_windows)
+            starts = np.concatenate([starts_trn, split_at + starts_val])
+            raw_data = np.concatenate([windows_trn, windows_val], axis=0)
+            n_train_windows = len(starts_trn)
             self.targets = np.zeros(raw_data.shape[0:2])
 
+        logging.debug(
+            f"QAD trace {self.dataset_number} ({self.mode}): {raw_data.shape[0]} windows of length "
+            f"{self.window_length} (overlap={self.overlapping_windows}, decimation={subsample_factor})")
+
         indcs = torch.arange(raw_data.shape[1])
+        starts = torch.as_tensor(starts, dtype=torch.long)
         data_tensor = torch.Tensor(raw_data)
         mask = torch.ones_like(data_tensor)
 
@@ -175,7 +200,7 @@ class QADData:
             logging.warning(f"Limiting dataset to {n_samples} samples")
             data_tensor = data_tensor[:n_samples]
             mask = mask[:n_samples]
-            indcs = indcs[:n_samples]
+            starts = starts[:n_samples]
             if self.mode == 'test':
                 self.targets = self.targets[:n_samples]
         else:
@@ -183,12 +208,12 @@ class QADData:
 
         assert data_tensor.shape[0] == mask.shape[0]
 
-        data = [(part_idx, indcs+(indcs.shape[0]*part_idx), data_tensor[part_idx, :, :],
+        data = [(part_idx, indcs + starts[part_idx], data_tensor[part_idx, :, :],
                  mask[part_idx, :, :]) for part_idx in range(mask.shape[0])]
 
         if self.mode == 'train':
             data_len = len(data)
-            split_idx = int(data_len * 0.9)
+            split_idx = min(n_train_windows, data_len)
             train_indices = np.arange(split_idx)
             val_indices = np.arange(split_idx, data_len)
 
@@ -211,7 +236,8 @@ class QADDataset(Dataset):
     def __init__(self, data_dir: str, mode: str = 'train', dataset_number: int = None,
                  window_length: int = 100, window_overlap: float = 0.0, subsample: float = 1.0, seed=-1,
                  data_normalization_strategy: str = "none",
-                 fixed_subsample_mask: bool = False, processed_root: str = None, train_shuffle:bool = True):
+                 fixed_subsample_mask: bool = False, processed_root: str = None, train_shuffle:bool = True,
+                 decimation_factor: int = 1):
 
         self.mode = mode
         self.subsample = subsample
@@ -229,7 +255,8 @@ class QADDataset(Dataset):
                 data_dir, mode='train', dataset_number=dataset_id,
                 window_length=window_length, window_overlap=window_overlap,
                 data_normalization_strategy=data_normalization_strategy,
-                processed_root=processed_root, shuffle=train_shuffle)
+                processed_root=processed_root, shuffle=train_shuffle,
+                decimation_factor=decimation_factor)
 
             objs = {
                 'train': train_data,
@@ -237,12 +264,14 @@ class QADDataset(Dataset):
                     data_dir, mode='test', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
                     normalizer=train_data.scaler,
-                    processed_root=processed_root),
+                    processed_root=processed_root,
+                    decimation_factor=decimation_factor),
                 'val': QADData(
                     data_dir, mode='val', dataset_number=dataset_id,
                     window_length=window_length, window_overlap=window_overlap,
                     normalizer=train_data.scaler,
-                    processed_root=processed_root)
+                    processed_root=processed_root,
+                    decimation_factor=decimation_factor)
             }
 
             data = objs[mode]
@@ -253,10 +282,13 @@ class QADDataset(Dataset):
                 logging.warning(f"Skipping empty QAD dataset {dataset_id} (mode={mode})")
                 continue
 
-            tps_base = raw[0][1].float()
-            tps_max = tps_base.max()
-            if tps_max > 0:
-                tps_base = tps_base / tps_max
+            # Windows may start anywhere (strided windowing), so build the
+            # per-window time grid from the window length, not from the
+            # first window's global indices.
+            n_time_ = raw[0][2].shape[0]
+            tps_base = torch.arange(n_time_).float()
+            if n_time_ > 1:
+                tps_base = tps_base / (n_time_ - 1)
 
             indcs = torch.stack([raw[i][1] for i in range(len(raw))])
             obs = torch.stack([raw[i][2] for i in range(len(raw))]).float()
@@ -424,7 +456,8 @@ class QADProvider(DatasetProvider):
                  window_overlap: float = 0.0,
                  data_normalization_strategy: str = "none", subsample: float = 1.0, seed=-1,
                  fixed_subsample_mask: bool = False,
-                 train_shuffle:bool = False,):
+                 train_shuffle:bool = False,
+                 decimation_factor: int = 1,):
         super().__init__()
 
         self._dataset = dataset_number
@@ -436,7 +469,8 @@ class QADProvider(DatasetProvider):
             'window_overlap': window_overlap,
             'data_normalization_strategy': data_normalization_strategy,
             'processed_root': self._processed_root,
-            'train_shuffle': train_shuffle
+            'train_shuffle': train_shuffle,
+            'decimation_factor': decimation_factor,
         }
 
         self._ds_trn = QADDataset(
