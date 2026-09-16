@@ -571,8 +571,6 @@ def _wandb_init_run(args, experiment_id_str: str, runtime_context: dict, output_
             config=config,
             reinit=True,
         )
-        wandb.define_metric("epoch")
-        wandb.define_metric("epoch/*", step_metric="epoch")
         wandb.define_metric("summary/*", summary="last")
         logging.info("Initialized W&B run: project=%s, name=%s, group=%s, mode=%s", args.wandb_project, run_name, run_group, args.wandb_mode)
         return run
@@ -581,20 +579,38 @@ def _wandb_init_run(args, experiment_id_str: str, runtime_context: dict, output_
         return None
 
 
+_wandb_step_metrics_defined: set[tuple[int, str]] = set()
+
+
+def _wandb_ensure_step_metric(run, metric_prefix: str) -> str:
+    """Lazily register a per-trace custom step metric so each trace's epoch
+    axis is independent (and may legitimately restart at 1) instead of all
+    traces sharing one global "epoch" step that only worked by accident of
+    row alignment."""
+    step_key = f"{metric_prefix}/epoch"
+    cache_key = (id(run), metric_prefix)
+    if cache_key not in _wandb_step_metrics_defined:
+        wandb.define_metric(step_key)
+        wandb.define_metric(f"epoch/{metric_prefix}/*", step_metric=step_key)
+        _wandb_step_metrics_defined.add(cache_key)
+    return step_key
+
+
 def _wandb_log_epoch(run, epoch: int, stats_prefix: str, trn_stats: dict, val_stats: dict | None, tst_stats: dict, oth_stats: dict):
     if run is None:
         return True
 
     try:
         metric_prefix = stats_prefix or "global"
-        payload = {"epoch": epoch}
+        step_key = _wandb_ensure_step_metric(run, metric_prefix)
+        payload = {step_key: epoch}
         for split_name, split_stats in (("trn", trn_stats), ("val", val_stats), ("tst", tst_stats), ("oth", oth_stats)):
             if not split_stats:
                 continue
             for key, value in split_stats.items():
                 if _is_numeric_scalar(value):
                     payload[f"epoch/{metric_prefix}/{split_name}/{key}"] = float(value)
-        run.log(payload, step=epoch)
+        run.log(payload)
         return True
     except Exception as exc:
         logging.warning("W&B epoch logging failed; disabling further W&B logging: %s", exc, exc_info=True)
