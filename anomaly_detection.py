@@ -37,7 +37,7 @@ from data.qad_provider import QADProvider
 from data.tsb_ad_m_provider import TSBADMProvider
 from data.smd_provider import SMDProvider
 from data.psm_provider import PSMProvider
-from utils.scoring_functions import get_ts_eval
+from utils.scoring_functions import get_ts_eval, smooth_scores
 from utils.logger import set_up_logging
 from utils.misc import (
     set_seed,
@@ -763,14 +763,8 @@ def normalise_scores(test_delta, norm="median-iqr", smooth=True,
             f'specified normalisation ({norm}) not implemented, please use one of {None, "mean-std", "median-iqr"}')
 
     if smooth:
-        smoothed_err_scores = np.zeros(err_scores.shape)
-
-        for i in range(smooth_window, len(err_scores)):
-            smoothed_err_scores[i] = np.mean(
-                err_scores[i - smooth_window: i + smooth_window - 1], axis=0)
-        return smoothed_err_scores
-    else:
-        return err_scores
+        return smooth_scores(err_scores, smooth_window)
+    return err_scores
 
 def eval_scores_for_all_score_normalizations(
         scores: np.ndarray,

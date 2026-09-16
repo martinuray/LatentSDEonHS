@@ -631,6 +631,36 @@ class Evaluator:
 
 from vus.metrics import get_metrics
 
+def smooth_scores(scores: np.ndarray, half_window: int) -> np.ndarray:
+    """Moving-average smoothing of anomaly scores along the time axis.
+
+    Reproduces the historical smoothing used by ``anomaly_detection.py``: for
+    every ``i >= half_window`` the output is the mean of
+    ``scores[i - half_window : i + half_window - 1]`` (a window of
+    ``2 * half_window - 1`` steps, truncated at the end of the series); the
+    first ``half_window`` outputs are 0. ``half_window <= 0`` returns the
+    scores unchanged. Works for 1-D ``[time]`` and 2-D ``[time, feature]``
+    arrays and is shared by the latent-SDE evaluation and the baselines so
+    both see identical post-processing.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if half_window is None or half_window <= 0 or scores.shape[0] == 0:
+        return scores
+
+    n = scores.shape[0]
+    half_window = int(half_window)
+    csum = np.concatenate([np.zeros((1,) + scores.shape[1:]), np.cumsum(scores, axis=0)], axis=0)
+    idx = np.arange(half_window, n)
+    lo = idx - half_window
+    hi = np.minimum(idx + half_window - 1, n)
+    counts = (hi - lo).astype(float)
+    counts_shaped = counts.reshape((-1,) + (1,) * (scores.ndim - 1))
+
+    smoothed = np.zeros_like(scores)
+    smoothed[half_window:] = (csum[hi] - csum[lo]) / counts_shaped
+    return smoothed
+
+
 def get_ts_eval(scores, targets, window_length=100):
     ts_evalator = Evaluator()
 
