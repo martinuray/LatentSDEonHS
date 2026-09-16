@@ -3,37 +3,47 @@
 ################################################################################
 # SLURM Script: Submit all benchmark experiments
 #
-# This script submits a separate SLURM job for each benchmark dataset.
-# Each job runs 5 independent runs with automatic deletion of processed data.
+# This script submits a separate SLURM job for each (benchmark, seed) pair,
+# so each of the 5 seeds runs as its own independent job with automatic
+# deletion of processed data. No cross-run aggregation is performed.
 #
 # Usage: ./scripts/slurm/submit_all_benchmarks.sh
 ################################################################################
 
+set -euo pipefail
+
 # SLURM Configuration - Modify as needed
-PARTITION="rtx2080ti,a6000"              # Partition to submit to
-TIMEOUT="48:00:00"           # Timeout per job (HH:MM:SS)
+PARTITION="rtx2080ti"              # Partition to submit to
+TIMEOUT="64:00:00"           # Timeout per job (HH:MM:SS)
 NUM_GPUS=1                   # Number of GPUs per job
 NUM_CPUS=8                   # Number of CPUs per job
 MEMORY="40GB"                # Memory per job
-JOB_NAME_PREFIX="ano"    # Prefix for job names
+JOB_NAME_PREFIX="qad"    # Prefix for job names
 
-# Number of runs per benchmark
-RUNS=5
+# Seeds to submit independently (one job per seed)
+SEEDS=(42 43 44 45 46)
 
 # Common anomaly_detection.py parameters (dataset and runs are set per benchmark below)
 
 # Benchmarks to run (from anomaly_detection.py)
-BENCHMARKS=("SWaT")
+BENCHMARKS=("QAD")
 
 
-# ---- Initialize conda ----
-source $(conda info --base)/etc/profile.d/conda.sh
+# ---- Conda / project setup ----
+CONDA_BASE="${CONDA_BASE:-/home2/muray/.miniconda3}"
+CONDA_ENV="baseline-latent"
+PROJECT_DIR="/home2/muray/Code/LatentSDEonHS"
 
-# ---- Activate environment ----
-conda activate baseline-latent
+# ---- Initialize conda (for this submitter script) ----
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV}"
 
 # ---- Move to project directory ----
-cd /home2/muray/Code/LatentSDEonHS
+cd "${PROJECT_DIR}"
+
+# Environment setup prepended to every sbatch --wrap so the job (which runs in a
+# fresh non-login shell on the compute node) has the right python on PATH.
+JOB_SETUP="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV} && cd ${PROJECT_DIR} &&"
 
 # Log directory for SLURM output
 LOG_DIR="slurm_logs_benchmark"
@@ -43,7 +53,7 @@ echo "=================================="
 echo "Submitting all benchmark jobs"
 echo "=================================="
 echo "Total benchmarks: ${#BENCHMARKS[@]}"
-echo "Runs per benchmark: ${RUNS}"
+echo "Seeds per benchmark: ${SEEDS[*]}"
 echo "Partition: ${PARTITION}"
 echo "Timeout: ${TIMEOUT}"
 echo "GPUs per job: ${NUM_GPUS}"
@@ -53,43 +63,46 @@ echo "Log directory: ${LOG_DIR}"
 echo "=================================="
 echo ""
 
-# Submit a job for each benchmark
+# Submit a job for each (benchmark, seed) pair
 for BENCHMARK in "${BENCHMARKS[@]}"; do
-    echo "Submitting jobs for benchmark: ${BENCHMARK}"
+    for SEED in "${SEEDS[@]}"; do
+        echo "Submitting jobs for benchmark: ${BENCHMARK}, seed: ${SEED}"
 
-    sbatch \
-        --partition="${PARTITION}" \
-        --time="${TIMEOUT}" \
-        --gpus="${NUM_GPUS}" \
-        --cpus-per-task="${NUM_CPUS}" \
-        --mem="${MEMORY}" \
-        --job-name="${JOB_NAME_PREFIX}_Sn_${BENCHMARK}" \
-        --output="${LOG_DIR}/${BENCHMARK}_Sn_%j.log" \
-        --error="${LOG_DIR}/${BENCHMARK}_Sn_%j.log" \
-        --wrap="python anomaly_detection.py \
-            --dataset ${BENCHMARK} \
-            --runs ${RUNS} \
-            --sphere-embedding"
+        sbatch \
+            --partition="${PARTITION}" \
+            --time="${TIMEOUT}" \
+            --gpus="${NUM_GPUS}" \
+            --cpus-per-task="${NUM_CPUS}" \
+            --mem="${MEMORY}" \
+            --job-name="${JOB_NAME_PREFIX}_Sn_${BENCHMARK}_s${SEED}" \
+            --output="${LOG_DIR}/${BENCHMARK}_Sn_s${SEED}_%j.log" \
+            --error="${LOG_DIR}/${BENCHMARK}_Sn_s${SEED}_%j.log" \
+            --wrap="python anomaly_detection.py \
+                --dataset ${BENCHMARK} \
+                --runs 1 \
+                --seed ${SEED} \
+                --sphere-embedding"
 
-    sleep 0.5
+        sleep 0.5
 
-    sbatch \
-        --partition="${PARTITION}" \
-        --time="${TIMEOUT}" \
-        --gpus="${NUM_GPUS}" \
-        --cpus-per-task="${NUM_CPUS}" \
-        --mem="${MEMORY}" \
-        --job-name="${JOB_NAME_PREFIX}_Rn_${BENCHMARK}" \
-        --output="${LOG_DIR}/${BENCHMARK}_Rn_%j.log" \
-        --error="${LOG_DIR}/${BENCHMARK}_Rn_%j.log" \
-        --wrap="python anomaly_detection.py \
-            --dataset ${BENCHMARK} \
-	    --subsample 0.5 \
-            --runs ${RUNS} \
-            --no-sphere-embedding"
+        sbatch \
+            --partition="${PARTITION}" \
+            --time="${TIMEOUT}" \
+            --gpus="${NUM_GPUS}" \
+            --cpus-per-task="${NUM_CPUS}" \
+            --mem="${MEMORY}" \
+            --job-name="${JOB_NAME_PREFIX}_Rn_${BENCHMARK}_s${SEED}" \
+            --output="${LOG_DIR}/${BENCHMARK}_Rn_s${SEED}_%j.log" \
+            --error="${LOG_DIR}/${BENCHMARK}_Rn_s${SEED}_%j.log" \
+            --wrap="python anomaly_detection.py \
+                --dataset ${BENCHMARK} \
+                --runs 1 \
+                --seed ${SEED} \
+                --no-sphere-embedding"
 
-    # Small delay to avoid overwhelming the scheduler
-    sleep 0.5
+        # Small delay to avoid overwhelming the scheduler
+        sleep 0.5
+    done
 done
 
 echo ""

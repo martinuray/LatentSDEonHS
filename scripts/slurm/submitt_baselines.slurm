@@ -7,27 +7,32 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 
-# ---- Initialize conda ----
-source $(conda info --base)/etc/profile.d/conda.sh
+# Usage: submitt_baselines.slurm BENCHMARK CLASSIFIER [SEED] [RUNS] [OUTPUT_DIR]
+#
+# Window/decimation/score-smoothing settings are resolved inside
+# baselines/baseline.py (BENCHMARK_WINDOW_DEFAULTS), so e.g. QAD automatically
+# runs at 10 Hz with 200-step windows, stride 20 and score smoothing 10, in
+# line with cfg/anomaly_detection/QAD.json. OUTPUT_DIR defaults to "out"; pass
+# a fresh directory when the protocol of a benchmark changed so new rows are
+# not appended to CSVs produced under the old protocol.
 
-# ---- Activate environment ----
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate baseline-latent
 
-# ---- Move to project directory ----
 cd /home2/muray/Code/LatentSDEonHS
 
-# ---- Read arguments ----
 BENCHMARK=$1
 CLASSIFIER=$2
 SEED=${3:-42}
 RUNS=${4:-5}
+OUTPUT_DIR=${5:-out}
 
-echo "Running classifier=$CLASSIFIER on benchmark=$BENCHMARK seed=$SEED runs=$RUNS"
+echo "Running classifier=$CLASSIFIER on benchmark=$BENCHMARK seed=$SEED runs=$RUNS output_dir=$OUTPUT_DIR"
 
-# ---- Run your experiment ----
 python baselines/baseline.py \
-	    --benchmarks "$BENCHMARK" \
-	        --classifiers "$CLASSIFIER" \
-		      --runs "$RUNS" \
-		      --seed "$SEED" \
-		      --gpu-id 0
+    --benchmarks "$BENCHMARK" \
+    --classifiers "$CLASSIFIER" \
+    --runs "$RUNS" \
+    --seed "$SEED" \
+    --gpu-id 0 \
+    --output-dir "$OUTPUT_DIR"

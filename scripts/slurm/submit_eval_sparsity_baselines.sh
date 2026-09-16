@@ -6,6 +6,11 @@
 # Sweeps over:
 #   - benchmarks:      QAD, PSM
 #   - interpolation:   linear, spline (cubic spline)
+#
+# Window / decimation / score-smoothing settings per benchmark come from
+# BENCHMARK_WINDOW_DEFAULTS in baselines/baseline.py (QAD: 10 Hz, seq_len 200,
+# stride 20, smoothing 10, matching cfg/anomaly_detection/QAD.json); override
+# with --benchmark-seq-lens/--benchmark-strides/... if needed.
 #   - classifiers:     IForest, KNN, LOF (CPU only)
 #                       USAD, TcnED, DeepIF (GPU)
 #
@@ -27,7 +32,7 @@
 set -euo pipefail
 
 # ---- Configuration ----
-PARTITION="gtx1080ti"
+PARTITION="a6000"
 CPU_TIMEOUT="3:00:00"     # IForest / KNN / LOF are cheap but KNN/LOF can be slow on large traces
 GPU_TIMEOUT="6:00:00"     # USAD / TcnED / DeepIF are deep models; allow more headroom
 NUM_CPUS=4
@@ -35,15 +40,15 @@ NUM_GPUS=1
 CPU_MEMORY="16GB"
 GPU_MEMORY="24GB"
 
-BENCHMARKS=(PSM)
+BENCHMARKS=(QAD)
 INTERPS=(linear spline)
 
-CPU_CLASSIFIERS=(COPOD KNN LOF OCSVM PCA)
-GPU_CLASSIFIERS=()
+CPU_CLASSIFIERS=()
+GPU_CLASSIFIERS=(COUTA DeepIF)
 
 # Sparsity grid (5 levels) and number of seeds -> 25 tasks per (benchmark, interp, classifier)
 SUBSAMPLES="0.01,0.05"
-NUM_SUBSAMPLES=5
+NUM_SUBSAMPLES=2
 NUM_SEEDS=5
 NUM_TASKS=$(( NUM_SEEDS * NUM_SUBSAMPLES - 1 ))   # 0-based upper bound
 
@@ -59,6 +64,25 @@ conda activate baseline-latent
 
 cd "${PROJECT_DIR}"
 
+# Refuse to append to result directories that already hold task JSONs: each
+# task merges into an existing file, so a re-run under a changed protocol
+# (e.g. the aligned QAD windows/decimation/smoothing presets in
+# baselines/baseline.py) would silently mix old and new results. Pass a fresh
+# RESULTS_BASE_DIR, or set ALLOW_EXISTING_RESULTS=1 to merge on purpose.
+ALLOW_EXISTING_RESULTS="${ALLOW_EXISTING_RESULTS:-0}"
+check_results_dir () {
+    local results_dir="$1"
+    if compgen -G "${results_dir}/*.json" > /dev/null; then
+        if [[ "${ALLOW_EXISTING_RESULTS}" == "1" ]]; then
+            echo "Warning: ${results_dir} already holds task results; merging (ALLOW_EXISTING_RESULTS=1)." >&2
+        else
+            echo "Error: ${results_dir} already holds task results from a previous sweep." >&2
+            echo "       Pass a fresh RESULTS_BASE_DIR or set ALLOW_EXISTING_RESULTS=1 to merge." >&2
+            exit 1
+        fi
+    fi
+}
+
 submit_classifier_jobs () {
     local benchmark="$1"
     local interp="$2"
@@ -66,6 +90,7 @@ submit_classifier_jobs () {
     local device_group="$4"   # "cpu" or "gpu"
 
     local results_dir="${RESULTS_BASE_DIR}_${benchmark}_${interp}_${classifier}"
+    check_results_dir "${results_dir}"
     mkdir -p "${results_dir}"
 
     local timeout mem gpus gpu_id_flag
