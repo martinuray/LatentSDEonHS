@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 
 from anomaly_detection import build_modules_and_optim, calculate_z_normalization_values
-from data.qad_provider import QADProvider
+from data.qad_provider import QADProvider, load_qad_pkl
 
 
 def _select_checkpoint_path() -> Path:
@@ -18,12 +18,60 @@ def _select_checkpoint_path() -> Path:
     return candidates[-1]
 
 
+def _resolve_trace_id(args, default: int = 1) -> int:
+    for attr in ("trace_id", "dataset_number"):
+        value = getattr(args, attr, None)
+        if value is not None:
+            return int(value)
+
+    trace_ids = getattr(args, "trace_ids", None)
+    if trace_ids:
+        first = trace_ids[0]
+        if isinstance(first, (list, tuple)):
+            first = first[0]
+        if isinstance(first, str) and "," in first:
+            first = first.split(",", 1)[0]
+        try:
+            return int(first)
+        except (TypeError, ValueError):
+            pass
+
+    return int(default)
+
+
+def _load_qad_raw_trace(data_dir: str, trace_id: int, decimation_factor: int):
+    raw_dir = Path(data_dir)
+    if not (raw_dir / f"test_{trace_id}.pkl").exists():
+        raw_dir = raw_dir / "QAD" / "raw"
+    data = load_qad_pkl(raw_dir / f"test_{trace_id}.pkl")
+    labels = load_qad_pkl(raw_dir / f"test_label_{trace_id}.pkl", is_label=True)
+
+    if "Enable" in data.columns:
+        data = data.drop(columns=["Enable"])
+
+    data = data.iloc[::decimation_factor].reset_index(drop=True)
+    labels = labels.iloc[::decimation_factor].reset_index(drop=True)
+
+    if isinstance(labels, pd.DataFrame):
+        if labels.shape[1] > 1:
+            labels = labels.iloc[:, 0:1]
+    else:
+        labels = labels.to_frame(name="labels")
+
+    aligned_len = min(len(data), len(labels))
+    data = data.iloc[:aligned_len].reset_index(drop=True)
+    labels = labels.iloc[:aligned_len].reset_index(drop=True)
+
+    return data, labels
+
+
 def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np.ndarray:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     args = checkpoint["args"]
     args.device = device
+    decimation_factor = max(1, int(getattr(args, "data_decimation_factor", 10)))
 
     provider = QADProvider(
         data_dir=getattr(args, "data_dir", "data_dir"),
@@ -34,7 +82,7 @@ def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np
         subsample=args.subsample,
         seed=getattr(args, "seed", -1),
         fixed_subsample_mask=getattr(args, "fixed_subsample_mask", False),
-        raw_subdir="qad_clean_txt_100Hz",
+        decimation_factor=decimation_factor,
     )
 
     desired_t = checkpoint["desired_t"].to(device)
@@ -109,30 +157,31 @@ def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np
     return np.linalg.norm(all_scores, ord=1, axis=1)
 
 
+
 #%%
-data = pd.read_csv("data_dir/QAD/raw/qad_clean_txt_100Hz/test_1.txt")
-data = data.drop(columns=["Enable"])
-labels = pd.read_csv("data_dir/QAD/raw/qad_clean_txt_100Hz/test_label_1.txt")
+checkpoint_path = _select_checkpoint_path()
+checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+checkpoint_args = checkpoint["args"]
+trace_id = _resolve_trace_id(checkpoint_args, default=1)
+data_dir = getattr(checkpoint_args, "data_dir", "data_dir")
+decimation_factor = max(1, int(getattr(checkpoint_args, "data_decimation_factor", 10)))
+
+data, labels = _load_qad_raw_trace(data_dir, trace_id, decimation_factor)
 
 start_idx = 130000 #115000
 end_idx = 200000 #122500
-subsample = 10
+subsample = decimation_factor
 col_idx = [0, 14, 12]
 SCORE_MA_WINDOW = 30
 q = 99.0
 
 window_length = 5000
-max_signal_len = data.shape[0] // window_length * window_length
-data = data[:max_signal_len]
-labels = labels[:max_signal_len]
-
-data = data.iloc[start_idx:end_idx:subsample, col_idx]
-labels = labels.iloc[start_idx:end_idx:subsample, 0].to_numpy() == 1
-
-checkpoint_path = _select_checkpoint_path()
-scores_full = _score_trace_with_checkpoint(checkpoint_path, trace_id=1)
+scores_full = _score_trace_with_checkpoint(checkpoint_path, trace_id=trace_id)
 r = float(np.nanpercentile(scores_full, q))
-scores = scores_full[start_idx//10:end_idx//10]
+
+data = data.iloc[start_idx // subsample:end_idx // subsample, col_idx]
+labels = labels.iloc[start_idx // subsample:end_idx // subsample, 0].to_numpy() == 1
+scores = scores_full[start_idx // subsample:end_idx // subsample]
 
 #%%
 if len(labels) != len(data) or len(scores) != len(data):
@@ -210,7 +259,7 @@ axs[-1].plot(
 )
 axs[-1].plot(t, scores_anom, color="red", linewidth=LINE_WIDTH * 1.5)
 axs[-1].axhline(r, color="purple", linestyle="--", label="95th percentile threshold")
-axs[-1].set_ylabel("Anomaly score", rotation=90, va="center")
+axs[-1].set_ylabel("$-\\log p_\theta$", rotation=90, va="center")
 axs[-1].yaxis.set_label_coords(YLABEL_X, 0.5)
 axs[-1].set_xlabel("Time in window (s)")
 axs[-1].set_xlim(t.min(), t.max() + 1)
