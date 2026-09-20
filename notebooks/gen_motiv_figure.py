@@ -11,7 +11,7 @@ from data.qad_provider import QADProvider, load_qad_pkl
 
 
 def _select_checkpoint_path() -> Path:
-    pattern = "checkpoint_AD_QAD_*_1_60.h5"
+    pattern = "checkpoint_qad_*_best_Rn.h5"
     candidates = sorted(Path("checkpoints").glob(pattern), key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(f"No checkpoint found in checkpoints/ matching '{pattern}'")
@@ -71,6 +71,7 @@ def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np
 
     args = checkpoint["args"]
     args.device = device
+    args.mc_eval_samples = 5
     decimation_factor = max(1, int(getattr(args, "data_decimation_factor", 10)))
 
     provider = QADProvider(
@@ -168,10 +169,10 @@ decimation_factor = max(1, int(getattr(checkpoint_args, "data_decimation_factor"
 
 data, labels = _load_qad_raw_trace(data_dir, trace_id, decimation_factor)
 
-start_idx = 130000 #115000
-end_idx = 200000 #122500
-subsample = decimation_factor
-col_idx = [0, 14, 12]
+start_idx = 0 #115000
+end_idx = -1 #122500
+subsample = 1 #decimation_factor*10
+col_idx = [0, 1, 3]
 SCORE_MA_WINDOW = 30
 q = 99.0
 
@@ -179,8 +180,8 @@ window_length = 5000
 scores_full = _score_trace_with_checkpoint(checkpoint_path, trace_id=trace_id)
 r = float(np.nanpercentile(scores_full, q))
 
-data = data.iloc[start_idx // subsample:end_idx // subsample, col_idx]
-labels = labels.iloc[start_idx // subsample:end_idx // subsample, 0].to_numpy() == 1
+data = data.iloc[start_idx // subsample:end_idx // subsample -1, col_idx]
+labels = labels.iloc[start_idx // subsample:end_idx // subsample -1, 0].to_numpy() == 1
 scores = scores_full[start_idx // subsample:end_idx // subsample]
 
 #%%
@@ -280,6 +281,7 @@ plt.savefig("out/motivational_figure.png", dpi=300, bbox_inches="tight", pad_inc
 plt.show()
 plt.close("all")
 
+import sys; sys.exit(0)
 
 #%% Content for Fig 2. ML Flow
 data_len = 650
