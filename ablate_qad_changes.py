@@ -94,11 +94,6 @@ GROUPS: "OrderedDict[str, dict]" = OrderedDict(
         new=dict(z_dim=4, h_dim=20, n_deg=5),
         why="smaller latent / path degree, wider hidden",
     ),
-    sigma=dict(
-        old=dict(initial_sigma=0.05),
-        new=dict(initial_sigma=0.22),
-        why="decoder sigma init (Normal(mu, sigma**2), so 0.22 -> std 0.05)",
-    ),
     scoring=dict(
         old=dict(normalize_score=False, score_aggregation="max", score_smoothing_window=5),
         new=dict(normalize_score=True, score_aggregation="weighted-mse", score_smoothing_window=10),
