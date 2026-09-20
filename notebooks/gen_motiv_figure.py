@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from anomaly_detection import build_modules_and_optim, calculate_z_normalization_values
+from anomaly_detection import (
+    build_modules_and_optim,
+    calculate_feature_reconstruction_weights,
+    calculate_z_normalization_values,
+)
 from data.qad_provider import QADProvider, load_qad_pkl
 
 
@@ -100,17 +104,27 @@ def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np
         pin_memory=False,
     )
 
+    dl_trn = provider.get_train_loader(
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=None,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+
     normalization_stats = None
     if getattr(args, "normalize_score", False):
-        dl_trn = provider.get_train_loader(
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=None,
-            num_workers=0,
-            pin_memory=False,
-            drop_last=False,
-        )
         normalization_stats = calculate_z_normalization_values(args, dl_trn, modules, desired_t, device)
+
+    # Weighted-mean channel aggregation: weight each channel's -log p_theta by
+    # its inverse training-reconstruction MSE (see calculate_feature_reconstruction_weights),
+    # so channels the model reconstructs faithfully on nominal training data
+    # dominate the score, instead of the previous plain per-channel sum.
+    weighting = "exp-inverse" if getattr(args, "score_aggregation", None) == "weighted-mse-exp" else "inverse"
+    feature_weights = calculate_feature_reconstruction_weights(
+        args, dl_trn, modules, desired_t, device, weighting=weighting
+    )["feature_weights"]
 
     n_time = int(dl_tst.dataset.indcs.max().item()) + 1
     all_scores = np.zeros((n_time, dl_tst.dataset.input_dim), dtype=np.float64)
@@ -155,7 +169,7 @@ def _score_trace_with_checkpoint(checkpoint_path: Path, trace_id: int = 1) -> np
         out=np.zeros_like(all_scores),
         where=normalize_counts[:, None] > 0,
     )
-    return np.linalg.norm(all_scores, ord=1, axis=1)
+    return (all_scores * feature_weights.reshape(1, -1)).sum(axis=1)
 
 
 
