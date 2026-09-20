@@ -25,8 +25,9 @@ SEEDS=(42 43 44 45 46)
 
 # Common anomaly_detection.py parameters (dataset and runs are set per benchmark below)
 
-# Benchmarks to run (from anomaly_detection.py)
-BENCHMARKS=("SWaT WaDi PSM MSL SMAP SMD")
+# Benchmarks to run (from anomaly_detection.py) -- each is submitted as its
+# own set of SLURM jobs.
+BENCHMARKS=(SWaT WaDi PSM MSL SMAP SMD)
 
 
 # ---- Conda / project setup ----
