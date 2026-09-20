@@ -18,7 +18,7 @@ TIMEOUT="64:00:00"           # Timeout per job (HH:MM:SS)
 NUM_GPUS=1                   # Number of GPUs per job
 NUM_CPUS=8                   # Number of CPUs per job
 MEMORY="40GB"                # Memory per job
-JOB_NAME_PREFIX="qad"    # Prefix for job names
+JOB_NAME_PREFIX="LSD"    # Prefix for job names
 
 # Seeds to submit independently (one job per seed)
 SEEDS=(42 43 44 45 46)
@@ -26,7 +26,7 @@ SEEDS=(42 43 44 45 46)
 # Common anomaly_detection.py parameters (dataset and runs are set per benchmark below)
 
 # Benchmarks to run (from anomaly_detection.py)
-BENCHMARKS=("QAD")
+BENCHMARKS=("SWaT WaDi PSM MSL SMAP SMD")
 
 
 # ---- Conda / project setup ----
