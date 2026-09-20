@@ -326,11 +326,12 @@ def _select_anomalous_window_indices(ds, n_select):
     n_windows = len(ds)
     n_select = min(n_select, n_windows)
 
-    anomalous = [i for i in range(n_windows) if bool((ds[i]["aux_tgt"] > 0).any())]
-    if not anomalous:
-        return _select_middle_window_indices(ds, n_select)
+    #anomalous = [i for i in range(n_windows) if bool((ds[i]["aux_tgt"] > 0).any())]
+    #if not anomalous:
+    #    return _select_middle_window_indices(ds, n_select)
 
-    first, last = anomalous[0], anomalous[-1]
+    #first, last = anomalous[0], anomalous[-1]
+    first, last = 675, 750
     span = last - first + 1
     start = first if span >= n_select else first - (n_select - span) // 2
     start = max(0, min(start, n_windows - n_select))
@@ -415,9 +416,9 @@ def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, ou
     # Same alpha scale as the notebook's spaghetti plot (500 samples @ alpha=0.01).
     recon_alpha = min(0.3, max(0.01, 5.0 / n_mc))
 
-    nrows = max(1, int(np.ceil(input_dim / 2.0)))
-    fig, axs = plt.subplots(nrows=nrows, ncols=2, figsize=(10, 1.6 * nrows), sharex=True)
-    axs = np.asarray(axs, dtype=object).reshape(-1)[:input_dim]
+    nrows = max(1, int(np.ceil(input_dim)))
+    fig, axs = plt.subplots(nrows=nrows, ncols=1, figsize=(12, 3.6 * nrows), sharex=True)
+    axs = axs.flatten()
     # Fix one common y-range across all per-variate twin axes so the
     # likelihood traces stay directly comparable across variates.
     likelihood_range = (likelihood.min().item(), likelihood.max().item()) if likelihood is not None else None
@@ -434,7 +435,9 @@ def _plot_actual_vs_reconstructed(actual, recon_samples, anomaly_mask, title, ou
                      label="reconstructed" if var_idx == 0 and mc_idx == 0 else None)
         ax.plot(actual[:, :, var_idx].flatten(), color="tab:blue", linewidth=1.2, alpha=.7,
                  label="actual" if var_idx == 0 else None)
-        ax.set_ylabel(f"var {var_idx}", fontsize=8)
+        #ax.set_ylabel(f"var {var_idx}", fontsize=8)
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
         ax.set_zorder(1)
         ax.patch.set_visible(False)  # keep anomaly shading visible through the twin axis
 
@@ -508,7 +511,7 @@ def plot_test_reconstruction(args, provider, modules, desired_t, epoch, experime
         actual, recon, anomaly_mask=anomaly_mask,
         title=f"Test reconstruction @ epoch {epoch} (test windows {indices[0]}-{indices[-1]})",
         out_path=out_path,
-        likelihood=nll,
+        #likelihood=nll,
     )
 
     logging.info("Saved test reconstruction plot to %s", out_path)
