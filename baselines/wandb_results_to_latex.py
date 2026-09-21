@@ -121,6 +121,9 @@ KNOWN_BENCHMARKS = {benchmark for _, benchmarks in TABLE_GROUPS for benchmark in
 DETERMINISTIC_CLASSIFIERS = {"COPOD", "OCSVM", "KNN", "PCA", "LOF"}
 DEFAULT_RUN_LIMIT = 5
 DETERMINISTIC_RUN_LIMIT = 1
+# Non-deterministic classifiers are expected to have one run per seed in this
+# range (5 seeds total); see report_missing_runs.
+EXPECTED_SEEDS = list(range(42, 47))
 
 # Classifier row groups, each separated by a booktabs \midrule: "shallow"
 # (classical, non-deep) methods, the deep-learning methods, the NeuralODE
@@ -194,15 +197,6 @@ def parse_args() -> argparse.Namespace:
         help="Don't fetch/include the 'ours' (LSD Rn/Sn) row group.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory to write the .tex files into.")
-    parser.add_argument(
-        "--after",
-        type=str,
-        default=None,
-        help=(
-            "Omit runs created before this date/time (e.g. '2026-09-01' or '2026-09-01 14:30'); "
-            "parsed with pandas.to_datetime and compared in UTC."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -455,6 +449,39 @@ def build_run_count_table(values: dict[tuple[str, str], dict[str, list[float]]])
                                  + sorted(set(count_df.index) - set(CLASSIFIER_ORDER)))
     count_df.index.name = "classifier"
     return count_df
+
+
+def report_missing_runs(
+    records: dict[tuple[str, str], list[RunEntry]], benchmarks: list[str]
+) -> None:
+    """Print, for every (benchmark, classifier) pair, which of the 5 expected
+    seeds (42-46) are still missing.
+
+    Deterministic classifiers (DETERMINISTIC_CLASSIFIERS) only ever need a
+    single run regardless of seed, so they're reported as missing only when
+    no run at all was found for that (benchmark, classifier) pair. `records`
+    should be the seed-deduped records dict (post dedupe_by_seed), i.e.
+    before select_recent_runs discards anything beyond the recency limit --
+    this reports on every run W&B has, not just the ones a table will use.
+    """
+    missing_lines = []
+    for benchmark in benchmarks:
+        for clf_name in CLASSIFIER_ORDER:
+            entries = records.get((benchmark, clf_name), [])
+            if clf_name in DETERMINISTIC_CLASSIFIERS:
+                if not entries:
+                    missing_lines.append(f"  {benchmark} / {clf_name}: no run found")
+                continue
+
+            seeds_present = {seed for _, seed, _ in entries if seed is not None}
+            missing_seeds = [s for s in EXPECTED_SEEDS if s not in seeds_present]
+            if missing_seeds:
+                missing_lines.append(
+                    f"  {benchmark} / {clf_name}: missing seed(s) {missing_seeds}"
+                )
+
+    print(f"\nRuns still left to do (expected seeds {EXPECTED_SEEDS[0]}-{EXPECTED_SEEDS[-1]}):")
+    print("\n".join(missing_lines) if missing_lines else "  none -- all expected runs found.")
 
 
 # cellcolor names for the 1st/2nd/3rd best value in a column; must be
@@ -740,12 +767,7 @@ def to_comparison_latex(comparison_df: pd.DataFrame) -> str:
 def main() -> None:
     args = parse_args()
 
-    min_created_at = None
-    if args.after is not None:
-        min_created_at = pd.to_datetime(args.after, utc=True)
-        print(f"Omitting runs created before {min_created_at} (UTC).")
-
-    records = fetch_run_records(args.project, args.entity, min_created_at=min_created_at)
+    records = fetch_run_records(args.project, args.entity)
 
     if not args.skip_neuralode:
         # --after only filters the PYOD baselines; NeuralODE runs are always
@@ -755,7 +777,7 @@ def main() -> None:
             records[key].extend(entries)
 
     if not args.skip_ours:
-        ours_records = fetch_ours_run_records(args.ours_project, args.ours_entity, min_created_at=min_created_at)
+        ours_records = fetch_ours_run_records(args.ours_project, args.ours_entity)
         for key, entries in ours_records.items():
             records[key].extend(entries)
 
@@ -814,6 +836,11 @@ def main() -> None:
     appendix_out_path = args.output_dir / "baseline_table_QAD_decimation1_appendix.tex"
     appendix_out_path.write_text(appendix_latex)
     print(f"Saved to {appendix_out_path}")
+
+    all_benchmarks = [b for _, benchmarks in TABLE_GROUPS for b in benchmarks] + [
+        QAD_BENCHMARK, QAD_DECIMATION1_BENCHMARK
+    ]
+    report_missing_runs(records, all_benchmarks)
 
 
 if __name__ == "__main__":
