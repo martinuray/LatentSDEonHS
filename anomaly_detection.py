@@ -1355,20 +1355,14 @@ def evaluate(
 
             aux_log_prob = -pxz.log_prob(parts["evd_obs"])
 
-            # make sure that log_prob is in the right shape
-            if aux_log_prob.dim() >= 4:
-                aux_log_prob = aux_log_prob.squeeze()
-            if aux_log_prob.dim() == 2:
-                aux_log_prob = aux_log_prob[None, :, :]
+            # aux_log_prob is always (mc_eval_samples, batch, time_steps, feat_dim);
+            # average out the mc-samples axis without touching batch/time/feat,
+            # since a trailing batch of size 1 (drop_last=False) makes a blind
+            # squeeze() collapse the wrong axis.
+            aux_log_prob = aux_log_prob.mean(dim=0)
 
-            #aux_log_prob = aux_log_prob.mean(dim=0)
             if normalization_stats is not None:
-                #aux_log_prob = (aux_log_prob - normalization_stats['mu']) / \
-                #               normalization_stats['sigma']
                 aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
-
-            if aux_log_prob.dim() == 4:
-                aux_log_prob = aux_log_prob.mean(axis=0)
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
