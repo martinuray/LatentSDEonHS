@@ -280,6 +280,98 @@ def _plot_anomaly_score_timeline(scores, labels, out_path, title):
     plt.close(fig)
 
 
+def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anomaly_mask, out_path):
+    """Motivational-figure-style plot (stacked per-channel traces on top,
+    anomaly score panel at the bottom; see notebooks/gen_motiv_figure.py)
+    built purely from the test-set arrays already computed above for the
+    test reconstruction and anomaly-score-timeline plots. No new scores or
+    statistics are computed here, only re-plotting of existing data.
+    """
+    LINE_COLOR = "0.2"
+    ANOMALY_COLOR = "red"
+    ANOMALY_ALPHA = 0.1
+    GRID_ALPHA = 0.25
+    LINE_WIDTH = 1.0
+    YLABEL_X = -0.05
+
+    actual = np.asarray(actual)
+    if actual.ndim == 3:
+        actual = actual.reshape(-1, actual.shape[-1])
+    anomaly_mask = np.asarray(anomaly_mask, dtype=bool)
+    score = np.asarray(score, dtype=float)
+    score_anomaly_mask = np.asarray(score_anomaly_mask, dtype=bool)
+
+    n_samples = min(actual.shape[0], anomaly_mask.shape[0], score.shape[0], score_anomaly_mask.shape[0])
+    actual = actual[:n_samples]
+    anomaly_mask = anomaly_mask[:n_samples]
+    score = score[:n_samples]
+    score_anomaly_mask = score_anomaly_mask[:n_samples]
+    t = np.arange(n_samples)
+
+    label_edges = np.diff(np.pad(anomaly_mask.astype(np.int8), (1, 1)))
+    anomaly_starts = np.flatnonzero(label_edges == 1)
+    anomaly_ends = np.flatnonzero(label_edges == -1)
+    anomaly_spans = [
+        (int(t[start]), int(t[min(end, n_samples - 1)]) + 1)
+        for start, end in zip(anomaly_starts, anomaly_ends)
+    ]
+
+    n_channels = actual.shape[1] + 1
+    spacer_height = 0.6
+
+    fig = plt.figure(figsize=(15, 1.2 * n_channels + 1.0), constrained_layout=False)
+    height_ratios = [1.2] * (n_channels - 1) + [spacer_height, 1.0]
+    gs = fig.add_gridspec(nrows=n_channels + 1, ncols=1, height_ratios=height_ratios, hspace=0.06)
+
+    axs = []
+    for i in range(n_channels - 1):
+        share_ax = axs[0] if axs else None
+        axs.append(fig.add_subplot(gs[i, 0], sharex=share_ax))
+
+    sep_ax = fig.add_subplot(gs[n_channels - 1, 0])
+    sep_ax.set_axis_off()
+
+    axs.append(fig.add_subplot(gs[n_channels, 0], sharex=axs[0]))
+
+    for i in range(actual.shape[1]):
+        ax = axs[i]
+        ax.plot(t, actual[:, i], color=LINE_COLOR, linewidth=LINE_WIDTH)
+        for span_start, span_end in anomaly_spans:
+            ax.axvspan(span_start, span_end, color=ANOMALY_COLOR, alpha=ANOMALY_ALPHA, linewidth=0)
+            ax.axvline(span_start, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+            ax.axvline(span_end, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
+        ax.set_ylabel(f"var {i}", rotation=90, va="center")
+        ax.yaxis.set_label_coords(YLABEL_X, 0.5)
+        ax.grid(axis="y", alpha=GRID_ALPHA, linewidth=0.6)
+
+    score_benign = score.copy()
+    score_anom = score.copy()
+    score_benign[score_anomaly_mask] = np.nan
+    score_anom[~score_anomaly_mask] = np.nan
+
+    axs[-1].plot(t, score_benign, color=LINE_COLOR, linewidth=LINE_WIDTH, label="anomaly score")
+    axs[-1].plot(t, score_anom, color="red", linewidth=LINE_WIDTH * 1.5)
+    axs[-1].set_ylabel("$-\\log p_\\theta$", rotation=90, va="center")
+    axs[-1].yaxis.set_label_coords(YLABEL_X, 0.5)
+    axs[-1].set_xlabel("Timepoint (concatenated test windows)")
+    axs[-1].set_xlim(t.min(), t.max())
+    axs[-1].set_title("Anomaly Scores")
+    axs[0].set_title("Sensory Data (test)")
+
+    for ax in axs[:-1]:
+        ax.tick_params(axis="x", which="both", labelbottom=False)
+
+    for ax in axs:
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(pad=0.2, h_pad=0.1)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
+    plt.close(fig)
+
+
 def _compute_xyz_bounds(*arrays, padding=0.08):
     stacked = []
     for arr in arrays:
@@ -609,6 +701,23 @@ def main() -> None:
             title="Test anomaly score timeline (weighted by train reconstruction MSE)",
         )
         logging.info("Saved anomaly score timeline plot to %s", timeline_path)
+
+        # Motivational-figure-style test plot: re-plots the same test actual
+        # data and anomaly score already computed above (tst_actual /
+        # tst_anomaly_mask / weighted_timeline / weighted_labels) in the
+        # stacked-channels-plus-score layout from gen_motiv_figure.py.
+        motiv_window_length = int(train_args.data_window_length)
+        motiv_start_idx = tst_indices[0] * motiv_window_length
+        motiv_end_idx = (tst_indices[-1] + 1) * motiv_window_length
+        motiv_fig_path = out_dir / f"{experiment_id}_epoch{epoch:04d}_test_motivational_figure.pdf"
+        _plot_motivational_style_test_figure(
+            actual=tst_actual,
+            anomaly_mask=tst_anomaly_mask,
+            score=weighted_timeline[motiv_start_idx:motiv_end_idx],
+            score_anomaly_mask=weighted_labels[motiv_start_idx:motiv_end_idx],
+            out_path=motiv_fig_path,
+        )
+        logging.info("Saved motivational-style test figure to %s", motiv_fig_path)
 
         def _render_latent_sphere(
             ds,
