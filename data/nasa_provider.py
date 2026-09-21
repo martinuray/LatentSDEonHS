@@ -261,13 +261,25 @@ class NASADataset(Dataset):
             data_obj = objs[mode][ds_idx]
             train_obj = objs['train'][ds_idx]
 
+            # A channel must be skipped identically across the train/test/val
+            # NASADataset instances, since each instance compacts self.datasets
+            # independently — skipping based only on this split's own window
+            # count would shift ds_idx out of alignment between the three
+            # instances (e.g. a channel with too few train windows to also
+            # populate val, but with enough test windows to be kept there).
+            split_lengths = {split: len(objs[split][ds_idx].data) for split in ('train', 'test', 'val')}
+            if any(length == 0 for length in split_lengths.values()):
+                logging.warning(
+                    f"Skipping dataset_id={dataset_id}: no windows in at least one split "
+                    f"(train={split_lengths['train']}, test={split_lengths['test']}, "
+                    f"val={split_lengths['val']})."
+                )
+                continue
+
             # Per-dataset normalisation bounds (always from training split)
             data_min, data_max = get_data_min_max(train_obj[:])
 
             raw = data_obj.data  # list of (part_idx, indcs, obs, msk)
-            if len(raw) == 0:
-                logging.warning(f"Skipping empty dataset: {dataset_id} (mode={mode})")
-                continue
 
             # Build tensors for this sub-dataset
             tps_base = raw[0][1].float()
