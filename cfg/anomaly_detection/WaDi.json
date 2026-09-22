@@ -8,7 +8,7 @@
   "final_metrics_csv": "logs/final_metrics.csv",
   "data_window_length": 100,
   "data_window_overlap": 0.9,
-  "batch_size": 256,
+  "batch_size": 64,
   "n_epochs": 2400,
   "seed": -1,
   "restart": 30,
