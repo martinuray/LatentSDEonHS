@@ -67,6 +67,12 @@ other table's aggregation. It has no "Avg. Rank" column (so no rank-based
 row sorting: rows keep CLASSIFIER_ORDER's fixed grouping) but still
 highlights each column's top 3 the same way as the other tables.
 
+A seventh table isolates the NeuralODE-vs-LSD comparison and transposes the
+layout: one row per benchmark (all of them in a single table) and the models
+as column groups, with NeuralODE on the left and our two LSD variants to its
+right. Only the best model per (benchmark, metric) is highlighted, via a bare
+``\cellcolor{first}{...}``; there is no "Avg. Rank" column.
+
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
 """
@@ -137,6 +143,15 @@ LSD_SN_LABEL = r"LSD on $\mathbb{S}^n$ (ours)"
 CLASSIFIER_GROUP_OURS = [LSD_RN_LABEL, LSD_SN_LABEL]
 NAMED_CLASSIFIER_GROUPS = [CLASSIFIER_GROUP_SHALLOW, CLASSIFIER_GROUP_DEEP, CLASSIFIER_GROUP_NEURALODE, CLASSIFIER_GROUP_OURS]
 CLASSIFIER_ORDER = [clf for group in NAMED_CLASSIFIER_GROUPS for clf in group]
+
+# The NeuralODE-vs-LSD table (see build_ode_vs_lsd_table) transposes the other
+# tables' layout: one row per benchmark, and the models as column groups --
+# NeuralODE first, our two LSD variants to its right. Row groups mirror
+# TABLE_GROUPS (single-trace / multi-trace) plus QAD, so the \midrule
+# structure matches the per-group tables. QAD_DECIMATION1_BENCHMARK stays out:
+# it's a decimation ablation, not a benchmark of its own.
+ODE_VS_LSD_MODELS = [NEURALODE_CLASSIFIER, LSD_RN_LABEL, LSD_SN_LABEL]
+ODE_VS_LSD_BENCHMARK_GROUPS = [benchmarks for _, benchmarks in TABLE_GROUPS] + [[QAD_BENCHMARK]]
 
 # clf_name -> shorter display label for the LaTeX "Method"/"Model" column;
 # classifiers not listed here are shown under their plain name. Internal
@@ -523,6 +538,33 @@ def highlight_top3(mean_table: pd.DataFrame, text_table: pd.DataFrame) -> pd.Dat
     return ranks
 
 
+def highlight_best_per_metric(
+    mean_table: pd.DataFrame, text_table: pd.DataFrame, models: list[str], metric_labels: list[str]
+) -> None:
+    """In-place row-wise counterpart of highlight_top3, for tables whose columns
+    are (model, metric) and whose rows are benchmarks.
+
+    For every (row, metric) the best-scoring model's cell is wrapped in
+    ``\\cellcolor{first}{...}`` and the remaining populated cells in bare
+    ``{...}``; "--" placeholders stay unwrapped. Only the winner is coloured
+    (not the top 3 as in highlight_top3): with just a handful of model columns
+    a top-3 highlight would colour essentially every cell.
+    """
+    for idx in mean_table.index:
+        for metric_label in metric_labels:
+            cols = [(model, metric_label) for model in models]
+            row_values = mean_table.loc[idx, cols]
+            best_col = row_values.idxmax() if row_values.notna().any() else None
+            for col in cols:
+                cell_text = text_table.loc[idx, col]
+                if cell_text == "--":
+                    continue
+                if col == best_col:
+                    text_table.loc[idx, col] = f"\\cellcolor{{{RANK_COLORS[1]}}}{{{cell_text}}}"
+                else:
+                    text_table.loc[idx, col] = f"{{{cell_text}}}"
+
+
 def build_latex_table(
     values: dict[tuple[str, str], dict[str, list[float]]], benchmarks: list[str]
 ) -> tuple[pd.DataFrame, pd.Series]:
@@ -710,6 +752,83 @@ def to_appendix_qad_latex(table: pd.DataFrame) -> str:
     )
 
 
+def build_ode_vs_lsd_table(values: dict[tuple[str, str], dict[str, list[float]]]) -> pd.DataFrame:
+    """NeuralODE vs. LSD table: one row per benchmark, models as column groups.
+
+    Transposes the per-group tables' layout so that every benchmark appears in
+    a single table and the NeuralODE baseline sits immediately left of our two
+    LSD variants (see ODE_VS_LSD_MODELS), making the ablation readable row by
+    row. Within each (benchmark, metric) the best of the model columns is
+    highlighted; there is no "Avg. Rank" column, since ranking over three
+    models carries little information.
+    """
+    benchmarks = [b for group in ODE_VS_LSD_BENCHMARK_GROUPS for b in group]
+    metric_labels = [METRIC_LABELS[m] for m in METRICS]
+
+    columns = pd.MultiIndex.from_product([ODE_VS_LSD_MODELS, metric_labels])
+    mean_table = pd.DataFrame(index=benchmarks, columns=columns, dtype=float)
+    text_table = pd.DataFrame(index=benchmarks, columns=columns, dtype=object)
+    mean_table.index.name = "benchmark"
+    text_table.index.name = "benchmark"
+
+    for benchmark in benchmarks:
+        for model in ODE_VS_LSD_MODELS:
+            metric_values = values.get((benchmark, model), {m: [] for m in METRICS})
+            for metric in METRICS:
+                col = (model, METRIC_LABELS[metric])
+                mean, std = mean_std(metric_values[metric])
+                mean_table.loc[benchmark, col] = mean
+                text_table.loc[benchmark, col] = format_cell(mean, std)
+
+    highlight_best_per_metric(mean_table, text_table, ODE_VS_LSD_MODELS, metric_labels)
+
+    text_table.insert(0, ("", "Benchmark"), pd.Series({b: BENCHMARK_LABELS.get(b, b) for b in benchmarks}))
+    return text_table.fillna("--")
+
+
+def to_ode_vs_lsd_latex(table: pd.DataFrame) -> str:
+    """Render the NeuralODE-vs-LSD table: Benchmark + 3 metrics per model group.
+
+    A \\midrule separates the benchmark row groups (single-trace, multi-trace,
+    QAD), mirroring how the per-group tables are split.
+    """
+    column_format = "l " + " ".join(["ccc"] * len(ODE_VS_LSD_MODELS))
+    group_cells = " & ".join(
+        f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{display_label(model)}}}}}" for model in ODE_VS_LSD_MODELS
+    )
+    metric_cells = [r"\textbf{Benchmark}"]
+    for _ in ODE_VS_LSD_MODELS:
+        metric_cells += [r"\textbf{AUC} \big\uparrow", r"\textbf{AUPRC} \big\uparrow", r"\textbf{F1} \big\uparrow"]
+    header = "\n".join([
+        f"& {group_cells} \\\\",
+        _cmidrule_spans(len(ODE_VS_LSD_MODELS), first_metric_col=2),
+        " & ".join(metric_cells) + r" \\",
+    ])
+
+    boundaries = set()
+    running_total = 0
+    for group in ODE_VS_LSD_BENCHMARK_GROUPS[:-1]:
+        running_total += len(group)
+        boundaries.add(running_total)
+
+    lines = []
+    for i, row in enumerate(table.itertuples(index=False), start=1):
+        lines.append(" & ".join(str(value) for value in row) + r" \\")
+        if i in boundaries:
+            lines.append(r"\midrule")
+    rows = "\n".join(lines)
+
+    return (
+        f"\\begin{{tabular}}{{{column_format}}}\n"
+        f"\\toprule\n"
+        f"{header}\n"
+        f"\\midrule\n"
+        f"{rows}\n"
+        f"\\bottomrule\n"
+        f"\\end{{tabular}}"
+    )
+
+
 def build_comparison_table(avg_rank_single: pd.Series, avg_rank_multi: pd.Series) -> pd.DataFrame:
     """Combine two tables' avg-rank columns into Overall/Single Trace/Multi Trace.
 
@@ -836,6 +955,16 @@ def main() -> None:
     appendix_out_path = args.output_dir / "baseline_table_QAD_decimation1_appendix.tex"
     appendix_out_path.write_text(appendix_latex)
     print(f"Saved to {appendix_out_path}")
+
+    ode_vs_lsd_table = build_ode_vs_lsd_table(values)
+    ode_vs_lsd_latex = to_ode_vs_lsd_latex(ode_vs_lsd_table)
+
+    print("\nLaTeX table (NeuralODE vs. LSD, all benchmarks)")
+    print(ode_vs_lsd_latex)
+
+    ode_vs_lsd_out_path = args.output_dir / "baseline_table_ode_vs_lsd.tex"
+    ode_vs_lsd_out_path.write_text(ode_vs_lsd_latex)
+    print(f"Saved to {ode_vs_lsd_out_path}")
 
     all_benchmarks = [b for _, benchmarks in TABLE_GROUPS for b in benchmarks] + [
         QAD_BENCHMARK, QAD_DECIMATION1_BENCHMARK
