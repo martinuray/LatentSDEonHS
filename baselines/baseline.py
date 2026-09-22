@@ -97,6 +97,7 @@ def set_round_context(run_number: int | None = None, total_runs: int | None = No
 _DEEPOD_INFERENCE_PATCHED = False
 _DEEPOD_WINDOWING_PATCHED = False
 _DEEPOD_COUTA_BATCH_PATCHED = False
+_DEEPOD_USAD_WINDOWING_PATCHED = False
 
 
 def _patch_deepod_inference_memory():
@@ -302,6 +303,121 @@ def _patch_deepod_couta_inference_batch(inference_batch_size: int = COUTA_INFERE
     )
 
 
+def _patch_deepod_usad_windowing():
+    """Patch `USAD` to flatten windows per batch instead of all at once.
+
+    USAD is the only deepod model that reshapes the *entire* windowed array
+    before batching - its encoder is an MLP over a flattened window, so both
+    `fit()` and `decision_function()` do
+
+        torch.from_numpy(seqs).float().view([seqs.shape[0], self.w_size])
+
+    Every other model hands `seqs` straight to a DataLoader and indexes it per
+    batch, which copies one window at a time and never looks at strides. Since
+    _patch_deepod_windowing_memory makes `get_sub_seqs` return an overlapping
+    `sliding_window_view`, that tensor is non-contiguous and `.view()` raises
+    "view size is not compatible with input tensor's size and stride". Using
+    `.reshape()` instead would only trade the error for the very copy the
+    windowing patch exists to avoid (33.5 GiB for SWaT at seq_len=200).
+
+    So `decision_function` is replaced by a version that keeps `seqs` lazy and
+    flattens one window at a time inside the Dataset: peak host memory stays
+    O(batch_size x w_size) whether or not `seqs` is a view. Scoring is
+    otherwise unchanged - same stride=1 windowing, same batch size, the same
+    `self.testing()` loop (itself patched by _patch_deepod_inference_memory),
+    and the same zero-padding that right-aligns window scores with `x`.
+
+    `fit()` is *not* reimplemented - training behaviour is left exactly as the
+    installed deepod defines it - but it reshapes the same way and would hit
+    the same error whenever its own windowing crosses the lazy-path threshold
+    (WaDi at stride=20 is ~7.4 GiB, i.e. it does). For its duration
+    `get_sub_seqs` is therefore forced back to returning a contiguous array,
+    restoring the pre-windowing-patch memory profile for training only. The
+    nested `self.decision_function(X)` call `fit()` makes at the end still gets
+    the lazy path, since it goes through the captured implementation rather
+    than the module global.
+    """
+    global _DEEPOD_USAD_WINDOWING_PATCHED
+    if _DEEPOD_USAD_WINDOWING_PATCHED:
+        return
+
+    from torch.utils.data import DataLoader, Dataset
+    from deepod.models.time_series import USAD
+    from deepod.models.time_series import usad as usad_module
+
+    # Whatever `get_sub_seqs` usad.py resolves to right now - i.e. the lazy
+    # wrapper if _patch_deepod_windowing_memory already ran (it must).
+    windowing_get_sub_seqs = usad_module.get_sub_seqs
+    original_fit = USAD.fit
+
+    class _FlattenedWindows(Dataset):
+        """One flattened float32 window per item, so `seqs` can stay a view.
+
+        Yields a 1-tuple to match what `TensorDataset` produced, keeping
+        `USAD.testing`'s `for [batch] in test_loader` unpacking valid.
+        """
+
+        def __init__(self, seqs, w_size):
+            self.seqs = seqs
+            self.w_size = w_size
+
+        def __len__(self):
+            return self.seqs.shape[0]
+
+        def __getitem__(self, index):
+            window = np.ascontiguousarray(self.seqs[index], dtype=np.float32)
+            return (torch.from_numpy(window).view(self.w_size),)
+
+    def _contiguous_get_sub_seqs(*args, **kwargs):
+        seqs = windowing_get_sub_seqs(*args, **kwargs)
+        if seqs.flags["C_CONTIGUOUS"]:
+            return seqs
+        LOGGER.info(
+            "USAD.fit: materialising %s lazy windows (%.1f GiB); USAD reshapes the "
+            "whole array up front and cannot consume a strided view.",
+            seqs.shape,
+            seqs.nbytes / 1024**3,
+        )
+        return np.ascontiguousarray(seqs)
+
+    def fit(self, X, y=None):
+        usad_module.get_sub_seqs = _contiguous_get_sub_seqs
+        try:
+            return original_fit(self, X, y)
+        finally:
+            usad_module.get_sub_seqs = windowing_get_sub_seqs
+
+    def decision_function(self, x, labels=None):
+        seqs = windowing_get_sub_seqs(x, seq_len=self.seq_len, stride=1)
+
+        test_loader = DataLoader(
+            _FlattenedWindows(seqs, self.w_size),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        results = self.testing(test_loader)
+
+        # Equivalent to deepod's
+        #   np.concatenate([torch.stack(results[:-1]).flatten()..., results[-1].flatten()...])
+        # but without requiring every batch bar the last to be the same size,
+        # which also makes the single-batch case (empty results[:-1]) work.
+        if results:
+            y_pred = np.concatenate([r.flatten().detach().cpu().numpy() for r in results])
+        else:
+            y_pred = np.zeros(0, dtype=float)
+
+        return np.hstack([0 * np.ones(x.shape[0] - y_pred.shape[0]), y_pred])
+
+    USAD.fit = fit
+    USAD.decision_function = decision_function
+    _DEEPOD_USAD_WINDOWING_PATCHED = True
+    LOGGER.info(
+        "Patched USAD.decision_function to flatten windows per batch (so it can "
+        "score a lazy sliding-window view), and USAD.fit to keep windowing eagerly."
+    )
+
+
 def build_classifier_factories(
     device: str = "cpu",
     random_state: int | None = None,
@@ -331,6 +447,8 @@ def build_classifier_factories(
 
     _patch_deepod_inference_memory()
     _patch_deepod_windowing_memory()
+    # Must follow the windowing patch: it captures usad.py's `get_sub_seqs`.
+    _patch_deepod_usad_windowing()
     _patch_deepod_couta_inference_batch()
 
     ts_kwargs = {"seq_len": seq_len, "stride": stride, "device": device, "random_state": random_state, "verbose": 1}
