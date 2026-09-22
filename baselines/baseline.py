@@ -37,7 +37,18 @@ CURRENT_ROUND = "-"
 _ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
 WADI_REDUCED_BATCH_SIZE = 16
 USAD_INFERENCE_BATCH_SIZE = 64
-USAD_MIN_INFERENCE_BATCH_SIZE = 8
+COUTA_INFERENCE_BATCH_SIZE = 256
+# Any deep model may OOM during inference; halve its batch size down to this
+# floor before falling back to CPU (see _score_with_oom_recovery).
+MIN_INFERENCE_BATCH_SIZE = 8
+INFERENCE_OOM_MAX_ATTEMPTS = 5
+# COUTA derives its synthetic-negative count as int(batch_size * neg_batch_ratio),
+# so a small batch size silently drops the calibration term that stops the
+# one-class objective collapsing - see _warn_if_couta_calibration_disabled.
+COUTA_TRAIN_BATCH_SIZE = 64
+# Scores whose spread is this small relative to their scale carry no ranking
+# information - the model has collapsed (see _warn_on_degenerate_scores).
+DEGENERATE_SCORE_REL_STD = 1e-6
 DEFAULT_SEQ_LEN = 200
 DEFAULT_STRIDE = 20
 DEFAULT_DECIMATION = 1
@@ -83,6 +94,8 @@ def set_round_context(run_number: int | None = None, total_runs: int | None = No
 
 
 _DEEPOD_INFERENCE_PATCHED = False
+_DEEPOD_WINDOWING_PATCHED = False
+_DEEPOD_COUTA_BATCH_PATCHED = False
 
 
 def _patch_deepod_inference_memory():
@@ -153,6 +166,120 @@ def _patch_deepod_inference_memory():
     )
 
 
+def _patch_deepod_windowing_memory(max_materialised_bytes: int = 4 * 1024**3):
+    """Patch deepod's `get_sub_seqs` to window large arrays lazily instead of copying.
+
+    `get_sub_seqs` materialises every window with
+    `np.array([x_arr[i:i + seq_len] for i in seq_starts])`, i.e. `seq_len` copies
+    of the input. `decision_function()` always windows with stride=1 - including
+    the call `fit()` makes on the *full* training set - so for WaDi
+    (784372 x 127, seq_len=200) that single array is 148 GiB of float64 and the
+    process dies with an ArrayMemoryError before a single batch is scored.
+
+    For the common case (no `start_discont`, plain strided starts) the same
+    windows are exactly representable as a `sliding_window_view` over the input,
+    which is a *view*: host memory stays O(n_samples x n_features) and only the
+    per-batch copies made by the DataLoader are materialised. Small arrays keep
+    the stock behaviour so nothing downstream sees a read-only/overlapping view
+    unless it is the only way to fit in RAM.
+    """
+    global _DEEPOD_WINDOWING_PATCHED
+    if _DEEPOD_WINDOWING_PATCHED:
+        return
+
+    from deepod.utils import utility
+
+    original_get_sub_seqs = utility.get_sub_seqs
+
+    def get_sub_seqs(x_arr, seq_len=100, stride=1, start_discont=np.array([])):
+        n_windows = max(0, x_arr.shape[0] - seq_len + 1)
+        n_windows = len(range(0, n_windows, stride)) if stride else n_windows
+        materialised = n_windows * seq_len * int(np.prod(x_arr.shape[1:])) * x_arr.dtype.itemsize
+
+        simple = len(start_discont) == 0 and stride is not None and stride >= 1
+        if not simple or materialised <= max_materialised_bytes:
+            return original_get_sub_seqs(x_arr, seq_len=seq_len, stride=stride, start_discont=start_discont)
+
+        LOGGER.info(
+            "get_sub_seqs: windowing %s lazily (seq_len=%s, stride=%s, %s windows, "
+            "%.1f GiB if materialised)",
+            x_arr.shape,
+            seq_len,
+            stride,
+            n_windows,
+            materialised / 1024**3,
+        )
+        # (n, seq_len, n_features) view over x_arr - no copy, no fancy indexing.
+        view = np.lib.stride_tricks.sliding_window_view(x_arr, seq_len, axis=0)
+        return np.moveaxis(view, -1, 1)[::stride]
+
+    patched_modules = []
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.startswith("deepod") or module is None:
+            continue
+        if getattr(module, "get_sub_seqs", None) is original_get_sub_seqs:
+            module.get_sub_seqs = get_sub_seqs
+            patched_modules.append(module_name)
+
+    _DEEPOD_WINDOWING_PATCHED = True
+    LOGGER.info(
+        "Patched deepod get_sub_seqs in %s module(s) to window arrays larger than "
+        "%.1f GiB as a zero-copy sliding-window view.",
+        len(patched_modules),
+        max_materialised_bytes / 1024**3,
+    )
+
+
+def _patch_deepod_couta_inference_batch(inference_batch_size: int = COUTA_INFERENCE_BATCH_SIZE):
+    """Patch `COUTA.decision_function` to score with a larger batch size than it trains with.
+
+    `decision_function()` reuses the *training* `self.batch_size` for its scoring
+    DataLoader. Since scoring always windows with stride=1, WaDi yields 784372
+    windows - at COUTA_TRAIN_BATCH_SIZE that is ~12k forward passes per scoring
+    pass, and there are two: the one `fit()` makes on the training set and the
+    one on the test set. Scoring keeps no autograd graph, so it can use a much
+    larger batch than training safely.
+
+    That cannot be fixed at the call site: the training-set pass happens *inside*
+    `clf.fit()`, and raising `batch_size` before `fit()` would change training.
+    So swap the batch size only for the duration of `decision_function`, then
+    restore it. No autograd graph is kept during scoring, so a larger batch is
+    cheap. The train-set scores only feed `threshold_`/`labels_`, which this
+    benchmark does not use - batching them differently cannot move the reported
+    metrics.
+    """
+    global _DEEPOD_COUTA_BATCH_PATCHED
+    if _DEEPOD_COUTA_BATCH_PATCHED:
+        return
+
+    from deepod.models.time_series import COUTA
+
+    original_decision_function = COUTA.decision_function
+
+    def decision_function(self, X, *args, **kwargs):
+        training_batch_size = self.batch_size
+        self.batch_size = max(training_batch_size, inference_batch_size)
+        if self.batch_size != training_batch_size:
+            LOGGER.info(
+                "COUTA.decision_function: scoring with batch_size=%s instead of the "
+                "training batch_size=%s",
+                self.batch_size,
+                training_batch_size,
+            )
+        try:
+            return original_decision_function(self, X, *args, **kwargs)
+        finally:
+            self.batch_size = training_batch_size
+
+    COUTA.decision_function = decision_function
+    _DEEPOD_COUTA_BATCH_PATCHED = True
+    LOGGER.info(
+        "Patched COUTA.decision_function to score with batch_size>=%s (training "
+        "batch size is left untouched).",
+        inference_batch_size,
+    )
+
+
 def build_classifier_factories(
     device: str = "cpu",
     random_state: int | None = None,
@@ -181,6 +308,8 @@ def build_classifier_factories(
     )
 
     _patch_deepod_inference_memory()
+    _patch_deepod_windowing_memory()
+    _patch_deepod_couta_inference_batch()
 
     ts_kwargs = {"seq_len": seq_len, "stride": stride, "device": device, "random_state": random_state, "verbose": 1}
 
@@ -198,7 +327,11 @@ def build_classifier_factories(
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
         "TranAD": lambda: TranAD(**ts_kwargs),
         "DeepIF": lambda: DeepIsolationForestTS(batch_size=256, **ts_kwargs),
-        "COUTA": lambda: COUTA(batch_size=2, **ts_kwargs),
+        # batch_size must stay well above 1/neg_batch_ratio (deepod default 0.2):
+        # at batch_size=2 COUTA generates int(2 * 0.2) == 0 synthetic negatives per
+        # batch, which removes the calibration half of the objective and lets the
+        # one-class term collapse onto the hypersphere centre (losses -> 0).
+        "COUTA": lambda: COUTA(batch_size=COUTA_TRAIN_BATCH_SIZE, **ts_kwargs),
         # "NCAD": lambda: NCAD(seq_len=100, stride=100),
         # "DCdetector": lambda: DCdetector(seq_len=100, stride=100),
     }
@@ -1104,6 +1237,179 @@ def load_dataset(spec, max_train_samples=None, max_test_samples=None, decimation
     return x_train, x_test, y_test
 
 
+def _warn_if_couta_calibration_disabled(clf, benchmark_name, dataset_id):
+    """Check that COUTA will actually generate synthetic negatives.
+
+    COUTA's calibration term is built from `int(batch_size * neg_batch_ratio)`
+    negatives per batch. When that rounds to 0 the term contributes nothing, the
+    model degenerates to plain Deep SVDD, and the one-class objective collapses
+    onto the centre - which is what produced `loss: 0.000000, loss_oc: 0.000000,
+    val_loss: 0.000000` on SWaT/WaDi. The batch size is chosen to avoid this, but
+    the ratio lives in deepod, so verify it here instead of assuming.
+    """
+    ratio = getattr(clf, "neg_batch_ratio", None)
+    batch_size = getattr(clf, "batch_size", None)
+    if ratio is None or batch_size is None:
+        LOGGER.warning(
+            "[%s/%s] COUTA: cannot read neg_batch_ratio/batch_size; unable to verify "
+            "that the calibration term is active",
+            benchmark_name,
+            dataset_id,
+        )
+        return
+
+    n_negatives = int(batch_size * ratio)
+    if n_negatives < 1:
+        LOGGER.error(
+            "[%s/%s] COUTA: batch_size=%s x neg_batch_ratio=%s yields %d synthetic "
+            "negatives per batch. The calibration term is inactive and the one-class "
+            "objective will collapse. Raise COUTA_TRAIN_BATCH_SIZE above %d.",
+            benchmark_name,
+            dataset_id,
+            batch_size,
+            ratio,
+            n_negatives,
+            int(np.ceil(1.0 / ratio)) if ratio > 0 else 0,
+        )
+    else:
+        LOGGER.info(
+            "[%s/%s] COUTA: %d synthetic negatives per batch (batch_size=%s, neg_batch_ratio=%s)",
+            benchmark_name,
+            dataset_id,
+            n_negatives,
+            batch_size,
+            ratio,
+        )
+
+
+def _move_classifier_to_cpu(clf, clf_name, benchmark_name, dataset_id):
+    """Move a fitted deepod model onto the CPU so scoring can continue after a CUDA OOM.
+
+    Deliberately does *not* call `configure_gpu(None)`: that sets
+    CUDA_VISIBLE_DEVICES="" process-wide and never restores it, so one model's
+    fallback would quietly push every model evaluated after it onto the CPU too.
+    Moving the modules and retargeting `clf.device` is enough and stays local to
+    this classifier.
+    """
+    moved = []
+    for attribute in ("net", "model"):  # deepod models use one or the other
+        module = getattr(clf, attribute, None)
+        if isinstance(module, torch.nn.Module):
+            module.to("cpu")
+            moved.append(attribute)
+    clf.device = "cpu"
+    LOGGER.warning(
+        "[%s/%s] %s moved to CPU for inference (modules: %s)",
+        benchmark_name,
+        dataset_id,
+        clf_name,
+        ", ".join(moved) if moved else "none found",
+    )
+
+
+def _score_with_oom_recovery(clf, clf_name, x_test, benchmark_name, dataset_id):
+    """Score `x_test`, recovering from CUDA OOM by shrinking the batch, then by CPU.
+
+    Previously only USAD retried on OOM, and TcnED was unconditionally moved to
+    the CPU before scoring whether it needed to be or not - which made TcnED far
+    slower than necessary on every benchmark to work around a failure on one.
+    Any deep model can OOM here (scoring windows with stride=1, so it sees far
+    more samples than training did), and a model that OOMs loses its entire cell
+    in the results table, so the recovery ladder now applies to all of them:
+    halve the batch size down to MIN_INFERENCE_BATCH_SIZE, then fall back to the
+    CPU once, then give up.
+    """
+    can_shrink = hasattr(clf, "batch_size")
+    on_cpu = str(getattr(clf, "device", "cpu")).startswith("cpu")
+    last_error = None
+
+    for attempt in range(1, INFERENCE_OOM_MAX_ATTEMPTS + 1):
+        try:
+            with torch.inference_mode():
+                return np.asarray(clf.decision_function(x_test)).ravel()
+        except RuntimeError as error:
+            last_error = error
+            message = str(error).lower()
+            if "cuda" not in message or "out of memory" not in message:
+                raise
+
+            old_batch_size = int(getattr(clf, "batch_size")) if can_shrink else 0
+            new_batch_size = max(MIN_INFERENCE_BATCH_SIZE, old_batch_size // 2)
+
+            if can_shrink and new_batch_size < old_batch_size:
+                LOGGER.warning(
+                    "[%s/%s] %s inference OOM on attempt %d/%d. Reducing batch_size: %d -> %d and retrying.",
+                    benchmark_name,
+                    dataset_id,
+                    clf_name,
+                    attempt,
+                    INFERENCE_OOM_MAX_ATTEMPTS,
+                    old_batch_size,
+                    new_batch_size,
+                )
+                clf.batch_size = new_batch_size
+            elif not on_cpu:
+                LOGGER.warning(
+                    "[%s/%s] %s inference OOM on attempt %d/%d at batch_size=%s; falling back to CPU.",
+                    benchmark_name,
+                    dataset_id,
+                    clf_name,
+                    attempt,
+                    INFERENCE_OOM_MAX_ATTEMPTS,
+                    getattr(clf, "batch_size", "n/a"),
+                )
+                _move_classifier_to_cpu(clf, clf_name, benchmark_name, dataset_id)
+                on_cpu = True
+            else:
+                raise
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    raise last_error
+
+
+def _warn_on_degenerate_scores(scores, clf_name, benchmark_name, dataset_id):
+    """Flag scores that carry no ranking information.
+
+    One-class models (COUTA, DeepSVDD) fail by collapsing: the encoder learns the
+    constant map onto the hypersphere centre, every training loss goes to ~0, and
+    decision_function() then returns near-identical scores for every window. The
+    run still "succeeds" and still produces an AUC - a meaningless one, decided by
+    floating-point noise and whatever tie-breaking the metric does. Nothing in the
+    pipeline noticed, so this is checked explicitly rather than left to be spotted
+    as a chance-level number in the results table weeks later.
+    """
+    finite = scores[np.isfinite(scores)]
+    if finite.size != scores.size:
+        LOGGER.error(
+            "[%s/%s] %s produced %d non-finite scores out of %d",
+            benchmark_name,
+            dataset_id,
+            clf_name,
+            scores.size - finite.size,
+            scores.size,
+        )
+    if finite.size == 0:
+        return
+
+    spread = float(np.std(finite))
+    scale = max(float(np.mean(np.abs(finite))), np.finfo(np.float64).tiny)
+    if spread / scale < DEGENERATE_SCORE_REL_STD:
+        LOGGER.error(
+            "[%s/%s] %s scores are degenerate (std=%.3e, mean|score|=%.3e, "
+            "%d distinct values): the model has almost certainly collapsed and "
+            "the metrics below are meaningless.",
+            benchmark_name,
+            dataset_id,
+            clf_name,
+            spread,
+            scale,
+            np.unique(finite).size,
+        )
+
+
 def evaluate_classifier_on_dataset(
     clf_name,
     clf,
@@ -1158,6 +1464,9 @@ def evaluate_classifier_on_dataset(
         getattr(clf, "batch_size", "n/a"),
     )
 
+    if clf_name == "COUTA":
+        _warn_if_couta_calibration_disabled(clf, benchmark_name, dataset_id)
+
     clf.fit(x_train)
     LOGGER.info("[%s/%s] fitted %s", benchmark_name, dataset_id, clf_name)
     gc.collect()
@@ -1169,15 +1478,10 @@ def evaluate_classifier_on_dataset(
         LOGGER.debug("[%s/%s] torch cleanup skipped", benchmark_name, dataset_id, exc_info=True)
 
 
-    if clf_name in ["TcnED"]:
-        LOGGER.warning(f"Running on {clf_name}, moving net to cpu for inference.")
-        if hasattr(clf, "net") and clf.net is not None:    # TcnED
-            clf.net.to('cpu')
-
-        clf.device = "cpu"
-        configure_gpu(None)
-
     if clf_name == "USAD":
+        # USAD trains at batch_size=512, which is far too large for scoring:
+        # decision_function() windows with stride=1 and so sees orders of
+        # magnitude more samples than training did.
         original_batch_size = getattr(clf, "batch_size", None)
         if original_batch_size is not None and original_batch_size > USAD_INFERENCE_BATCH_SIZE:
             clf.batch_size = USAD_INFERENCE_BATCH_SIZE
@@ -1190,44 +1494,8 @@ def evaluate_classifier_on_dataset(
                 clf.batch_size,
             )
 
-    max_attempts = 1
-    if clf_name == "USAD" and hasattr(clf, "batch_size"):
-        max_attempts = 4
-
-    last_error = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with torch.inference_mode():
-                y_test_scores = np.asarray(clf.decision_function(x_test)).ravel()
-            break
-        except RuntimeError as error:
-            last_error = error
-            message = str(error).lower()
-            is_cuda_oom = "cuda" in message and "out of memory" in message
-            if not is_cuda_oom or clf_name != "USAD" or not hasattr(clf, "batch_size") or attempt == max_attempts:
-                raise
-
-            old_batch_size = int(getattr(clf, "batch_size"))
-            new_batch_size = max(USAD_MIN_INFERENCE_BATCH_SIZE, old_batch_size // 2)
-            if new_batch_size >= old_batch_size:
-                raise
-
-            LOGGER.warning(
-                "[%s/%s] %s inference OOM on attempt %d/%d. Reducing batch_size: %d -> %d and retrying.",
-                benchmark_name,
-                dataset_id,
-                clf_name,
-                attempt,
-                max_attempts,
-                old_batch_size,
-                new_batch_size,
-            )
-            clf.batch_size = new_batch_size
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    else:
-        raise last_error if last_error is not None else RuntimeError("Inference failed without a captured error")
+    y_test_scores = _score_with_oom_recovery(clf, clf_name, x_test, benchmark_name, dataset_id)
+    _warn_on_degenerate_scores(y_test_scores, clf_name, benchmark_name, dataset_id)
 
     if y_test_scores.shape[0] != y_test.shape[0]:
         aligned_len = min(y_test_scores.shape[0], y_test.shape[0])
