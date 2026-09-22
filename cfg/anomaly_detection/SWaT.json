@@ -7,7 +7,7 @@
   "checkpoint_at": [],
   "final_metrics_csv": "logs/final_metrics.csv",
   "data_window_length": 100,
-  "data_window_overlap": 0.0,
+  "data_window_overlap": 0.9,
   "batch_size": 256,
   "lr": 1e-3,
   "n_epochs": 2400,
