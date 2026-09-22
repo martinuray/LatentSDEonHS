@@ -1510,6 +1510,42 @@ def _score_with_oom_recovery(clf, clf_name, x_test, benchmark_name, dataset_id):
     raise last_error
 
 
+class NonFiniteScoresError(RuntimeError):
+    """A classifier returned NaN/inf scores, so no metric computed from them is meaningful."""
+
+
+def _reject_non_finite_scores(scores, clf_name, benchmark_name, dataset_id):
+    """Fail immediately, and legibly, when scores contain NaN or inf.
+
+    A model that diverged during training (TcnED on WaDi: the epoch losses go
+    to nan) returns a non-finite score for every window. deepod's
+    decision_function() then left-pads that vector with `seq_len - 1` zeros to
+    realign it with the input, so the only finite entries left are the padding
+    - which makes any statistic taken over the finite subset look like a
+    textbook collapse (std 0, one distinct value) and sends
+    _warn_on_degenerate_scores chasing the wrong failure.
+
+    Unhandled, those NaNs used to survive all the way into `roc_auc_score` and
+    surface as `ValueError: Input contains NaN` five frames deep in sklearn,
+    naming neither the model nor the dataset. Raising here instead puts the
+    classifier, the benchmark and the count in the message, and gives the
+    per-run error row in runtime.csv a meaningful error_type.
+    """
+    non_finite = ~np.isfinite(scores)
+    n_bad = int(non_finite.sum())
+    if n_bad == 0:
+        return
+
+    n_nan = int(np.isnan(scores).sum())
+    raise NonFiniteScoresError(
+        f"[{benchmark_name}/{dataset_id}] {clf_name} returned {n_bad} non-finite scores "
+        f"out of {scores.size} ({n_nan} NaN, {n_bad - n_nan} inf), first at index "
+        f"{int(np.argmax(non_finite))}: the model almost certainly diverged during "
+        f"training - check its epoch losses - and no metric computed from these scores "
+        f"would be meaningful."
+    )
+
+
 def _warn_on_degenerate_scores(scores, clf_name, benchmark_name, dataset_id):
     """Flag scores that carry no ranking information.
 
@@ -1520,17 +1556,12 @@ def _warn_on_degenerate_scores(scores, clf_name, benchmark_name, dataset_id):
     floating-point noise and whatever tie-breaking the metric does. Nothing in the
     pipeline noticed, so this is checked explicitly rather than left to be spotted
     as a chance-level number in the results table weeks later.
+
+    Non-finite scores are _reject_non_finite_scores' business and have already
+    raised by the time this runs; the filtering below is kept only so the check
+    stays correct if it is ever called on its own.
     """
     finite = scores[np.isfinite(scores)]
-    if finite.size != scores.size:
-        LOGGER.error(
-            "[%s/%s] %s produced %d non-finite scores out of %d",
-            benchmark_name,
-            dataset_id,
-            clf_name,
-            scores.size - finite.size,
-            scores.size,
-        )
     if finite.size == 0:
         return
 
@@ -1635,6 +1666,7 @@ def evaluate_classifier_on_dataset(
             )
 
     y_test_scores = _score_with_oom_recovery(clf, clf_name, x_test, benchmark_name, dataset_id)
+    _reject_non_finite_scores(y_test_scores, clf_name, benchmark_name, dataset_id)
     _warn_on_degenerate_scores(y_test_scores, clf_name, benchmark_name, dataset_id)
 
     if y_test_scores.shape[0] != y_test.shape[0]:

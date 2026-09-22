@@ -642,6 +642,17 @@ def smooth_scores(scores: np.ndarray, half_window: int) -> np.ndarray:
     scores unchanged. Works for 1-D ``[time]`` and 2-D ``[time, feature]``
     arrays and is shared by the latent-SDE evaluation and the baselines so
     both see identical post-processing.
+
+    Non-finite inputs stay local: each output is the mean of the *finite*
+    entries of its window, and only a window with no finite entry at all is
+    itself NaN. This used to be computed from a cumulative sum, where a single
+    NaN (or a pair of infinities cancelling to NaN) poisoned every later
+    prefix and so turned the whole remainder of the series into NaN - a
+    diverged model's handful of bad windows came out the far end as a
+    uniformly NaN array and an `Input contains NaN` from deep inside sklearn.
+    Summing each window independently also keeps the rounding error at
+    O(window) instead of O(len(scores)); results for finite input are
+    unchanged up to floating-point associativity.
     """
     scores = np.asarray(scores, dtype=float)
     if half_window is None or half_window <= 0 or scores.shape[0] == 0:
@@ -649,15 +660,42 @@ def smooth_scores(scores: np.ndarray, half_window: int) -> np.ndarray:
 
     n = scores.shape[0]
     half_window = int(half_window)
-    csum = np.concatenate([np.zeros((1,) + scores.shape[1:]), np.cumsum(scores, axis=0)], axis=0)
-    idx = np.arange(half_window, n)
-    lo = idx - half_window
-    hi = np.minimum(idx + half_window - 1, n)
-    counts = (hi - lo).astype(float)
-    counts_shaped = counts.reshape((-1,) + (1,) * (scores.ndim - 1))
-
     smoothed = np.zeros_like(scores)
-    smoothed[half_window:] = (csum[hi] - csum[lo]) / counts_shaped
+    if n <= half_window:
+        return smoothed
+
+    # Window i spans scores[i - half_window : min(i + half_window - 1, n)], so
+    # every window has the same width except where it is clipped by the end of
+    # the series. Padding by that much turns them all into full-width windows:
+    # the padded steps contribute nothing to either the sum or the count, which
+    # reproduces the clipping exactly.
+    width = 2 * half_window - 1
+    pad = np.zeros((width - 1,) + scores.shape[1:])
+    valid = np.isfinite(scores)
+    all_finite = bool(valid.all())
+
+    # Window i starts at i - half_window, i.e. starts 0 .. n - half_window - 1.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        np.concatenate([scores if all_finite else np.where(valid, scores, 0.0), pad], axis=0),
+        width,
+        axis=0,
+    )
+    totals = windows[: n - half_window].sum(axis=-1)
+
+    if all_finite:
+        # Every window's count is fixed by the geometry, so the per-element
+        # tally below (an int64 array the size of the input) is not needed.
+        idx = np.arange(half_window, n)
+        counts = (np.minimum(idx + half_window - 1, n) - (idx - half_window)).astype(float)
+        smoothed[half_window:] = totals / counts.reshape((-1,) + (1,) * (scores.ndim - 1))
+        return smoothed
+
+    counts = np.lib.stride_tricks.sliding_window_view(
+        np.concatenate([valid, pad.astype(bool)], axis=0), width, axis=0
+    )[: n - half_window].sum(axis=-1)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        smoothed[half_window:] = np.where(counts > 0, totals / counts, np.nan)
     return smoothed
 
 
