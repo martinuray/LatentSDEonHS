@@ -5,6 +5,7 @@ import argparse
 import ast
 import gc
 import glob
+import inspect
 import logging
 import os
 import pickle
@@ -182,6 +183,11 @@ def _patch_deepod_windowing_memory(max_materialised_bytes: int = 4 * 1024**3):
     per-batch copies made by the DataLoader are materialised. Small arrays keep
     the stock behaviour so nothing downstream sees a read-only/overlapping view
     unless it is the only way to fit in RAM.
+
+    The wrapper binds arguments against the installed deepod's own signature
+    rather than assuming one: `start_discont` exists in some versions and not
+    others, and callers mix positional and keyword arguments. Anything that
+    cannot be handled is forwarded to the original untouched.
     """
     global _DEEPOD_WINDOWING_PATCHED
     if _DEEPOD_WINDOWING_PATCHED:
@@ -190,15 +196,30 @@ def _patch_deepod_windowing_memory(max_materialised_bytes: int = 4 * 1024**3):
     from deepod.utils import utility
 
     original_get_sub_seqs = utility.get_sub_seqs
+    original_signature = inspect.signature(original_get_sub_seqs)
+    x_arr_name = next(iter(original_signature.parameters))
 
-    def get_sub_seqs(x_arr, seq_len=100, stride=1, start_discont=np.array([])):
+    def get_sub_seqs(*args, **kwargs):
+        try:
+            bound = original_signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            arguments = bound.arguments
+            x_arr = arguments[x_arr_name]
+            seq_len = arguments["seq_len"]
+            stride = arguments["stride"]
+            start_discont = arguments.get("start_discont")
+        except (TypeError, KeyError):
+            # Unexpected signature or call shape: do not second-guess it.
+            return original_get_sub_seqs(*args, **kwargs)
+
         n_windows = max(0, x_arr.shape[0] - seq_len + 1)
         n_windows = len(range(0, n_windows, stride)) if stride else n_windows
         materialised = n_windows * seq_len * int(np.prod(x_arr.shape[1:])) * x_arr.dtype.itemsize
 
-        simple = len(start_discont) == 0 and stride is not None and stride >= 1
+        no_discont = start_discont is None or len(start_discont) == 0
+        simple = no_discont and stride is not None and stride >= 1
         if not simple or materialised <= max_materialised_bytes:
-            return original_get_sub_seqs(x_arr, seq_len=seq_len, stride=stride, start_discont=start_discont)
+            return original_get_sub_seqs(*args, **kwargs)
 
         LOGGER.info(
             "get_sub_seqs: windowing %s lazily (seq_len=%s, stride=%s, %s windows, "
@@ -223,8 +244,9 @@ def _patch_deepod_windowing_memory(max_materialised_bytes: int = 4 * 1024**3):
 
     _DEEPOD_WINDOWING_PATCHED = True
     LOGGER.info(
-        "Patched deepod get_sub_seqs in %s module(s) to window arrays larger than "
+        "Patched deepod get_sub_seqs%s in %s module(s) to window arrays larger than "
         "%.1f GiB as a zero-copy sliding-window view.",
+        original_signature,
         len(patched_modules),
         max_materialised_bytes / 1024**3,
     )
