@@ -6,7 +6,13 @@ import sys
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from anomaly_detection import extend_argparse, start_experiment
+from anomaly_detection import (
+    _extract_bootstrap_args,
+    _load_dataset_config,
+    _validate_config_keys,
+    extend_argparse,
+    start_experiment,
+)
 from utils.parser import generic_parser, get_partition_batch_size
 
 SUBSAMPLES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -123,7 +129,26 @@ def main():
     parser.add_argument(
         '--results-dir', default='out/sparsity_results',
         help="Directory for per-task JSON files and final outputs.")
+
+    # Apply the dataset's JSON config as parser defaults, exactly as
+    # anomaly_detection.main() does. Without this the sparsity sweep ignored
+    # cfg/anomaly_detection/<dataset>.json entirely and ran on bare parser
+    # defaults: for QAD that meant data_decimation_factor=1 (raw 100 Hz) with
+    # 100-step non-overlapping windows, while the baseline sparsity sweep
+    # decimates QAD to 10 Hz with 200-step windows via BENCHMARK_WINDOW_DEFAULTS.
+    # The two curves were therefore not measured on the same data. Explicit CLI
+    # values still override the config.
+    bootstrap_args = _extract_bootstrap_args(argv)
+    dataset_cfg = _load_dataset_config(bootstrap_args.dataset, bootstrap_args.config_file)
+    _validate_config_keys(parser, dataset_cfg, bootstrap_args.dataset)
+    parser.set_defaults(**dataset_cfg)
+
     args = parser.parse_args(argv)
+    logging.info(
+        f"Dataset {args.dataset}: data_decimation_factor={args.data_decimation_factor}, "
+        f"data_window_length={args.data_window_length}, "
+        f"data_window_overlap={args.data_window_overlap}"
+    )
 
     # important!
     args.fixed_subsample_mask = True
