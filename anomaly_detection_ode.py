@@ -372,11 +372,11 @@ def calculate_z_normalization_values_ode(args, dl, modules, desired_t, device):
             _, _, pxz = latent_ode_rollout(args, modules, inp, desired_t, args.mc_eval_samples)
 
             aux_log_prob = -pxz.log_prob(parts["evd_obs"])
-            if aux_log_prob.dim() >= 4:
-                aux_log_prob = aux_log_prob.squeeze()
-            if aux_log_prob.dim() == 2:
-                aux_log_prob = aux_log_prob[None, :, :]
 
+            # aux_log_prob is always (mc_eval_samples, batch, time_steps, feat_dim);
+            # average out the mc-samples axis without touching batch/time/feat,
+            # since a trailing batch of size 1 (drop_last=False) makes a blind
+            # squeeze() collapse the wrong axis.
             aux_log_prob = aux_log_prob.mean(dim=0)
             all_scores_list.append(aux_log_prob)
 
@@ -426,18 +426,18 @@ def evaluate_ode(
             loss = elbo_val
 
             aux_log_prob = -pxz.log_prob(parts["evd_obs"])
-            if aux_log_prob.dim() >= 4:
-                aux_log_prob = aux_log_prob.squeeze()
-            if aux_log_prob.dim() == 2:
-                aux_log_prob = aux_log_prob[None, :, :]
+
+            # aux_log_prob is always (mc_eval_samples, batch, time_steps, feat_dim);
+            # average out the mc-samples axis without touching batch/time/feat,
+            # since a trailing batch of size 1 (drop_last=False) makes a blind
+            # squeeze() collapse the wrong axis.
+            aux_log_prob = aux_log_prob.mean(dim=0)
 
             if normalization_stats is not None:
-                aux_log_prob = (aux_log_prob - normalization_stats["min"]) / (
-                    normalization_stats["max"] - normalization_stats["min"]
-                )
-
-            if aux_log_prob.dim() == 4:
-                aux_log_prob = aux_log_prob.mean(axis=0)
+                # clamp the range so channels with a (near-)constant training
+                # score don't blow up to inf/NaN and poison the aggregation
+                score_range = (normalization_stats["max"] - normalization_stats["min"]).clamp_min(1e-8)
+                aux_log_prob = (aux_log_prob - normalization_stats["min"]) / score_range
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()

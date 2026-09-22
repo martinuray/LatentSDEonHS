@@ -668,10 +668,12 @@ def create_win_periods(data_, win_size_, win_stride_):
     if win_stride_ < 1:
         win_stride_ = 1
 
+    # sliding_window_view yields (n_windows, 1, win_size, feat_dim); only axis 1
+    # is guaranteed to be size 1, so squeeze exactly that axis — a blind
+    # squeeze() also collapses n_windows==1 or feat_dim==1.
     windows = sliding_window_view(data_, (
-        win_size_, data_.shape[1]))
-    windows = windows.squeeze()
+        win_size_, data_.shape[1])).squeeze(axis=1)
     indcs = sliding_window_view(np.arange(data_.shape[0]), win_size_)
 
-    return indcs[::win_stride_], windows.squeeze()[::win_stride_, :]
+    return indcs[::win_stride_], windows[::win_stride_]
 

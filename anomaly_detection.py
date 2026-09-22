@@ -853,11 +853,11 @@ def eval_scores(scores, true_labels, window_length=100, aggregation_strategy="ma
 
 
 def calculate_z_normalization_values(args, dl, modules, desired_t, device):
-    stats = defaultdict(list)
+    stats = {}
 
     modules.eval()
-    with (torch.no_grad()):
-        all_labels, all_scores_list = [], []
+    with torch.no_grad():
+        all_scores_list = []
         for _, batch in enumerate(dl):
             parts = {key: val.to(device) for key, val in batch.items()}
 
@@ -870,22 +870,14 @@ def calculate_z_normalization_values(args, dl, modules, desired_t, device):
 
             aux_log_prob = -pxz.log_prob(parts["evd_obs"])
 
-            # make sure that log_prob is in the right shape
-            if aux_log_prob.dim() >= 4:
-                aux_log_prob = aux_log_prob.squeeze()
-            if aux_log_prob.dim() == 2:
-                aux_log_prob = aux_log_prob[None, :, :]
-
-            # aux_log_prob = aux_log_prob.mean(dim=0)
-            #aux_log_prob = aux_log_prob.mean(dim=2)
+            # aux_log_prob is always (mc_eval_samples, batch, time_steps, feat_dim);
+            # average out the mc-samples axis without touching batch/time/feat,
+            # since a trailing batch of size 1 (drop_last=False) makes a blind
+            # squeeze() collapse the wrong axis.
             aux_log_prob = aux_log_prob.mean(dim=0)
             all_scores_list.append(aux_log_prob)
 
-    try:
-        all_scores = torch.cat(all_scores_list, dim=0)
-    except RuntimeError:
-        pass
-        raise RuntimeError
+    all_scores = torch.cat(all_scores_list, dim=0)
 
     stats['mu'] = all_scores.mean(dim=0)
     stats['sigma'] = all_scores.std(dim=0)
@@ -1362,7 +1354,10 @@ def evaluate(
             aux_log_prob = aux_log_prob.mean(dim=0)
 
             if normalization_stats is not None:
-                aux_log_prob = (aux_log_prob - normalization_stats['min']) / (normalization_stats['max'] - normalization_stats['min'])
+                # clamp the range so channels with a (near-)constant training
+                # score don't blow up to inf/NaN and poison the aggregation
+                score_range = (normalization_stats['max'] - normalization_stats['min']).clamp_min(1e-8)
+                aux_log_prob = (aux_log_prob - normalization_stats['min']) / score_range
 
             for idx in range(aux_log_prob.shape[0]):
                 all_scores[indcs[idx, :], :] += aux_log_prob[idx, :, :].cpu().numpy()
