@@ -39,7 +39,7 @@
   "initial_sigma": 0.2,
   "mc_eval_samples": 10,
   "use_atanh": false,
-  "subsample": 0.5,
+  "subsample": 0.1,
   "non_linear_decoder": true,
   "dec_hidden_dim": 64,
   "n_dec_layers": 2

@@ -30,7 +30,7 @@
   "loglevel": "debug",
   "use_atanh": false,
   "debug": false,
-  "subsample": 0.5,
+  "subsample": 0.1,
   "normalize_score": false,
   "data_normalization_strategy": "min-max",
   "score_aggregation": "max",
