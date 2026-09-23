@@ -41,7 +41,12 @@ https://wandb.ai/martin-uray-salzburg-university-of-applied-sciences/latent-sde-
 embedding) and "LSD on $\mathbb{S}^n$ (ours)" (Sn, sphere embedding). Runs
 restricted to a subset of traces via --trace-ids (benchmark_name containing
 ":") are excluded -- only full-benchmark runs, whose logged metrics are
-already the mean over every trace, are used.
+already the mean over every trace, are used. Runs with
+`args.fixed_subsample_mask` set are excluded as well: those belong to the QAD
+sparsity sweep (eval_sparsity_data.py forces that flag on) and are a different
+experiment, reported only in the sparsity table below. The same filter is
+applied to the NeuralODE project, so both sides of every comparison are
+restricted to the resampled-mask setting.
 
 Cells are rendered as ``mean \std{std}`` (the ``\std`` macro must be defined
 in the LaTeX preamble, e.g. ``\newcommand{\std}[1]{$\pm$#1}``). Within each
@@ -73,6 +78,20 @@ as column groups, with NeuralODE on the left and our two LSD variants to its
 right. Only the best model per (benchmark, metric) is highlighted, via a bare
 ``\cellcolor{first}{...}``; there is no "Avg. Rank" column.
 
+An eighth table covers the sparsity sweep, fetched from yet another project
+(default:
+https://wandb.ai/martin-uray-salzburg-university-of-applied-sciences/latent-sde-on-hs-sparsity-baselines,
+logged by baselines/eval_sparsity_baselines.py). It is QAD-only: each column
+group is one subsample level (1% / 5% of the original training data kept) and
+each row is one (classifier, interpolation method) pair -- "COPOD (linear)",
+"COPOD (spline)", ... -- since every classifier was run under both a linear
+and a spline interpolation of the burst-masked gaps. Our two LSD rows come
+from the "ours" project instead (eval_sparsity_data.py logs there), and are
+taken from exactly the runs the other tables exclude: QAD runs with
+`args.fixed_subsample_mask` set and `args.subsample` at one of the sweep's
+levels. They carry no interpolation variant -- the model consumes the sparse
+series directly -- so they get one row each.
+
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
 """
@@ -81,6 +100,7 @@ import argparse
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import pandas as pd
@@ -173,6 +193,31 @@ OURS_DEFAULT_ENTITY = "martin-uray-salzburg-university-of-applied-sciences"
 # run_context.model_variant -> row label, for the "ours" project.
 OURS_VARIANT_LABELS = {"Rn": LSD_RN_LABEL, "Sn": LSD_SN_LABEL}
 
+# ---------------------------------------------------------------------------
+# Sparsity sweep (baselines/eval_sparsity_baselines.py) -- its own W&B project.
+# ---------------------------------------------------------------------------
+SPARSITY_DEFAULT_PROJECT = "latent-sde-on-hs-sparsity-baselines"
+SPARSITY_DEFAULT_ENTITY = "martin-uray-salzburg-university-of-applied-sciences"
+# Fraction of the original training data still available; one column group each.
+SPARSITY_SUBSAMPLES = [0.01, 0.05]
+# Every classifier was run under both interpolation strategies for the
+# burst-masked gaps, giving two rows ("<clf> (linear)" / "<clf> (spline)").
+SPARSITY_INTERP_METHODS = ["linear", "spline"]
+# Row groups, mirroring the main tables' shallow / deep / ours split. This is a
+# deliberate subset of CLASSIFIER_ORDER -- only these were run under sparsity.
+SPARSITY_GROUP_SHALLOW = ["COPOD", "IForest", "KNN", "LOF", "OCSVM"]
+SPARSITY_GROUP_DEEP = ["DeepIF", "COUTA", "USAD", "DeepSVDD"]
+SPARSITY_GROUP_OURS = [LSD_SN_LABEL, LSD_RN_LABEL]
+SPARSITY_CLASSIFIER_GROUPS = [SPARSITY_GROUP_SHALLOW, SPARSITY_GROUP_DEEP, SPARSITY_GROUP_OURS]
+# Our own LSD sparsity runs come from the "ours" project (eval_sparsity_data.py)
+# and have no interpolation variant -- the model handles the sparse series
+# natively -- so their rows use this sentinel as the interp part of the key.
+SPARSITY_OURS_ROWS = set(SPARSITY_GROUP_OURS)
+OURS_SPARSITY_INTERP = None
+# Unlike the main tables, DETERMINISTIC_CLASSIFIERS does *not* apply here: the
+# burst mask is drawn from the run seed, so even COPOD/KNN/LOF/OCSVM vary
+# across seeds and all DEFAULT_RUN_LIMIT runs carry information.
+
 # Matches both "summary/per_dataset/<id>/<metric>" (from _wandb_summary_from_dataframe)
 # and "summary/per_dataset.<id>.<metric>" (from _flatten_numeric_metrics), the two
 # equivalent key spellings anomaly_detection.py's _wandb_log_final_outputs logs.
@@ -211,11 +256,27 @@ def parse_args() -> argparse.Namespace:
         "--skip-ours", action="store_true",
         help="Don't fetch/include the 'ours' (LSD Rn/Sn) row group.",
     )
+    parser.add_argument(
+        "--sparsity-project", type=str, default=SPARSITY_DEFAULT_PROJECT,
+        help="W&B project name for the eval_sparsity_baselines.py sweep.",
+    )
+    parser.add_argument(
+        "--sparsity-entity", type=str, default=SPARSITY_DEFAULT_ENTITY,
+        help="W&B entity/team for --sparsity-project.",
+    )
+    parser.add_argument(
+        "--skip-sparsity", action="store_true",
+        help="Don't fetch/render the QAD sparsity table.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory to write the .tex files into.")
     return parser.parse_args()
 
 
 RunEntry = tuple[pd.Timestamp, "int | None", dict[str, float]]
+# Most tables bucket runs by (benchmark, classifier); the sparsity table uses a
+# (subsample, classifier, interp_method) key instead. dedupe_by_seed treats the
+# key as opaque, so it works for either.
+RecordKey = TypeVar("RecordKey", bound=tuple)
 
 
 def fetch_run_records(
@@ -306,6 +367,17 @@ def _extract_ad_summary_metrics(summary: dict) -> dict[str, float]:
     return metrics
 
 
+def uses_fixed_subsample_mask(config: dict) -> bool:
+    """Whether an anomaly_detection.py-style run had --fixed-subsample-mask set.
+
+    Runs predating the flag have no such entry; the argparse default is False,
+    so a missing key means "resampled every iteration". Only the QAD sparsity
+    sweep (eval_sparsity_data.py) turns it on, which is what separates those
+    runs from the ones every other table reports on.
+    """
+    return bool((config.get("args") or {}).get("fixed_subsample_mask", False))
+
+
 def fetch_anomaly_detection_run_records(
     project: str,
     entity: str | None,
@@ -323,6 +395,10 @@ def fetch_anomaly_detection_run_records(
     value to skip the run). If `require_full_trace` is set, runs restricted
     to a subset of traces via --trace-ids (benchmark_name containing ":")
     are skipped -- their logged metrics wouldn't be a mean over every trace.
+
+    Sparsity-sweep runs (``args.fixed_subsample_mask`` set) are always
+    skipped: they train on a fixed, heavily subsampled mask and belong to the
+    sparsity table only -- see fetch_ours_sparsity_run_records.
     """
     api = wandb.Api()
     path = f"{entity}/{project}" if entity else project
@@ -335,6 +411,10 @@ def fetch_anomaly_detection_run_records(
         run_context = config.get("run_context", {})
         raw_benchmark = run_context.get("benchmark_name")
         if not raw_benchmark:
+            continue
+
+        # Sparsity-sweep runs are reported by the sparsity table alone.
+        if uses_fixed_subsample_mask(config):
             continue
 
         # Runs restricted to specific --trace-ids are tagged "DATASET:ids".
@@ -406,7 +486,146 @@ def fetch_ours_run_records(
     )
 
 
-def dedupe_by_seed(records: dict[tuple[str, str], list[RunEntry]]) -> dict[tuple[str, str], list[RunEntry]]:
+# (subsample, clf_name, interp_method); interp is OURS_SPARSITY_INTERP (None)
+# for our own LSD rows, which have no interpolation variant.
+SparsityKey = tuple[float, str, "str | None"]
+
+
+def fetch_sparsity_run_records(
+    project: str, entity: str | None
+) -> dict[SparsityKey, list[RunEntry]]:
+    """Fetch eval_sparsity_baselines.py runs, keyed by (subsample, clf, interp).
+
+    One W&B run there covers a single (seed, subsample) task but evaluates
+    *several* classifiers at once (config.selection.classifiers), so each run
+    contributes one entry per classifier. Its per-classifier, dataset-averaged
+    metrics live under ``summary/<clf_name>/<metric>`` (written by
+    ``_wandb_log_task_summary``) -- the same role baseline.py's
+    ``summary/macro/<benchmark>/<clf_name>/<metric>`` plays elsewhere.
+
+    Only QAD runs at QAD_REQUIRED_DECIMATION are kept, matching the main QAD
+    table. Runs that are still in flight simply have no ``summary/...`` keys
+    yet and drop out on their own.
+    """
+    api = wandb.Api()
+    path = f"{entity}/{project}" if entity else project
+    runs = api.runs(path, order="-created_at")
+
+    records: dict[SparsityKey, list[RunEntry]] = defaultdict(list)
+
+    for run in runs:
+        config = run.config or {}
+        selection = config.get("selection", {}) or {}
+        task = config.get("task", {}) or {}
+        if selection.get("benchmark") != QAD_BENCHMARK:
+            continue
+        if (config.get("window_settings") or {}).get("decimation") != QAD_REQUIRED_DECIMATION:
+            continue
+
+        interp = config.get("interp_method")
+        subsample = task.get("subsample")
+        if interp not in SPARSITY_INTERP_METHODS or subsample not in SPARSITY_SUBSAMPLES:
+            continue
+
+        created_at = pd.to_datetime(run.created_at, utc=True)
+        seed = task.get("run_seed")
+        summary = run.summary
+
+        for clf_name in selection.get("classifiers", []):
+            metrics = {}
+            for metric in METRICS:
+                value = summary.get(f"summary/{clf_name}/{metric}")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metrics[metric] = float(value)
+            if not metrics:
+                continue  # classifier failed, or the run hasn't finished yet
+            records[(float(subsample), clf_name, interp)].append((created_at, seed, metrics))
+
+    return records
+
+
+def fetch_ours_sparsity_run_records(
+    project: str, entity: str | None
+) -> dict[SparsityKey, list[RunEntry]]:
+    """Fetch our own LSD sparsity runs (eval_sparsity_data.py) for the sparsity table.
+
+    These live in the same project as the main "ours" runs, not in the
+    baselines' sparsity project, and are exactly the runs
+    fetch_ours_run_records skips: QAD at QAD_REQUIRED_DECIMATION with
+    ``args.fixed_subsample_mask`` set -- a mask drawn once at load time, which
+    is what makes a run a sparsity experiment rather than a main-table one.
+    The subsample level comes from ``args.subsample``; levels outside
+    SPARSITY_SUBSAMPLES (the table's column groups) are dropped.
+
+    Keys use OURS_SPARSITY_INTERP for the interpolation slot: our model takes
+    the subsampled series as-is, with no gap interpolation to vary.
+    """
+    api = wandb.Api()
+    path = f"{entity}/{project}" if entity else project
+    runs = api.runs(path, order="-created_at")
+
+    records: dict[SparsityKey, list[RunEntry]] = defaultdict(list)
+
+    for run in runs:
+        config = run.config or {}
+        run_context = config.get("run_context", {}) or {}
+        run_args = config.get("args", {}) or {}
+
+        if not uses_fixed_subsample_mask(config):
+            continue
+
+        raw_benchmark = run_context.get("benchmark_name")
+        # As in fetch_ours_run_records, --trace-ids subsets ("DATASET:ids") are
+        # not averaged over every trace and must not be mixed in.
+        if not raw_benchmark or ":" in raw_benchmark:
+            continue
+        if raw_benchmark != QAD_BENCHMARK:
+            continue
+        if run_args.get("data_decimation_factor") != QAD_REQUIRED_DECIMATION:
+            continue
+
+        clf_name = OURS_VARIANT_LABELS.get(run_context.get("model_variant"))
+        if not clf_name:
+            continue
+
+        subsample = run_args.get("subsample")
+        if not isinstance(subsample, (int, float)) or isinstance(subsample, bool):
+            continue
+        if float(subsample) not in SPARSITY_SUBSAMPLES:
+            continue
+
+        metrics = _extract_ad_summary_metrics(dict(run.summary))
+        if not metrics:
+            continue  # run failed or never produced usable metrics
+
+        created_at = pd.to_datetime(run.created_at, utc=True)
+        seed = run_context.get("run_seed")
+        records[(float(subsample), clf_name, OURS_SPARSITY_INTERP)].append((created_at, seed, metrics))
+
+    return records
+
+
+def select_recent_sparsity_runs(
+    records: dict[SparsityKey, list[RunEntry]],
+) -> dict[SparsityKey, dict[str, list[float]]]:
+    """Keep the DEFAULT_RUN_LIMIT most recent runs per (subsample, clf, interp).
+
+    DETERMINISTIC_CLASSIFIERS deliberately gets no special treatment here
+    (unlike select_recent_runs): the burst mask is drawn from the run seed, so
+    even COPOD/KNN/LOF/OCSVM differ from seed to seed under sparsity.
+    """
+    values: dict[SparsityKey, dict[str, list[float]]] = {}
+    for key, entries in records.items():
+        most_recent = sorted(entries, key=lambda item: item[0], reverse=True)[:DEFAULT_RUN_LIMIT]
+        metric_values = {m: [] for m in METRICS}
+        for _, _, metrics in most_recent:
+            for metric, value in metrics.items():
+                metric_values[metric].append(value)
+        values[key] = metric_values
+    return values
+
+
+def dedupe_by_seed(records: dict[RecordKey, list[RunEntry]]) -> dict[RecordKey, list[RunEntry]]:
     """Keep at most one entry per seed within each (benchmark, classifier) group.
 
     If the same seed was run more than once, keep only the most recently
@@ -466,8 +685,43 @@ def build_run_count_table(values: dict[tuple[str, str], dict[str, list[float]]])
     return count_df
 
 
+def _missing_sparsity_run_lines(
+    sparsity_records: dict[SparsityKey, list[RunEntry]],
+) -> list[str]:
+    """Report lines for the QAD sparsity sweep's still-missing seeds.
+
+    One entry per (subsample, classifier, interpolation) cell of the sparsity
+    table. DETERMINISTIC_CLASSIFIERS gets no exemption here (unlike the
+    benchmark report above): the burst mask is drawn from the run seed, so
+    every cell needs all EXPECTED_SEEDS regardless of classifier.
+
+    Our own LSD rows are reported only as present/absent: eval_sparsity_data.py
+    seeds its runs by task index (0, 1, 2, ...), not from EXPECTED_SEEDS, so
+    naming specific missing seeds would be meaningless. The per-cell run counts
+    in build_sparsity_run_count_table cover those rows instead.
+    """
+    lines = []
+    for subsample in SPARSITY_SUBSAMPLES:
+        for group in sparsity_row_plan():
+            for clf_name, interp, label in group:
+                entries = sparsity_records.get((subsample, clf_name, interp), [])
+                if clf_name in SPARSITY_OURS_ROWS:
+                    if not entries:
+                        lines.append(f"  QAD sparsity {subsample * 100:g}% / {label}: no run found")
+                    continue
+                seeds_present = {seed for _, seed, _ in entries if seed is not None}
+                missing_seeds = [s for s in EXPECTED_SEEDS if s not in seeds_present]
+                if missing_seeds:
+                    lines.append(
+                        f"  QAD sparsity {subsample * 100:g}% / {label}: missing seed(s) {missing_seeds}"
+                    )
+    return lines
+
+
 def report_missing_runs(
-    records: dict[tuple[str, str], list[RunEntry]], benchmarks: list[str]
+    records: dict[tuple[str, str], list[RunEntry]],
+    benchmarks: list[str],
+    sparsity_records: dict[SparsityKey, list[RunEntry]] | None = None,
 ) -> None:
     """Print, for every (benchmark, classifier) pair, which of the 5 expected
     seeds (42-46) are still missing.
@@ -478,6 +732,10 @@ def report_missing_runs(
     should be the seed-deduped records dict (post dedupe_by_seed), i.e.
     before select_recent_runs discards anything beyond the recency limit --
     this reports on every run W&B has, not just the ones a table will use.
+
+    `sparsity_records` (same post-dedupe form, but keyed by
+    (subsample, classifier, interp)) appends the QAD sparsity sweep's 1% / 5%
+    configurations to the same list -- see _missing_sparsity_run_lines.
     """
     missing_lines = []
     for benchmark in benchmarks:
@@ -494,6 +752,9 @@ def report_missing_runs(
                 missing_lines.append(
                     f"  {benchmark} / {clf_name}: missing seed(s) {missing_seeds}"
                 )
+
+    if sparsity_records is not None:
+        missing_lines += _missing_sparsity_run_lines(sparsity_records)
 
     print(f"\nRuns still left to do (expected seeds {EXPECTED_SEEDS[0]}-{EXPECTED_SEEDS[-1]}):")
     print("\n".join(missing_lines) if missing_lines else "  none -- all expected runs found.")
@@ -829,6 +1090,152 @@ def to_ode_vs_lsd_latex(table: pd.DataFrame) -> str:
     )
 
 
+def sparsity_column_label(subsample: float) -> str:
+    """Column-group header for a subsample level, e.g. 0.01 -> ``QAPPD (1\\%)``."""
+    return f"{BENCHMARK_LABELS.get(QAD_BENCHMARK, QAD_BENCHMARK).split(' (')[0]} ({subsample * 100:g}\\%)"
+
+
+SparsityRow = tuple[str, "str | None", str]  # (clf_name, interp_method, label)
+
+
+def sparsity_row_label(clf_name: str, interp: "str | None") -> str:
+    """Row label for a sparsity cell: ``COPOD (linear)``, or the bare model name
+    for our LSD rows, which have no interpolation variant."""
+    label = display_label(clf_name)
+    return f"{label} ({interp})" if interp else label
+
+
+def sparsity_row_plan() -> list[list[SparsityRow]]:
+    """Return the table's rows as ``(clf_name, interp, display label)``, grouped.
+
+    One row per (classifier, interpolation method) pair -- "COPOD (linear)",
+    "COPOD (spline)", ... -- except for SPARSITY_OURS_ROWS (our own LSD
+    variants), which get a single row each (interp OURS_SPARSITY_INTERP), fed
+    from the "ours" project's fixed-subsample-mask runs. The outer list is the
+    \\midrule row grouping, mirroring SPARSITY_CLASSIFIER_GROUPS.
+    """
+    plan: list[list[SparsityRow]] = []
+    for group in SPARSITY_CLASSIFIER_GROUPS:
+        rows: list[SparsityRow] = []
+        for clf_name in group:
+            interps = [OURS_SPARSITY_INTERP] if clf_name in SPARSITY_OURS_ROWS else SPARSITY_INTERP_METHODS
+            for interp in interps:
+                rows.append((clf_name, interp, sparsity_row_label(clf_name, interp)))
+        plan.append(rows)
+    return plan
+
+
+def build_sparsity_table(values: dict[SparsityKey, dict[str, list[float]]]) -> pd.DataFrame:
+    """QAD sparsity table: one column group per subsample level, rows per
+    (classifier, interpolation) pair.
+
+    Layout mirrors the main per-group tables -- leading "Avg. Rank" + "Model"
+    columns, AUC/AUPRC/F1 per group, top 3 highlighted per column -- but rows
+    keep sparsity_row_plan()'s fixed order rather than being sorted by rank,
+    so a classifier's linear/spline pair always stays adjacent.
+    """
+    rows = [row for group in sparsity_row_plan() for row in group]
+    labels = [label for _, _, label in rows]
+
+    columns = pd.MultiIndex.from_product(
+        [[sparsity_column_label(s) for s in SPARSITY_SUBSAMPLES], [METRIC_LABELS[m] for m in METRICS]]
+    )
+    mean_table = pd.DataFrame(index=labels, columns=columns, dtype=float)
+    text_table = pd.DataFrame(index=labels, columns=columns, dtype=object)
+
+    empty = {m: [] for m in METRICS}
+    for clf_name, interp, label in rows:
+        for subsample in SPARSITY_SUBSAMPLES:
+            metric_values = values.get((subsample, clf_name, interp), empty)
+            for metric in METRICS:
+                col = (sparsity_column_label(subsample), METRIC_LABELS[metric])
+                mean, std = mean_std(metric_values[metric])
+                mean_table.loc[label, col] = mean
+                text_table.loc[label, col] = format_cell(mean, std)
+
+    ranks = highlight_top3(mean_table, text_table)
+
+    avg_rank = ranks.mean(axis=1, skipna=True)
+    avg_rank_position = avg_rank.rank(method="min", ascending=True)
+    rank_texts = {}
+    for label in labels:
+        value = avg_rank.get(label)
+        if pd.isna(value):
+            rank_texts[label] = "--"
+            continue
+        position = avg_rank_position.get(label)
+        color = RANK_COLORS.get(position) if pd.notna(position) else None
+        if color is not None:
+            rank_texts[label] = f"\\rankbox[{color}]{{{value:.2f}}}"
+        else:
+            rank_texts[label] = f"\\rankbox{{{value:.2f}}}"
+
+    text_table.insert(0, ("", "Avg. Rank"), pd.Series(rank_texts))
+    text_table.insert(1, ("", "Model"), pd.Series({label: label for label in labels}))
+    return text_table.fillna("--")
+
+
+def to_sparsity_latex(table: pd.DataFrame) -> str:
+    """Render the QAD sparsity table, with a \\midrule between row groups."""
+    column_format = "cl " + " ".join(["ccc"] * len(SPARSITY_SUBSAMPLES))
+    group_cells = " & ".join(
+        f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{sparsity_column_label(s)}}}}}" for s in SPARSITY_SUBSAMPLES
+    )
+    metric_cells = [r"\textbf{Rank}\big\downarrow", r"\textbf{Model}"]
+    for _ in SPARSITY_SUBSAMPLES:
+        metric_cells += [r"\textbf{AUC} \big\uparrow", r"\textbf{AUPRC} \big\uparrow", r"\textbf{F1} \big\uparrow"]
+    header = "\n".join([
+        f"&& {group_cells} \\\\",
+        _cmidrule_spans(len(SPARSITY_SUBSAMPLES)),
+        " & ".join(metric_cells) + r" \\",
+    ])
+
+    boundaries = set()
+    running_total = 0
+    for group in sparsity_row_plan()[:-1]:
+        running_total += len(group)
+        boundaries.add(running_total)
+
+    lines = []
+    for i, row in enumerate(table.itertuples(index=False), start=1):
+        lines.append(" & ".join(str(value) for value in row) + r" \\")
+        if i in boundaries:
+            lines.append(r"\midrule")
+    rows = "\n".join(lines)
+
+    return (
+        f"\\begin{{tabular}}{{{column_format}}}\n"
+        f"\\toprule\n"
+        f"{header}\n"
+        f"\\midrule\n"
+        f"{rows}\n"
+        f"\\bottomrule\n"
+        f"\\end{{tabular}}"
+    )
+
+
+def build_sparsity_run_count_table(values: dict[SparsityKey, dict[str, list[float]]]) -> pd.DataFrame:
+    """Console-only: number of contributing runs per (clf, interp) x subsample.
+
+    Every planned row is listed even when nothing was found for it (shown as
+    0), so still-missing sparsity configurations are visible at a glance --
+    this is the sparsity counterpart of report_missing_runs.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for (subsample, clf_name, interp), metric_values in values.items():
+        num_runs = max((len(v) for v in metric_values.values()), default=0)
+        counts.setdefault(sparsity_column_label(subsample), {})[sparsity_row_label(clf_name, interp)] = num_runs
+
+    count_df = pd.DataFrame(counts)
+    expected = [label for group in sparsity_row_plan() for _, _, label in group]
+    count_df = count_df.reindex(
+        index=expected + sorted(set(count_df.index) - set(expected)),
+        columns=[sparsity_column_label(s) for s in SPARSITY_SUBSAMPLES],
+    ).fillna(0).astype(int)
+    count_df.index.name = "model (interp)"
+    return count_df
+
+
 def build_comparison_table(avg_rank_single: pd.Series, avg_rank_multi: pd.Series) -> pd.DataFrame:
     """Combine two tables' avg-rank columns into Overall/Single Trace/Multi Trace.
 
@@ -966,10 +1373,42 @@ def main() -> None:
     ode_vs_lsd_out_path.write_text(ode_vs_lsd_latex)
     print(f"Saved to {ode_vs_lsd_out_path}")
 
+    sparsity_records = None
+    if not args.skip_sparsity:
+        # Independent of everything above: its own project, its own
+        # (subsample, classifier, interp) bucketing. Our LSD rows are the one
+        # exception -- they come from the "ours" project, from precisely the
+        # fixed-subsample-mask runs the tables above filter out.
+        raw_sparsity_records = fetch_sparsity_run_records(args.sparsity_project, args.sparsity_entity)
+        if not args.skip_ours:
+            ours_sparsity_records = fetch_ours_sparsity_run_records(args.ours_project, args.ours_entity)
+            for key, entries in ours_sparsity_records.items():
+                raw_sparsity_records[key].extend(entries)
+        sparsity_records = dedupe_by_seed(raw_sparsity_records)
+        if sparsity_records:
+            sparsity_values = select_recent_sparsity_runs(sparsity_records)
+
+            print(f"\nSparsity runs found per subsample/model configuration (most recent "
+                  f"{DEFAULT_RUN_LIMIT} per cell):")
+            print(build_sparsity_run_count_table(sparsity_values).to_string())
+
+            sparsity_latex = to_sparsity_latex(build_sparsity_table(sparsity_values))
+
+            print("\nLaTeX table (QAD sparsity sweep)")
+            print(sparsity_latex)
+
+            sparsity_out_path = args.output_dir / "baseline_table_QAD_sparsity.tex"
+            sparsity_out_path.write_text(sparsity_latex)
+            print(f"Saved to {sparsity_out_path}")
+        else:
+            print(f"\nNo usable sparsity runs found in project '{args.sparsity_project}' "
+                  f"(entity={args.sparsity_entity}), nor any fixed-subsample-mask QAD runs in "
+                  f"'{args.ours_project}'; skipping the sparsity table.")
+
     all_benchmarks = [b for _, benchmarks in TABLE_GROUPS for b in benchmarks] + [
         QAD_BENCHMARK, QAD_DECIMATION1_BENCHMARK
     ]
-    report_missing_runs(records, all_benchmarks)
+    report_missing_runs(records, all_benchmarks, sparsity_records=sparsity_records)
 
 
 if __name__ == "__main__":
