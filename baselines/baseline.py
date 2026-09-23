@@ -462,10 +462,10 @@ def build_classifier_factories(
         "OCSVM": lambda: OCSVM(),
         "TimesNet": lambda: TimesNet(batch_size=16, **ts_kwargs),
         "DeepSVDD": lambda: DeepSVDDTS(**ts_kwargs),
-        "USAD": lambda: USAD(batch_size=512, **ts_kwargs),
+        "USAD": lambda: USAD(batch_size=128, **ts_kwargs),
         "AnomalyTransformer": lambda: AnomalyTransformer(batch_size=16, **ts_kwargs),
         "TcnED": lambda: TcnED(batch_size=16, **ts_kwargs),
-        "TranAD": lambda: TranAD(**ts_kwargs),
+        "TranAD": lambda: TranAD(batch_size=32, **ts_kwargs),
         "DeepIF": lambda: DeepIsolationForestTS(batch_size=256, **ts_kwargs),
         # batch_size must stay well above 1/neg_batch_ratio (deepod default 0.2):
         # at batch_size=2 COUTA generates int(2 * 0.2) == 0 synthetic negatives per
