@@ -50,11 +50,11 @@ COUTA_TRAIN_BATCH_SIZE = 64
 # Scores whose spread is this small relative to their scale carry no ranking
 # information - the model has collapsed (see _warn_on_degenerate_scores).
 DEGENERATE_SCORE_REL_STD = 1e-6
-DEFAULT_SEQ_LEN = 200
-DEFAULT_STRIDE = 20
+DEFAULT_SEQ_LEN = 100
+DEFAULT_STRIDE = DEFAULT_SEQ_LEN//10
 DEFAULT_DECIMATION = 1
 DEFAULT_SCORE_SMOOTHING = 10
-DEFAULT_EVAL_WINDOW = 200
+DEFAULT_EVAL_WINDOW = DEFAULT_SEQ_LEN
 
 # Per-benchmark window/scoring defaults, used unless overridden on the CLI.
 # QAD mirrors cfg/anomaly_detection/QAD.json so the baselines see the same
