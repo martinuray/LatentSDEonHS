@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -15,41 +16,72 @@ from anomaly_detection import (
 )
 from utils.parser import generic_parser, get_partition_batch_size
 
-SUBSAMPLES = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-NUM_SEEDS = 5
+DEFAULT_SUBSAMPLES = [0.01, 0.05]
+DEFAULT_NUM_SEEDS = 3
 
 
-def _decode_task_id(task_id: int):
+def _parse_subsamples(spec: str):
+    """Parse a comma-separated list of subsample fractions."""
+    subsamples = [float(s.strip()) for s in spec.split(',') if s.strip()]
+    if not subsamples:
+        raise ValueError("--subsamples must contain at least one value")
+    for s in subsamples:
+        if not 0.0 < s <= 1.0:
+            raise ValueError(f"subsample fractions must lie in (0, 1], got {s}")
+    return subsamples
+
+
+def _decode_task_id(task_id: int, subsamples):
     """Map a 0-based SLURM array task id to (seed_idx, subsample)."""
-    seed_idx = task_id // len(SUBSAMPLES)
-    sub_idx  = task_id %  len(SUBSAMPLES)
-    return seed_idx, SUBSAMPLES[sub_idx]
+    seed_idx = task_id // len(subsamples)
+    sub_idx  = task_id %  len(subsamples)
+    return seed_idx, subsamples[sub_idx]
 
 
-def run_single(args, out_dir: str):
+def run_single(args, out_dir: str, subsamples):
     """Run one (seed, subsample) pair and save the result as JSON."""
     os.makedirs(out_dir, exist_ok=True)
-    task_id = int(args.task_id)
-    seed_idx, subsample = _decode_task_id(task_id)
 
-    logging.info(f"Task {task_id}: seed={seed_idx}, subsample={subsample}")
+    # The pair is either encoded in the SLURM array task id or given explicitly
+    # via --subsample-value (+ --seed-idx).
+    if args.task_id is not None:
+        task_id = int(args.task_id)
+        seed_idx, subsample = _decode_task_id(task_id, subsamples)
+        task_label = f"task_{task_id:04d}"
+    else:
+        seed_idx = int(args.seed_idx)
+        subsample = float(args.subsample_value)
+        task_label = f"seed{seed_idx}_sub{subsample:.3f}"
+
+    logging.info(f"{task_label}: seed={seed_idx}, subsample={subsample}")
     args.subsample = subsample
     args.seed = seed_idx
 
     best_stats = start_experiment(args, provider=None)
 
     result = {'subsample': subsample, 'idx': seed_idx, **best_stats}
-    out_file = os.path.join(out_dir, f"task_{task_id:04d}.json")
+    out_file = os.path.join(out_dir, f"{task_label}.json")
     with open(out_file, 'w') as f:
         json.dump(result, f)
     logging.info(f"Saved result to {out_file}")
 
 
+def run_all(args, out_dir: str, subsamples):
+    """Run the full num_seeds x subsamples sweep sequentially."""
+    for task_id in range(args.num_seeds * len(subsamples)):
+        task_args = copy.copy(args)
+        task_args.task_id = task_id
+        run_single(task_args, out_dir, subsamples)
+
+
 def aggregate(out_dir: str):
     """Collect all per-task JSON files, build CSV, and produce plots."""
-    files = sorted(f for f in os.listdir(out_dir) if f.startswith('task_') and f.endswith('.json'))
+    files = sorted(
+        f for f in os.listdir(out_dir)
+        if f.endswith('.json') and (f.startswith('task_') or f.startswith('seed'))
+    )
     if not files:
-        raise FileNotFoundError(f"No task_*.json files found in {out_dir}")
+        raise FileNotFoundError(f"No task_*.json / seed*.json files found in {out_dir}")
 
     rows = []
     for fname in files:
@@ -119,13 +151,29 @@ def main():
     argv = sys.argv[1:]
     parser = extend_argparse(generic_parser)
     parser.add_argument(
-        '--mode', choices=['single', 'aggregate'], default='aggregate',
-        help="'single': run one (seed,subsample) pair (requires --task-id); "
+        '--mode', choices=['single', 'all', 'aggregate'], default='aggregate',
+        help="'single': run one (seed,subsample) pair (requires --task-id or --subsample-value); "
+             "'all': run the full seeds x subsamples sweep sequentially; "
              "'aggregate': collect results and plot.")
     parser.add_argument(
         '--task-id', type=int, default=None,
-        help="0-based task index encoding (seed, subsample). "
-             f"Range: 0 .. {NUM_SEEDS * len(SUBSAMPLES) - 1}.")
+        help="0-based task index encoding (seed_idx, subsample_idx). "
+             "Range: 0 .. num_seeds * len(subsamples) - 1.")
+    parser.add_argument(
+        '--subsamples', type=str, default=','.join(str(s) for s in DEFAULT_SUBSAMPLES),
+        help="Comma-separated subsample fractions forming the sweep grid "
+             f"(default: {','.join(str(s) for s in DEFAULT_SUBSAMPLES)}). "
+             "Also defines how --task-id is decoded.")
+    parser.add_argument(
+        '--subsample-value', type=float, default=None,
+        help="Explicit subsample fraction to process in --mode single "
+             "(alternative to --task-id).")
+    parser.add_argument(
+        '--seed-idx', type=int, default=0,
+        help="Seed index to use in --mode single when --subsample-value is given.")
+    parser.add_argument(
+        '--num-seeds', type=int, default=DEFAULT_NUM_SEEDS,
+        help=f"Number of seeds per subsample level (default: {DEFAULT_NUM_SEEDS}).")
     parser.add_argument(
         '--results-dir', default='out/sparsity_results',
         help="Directory for per-task JSON files and final outputs.")
@@ -158,10 +206,26 @@ def main():
         if partition_batch_size is not None:
             args.batch_size = partition_batch_size
 
+    try:
+        subsamples = _parse_subsamples(args.subsamples)
+    except ValueError as exc:
+        parser.error(str(exc))
+    logging.info(f"Subsample grid: {subsamples} (num_seeds={args.num_seeds})")
+
     if args.mode == 'single':
-        if args.task_id is None:
-            parser.error("--task-id is required for --mode single")
-        run_single(args, args.results_dir)
+        if args.task_id is None and args.subsample_value is None:
+            parser.error("--mode single requires either --task-id or --subsample-value")
+        if args.task_id is not None and args.subsample_value is not None:
+            parser.error("--task-id and --subsample-value are mutually exclusive")
+        if args.task_id is not None and not 0 <= args.task_id < args.num_seeds * len(subsamples):
+            parser.error(
+                f"--task-id must be in 0 .. {args.num_seeds * len(subsamples) - 1} "
+                f"for num_seeds={args.num_seeds} and {len(subsamples)} subsamples")
+        run_single(args, args.results_dir, subsamples)
+    elif args.mode == 'all':
+        if args.task_id is not None or args.subsample_value is not None:
+            parser.error("--mode all runs the full sweep; drop --task-id / --subsample-value")
+        run_all(args, args.results_dir, subsamples)
     else:
         aggregate(args.results_dir)
 
