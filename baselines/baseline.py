@@ -65,7 +65,7 @@ BENCHMARK_WINDOW_DEFAULTS = {
         "seq_len": 200,
         "stride": 20,
         "decimation": 10,
-        "score_smoothing_window": 10,
+        "score_smoothing_window": 0,
         "eval_window": 200,
     },
 }
