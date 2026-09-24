@@ -975,6 +975,90 @@ def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, devic
     return {"feature_mse": feature_mse, "feature_weights": feature_weights}
 
 
+def build_provider(args, data_dir: str | None = None):
+    """Instantiate the data provider for ``args.dataset`` exactly as the
+    training entry point does (shared with evaluate_checkpoints.py)."""
+    if data_dir is None:
+        data_dir = getattr(args, "data_dir", "data_dir")
+    logging.info("Instantiating data provider")
+    if args.dataset in ['SWaT', 'WaDi']:
+        provider = ADProvider(
+            data_dir=data_dir, dataset=args.dataset,
+            window_length=args.data_window_length, window_overlap=args.data_window_overlap,
+            n_samples=1000 if args.debug else None,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy
+        )
+    elif args.dataset == 'SMD':
+        provider = SMDProvider(
+            data_dir=data_dir,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    elif args.dataset == 'QAD':
+        dataset_number = None
+        if args.trace_ids is not None and len(args.trace_ids) == 1:
+            dataset_number = int(args.trace_ids[0])
+        provider = QADProvider(
+            data_dir=data_dir,
+            dataset_number=dataset_number,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+            decimation_factor=args.data_decimation_factor,
+        )
+    elif args.dataset == 'TSB-AD-M':
+        dataset_number = None
+        if args.trace_ids is not None:
+            try:
+                dataset_number = [int(trace_id) for trace_id in args.trace_ids]
+                if len(dataset_number) == 1:
+                    dataset_number = dataset_number[0]
+            except ValueError as exc:
+                raise ValueError(
+                    f"--trace-ids for dataset {args.dataset} must be numeric file indices, got {args.trace_ids}"
+                ) from exc
+        provider = TSBADMProvider(
+            data_dir=data_dir,
+            dataset_number=dataset_number,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    elif args.dataset in ['SMAP', 'MSL']:
+        provider = NASAProvider(
+            data_dir=data_dir, dataset=args.dataset,
+            window_length=args.data_window_length,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask)
+    elif args.dataset == 'PSM':
+        provider = PSMProvider(
+            data_dir=data_dir,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}")
+    return provider
+
+
 def start_experiment(args, provider=None, store_final_metrics=True, run_number: int = 1, total_runs: int = 1):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
@@ -1030,82 +1114,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
     data_dir = getattr(args, "data_dir", "data_dir")
 
     if provider is None:
-        logging.info("Instantiating data provider")
-        if args.dataset in ['SWaT', 'WaDi']:
-            provider = ADProvider(
-                data_dir=data_dir, dataset=args.dataset,
-                window_length=args.data_window_length, window_overlap=args.data_window_overlap,
-                n_samples=1000 if args.debug else None,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy
-            )
-        elif args.dataset == 'SMD':
-            provider = SMDProvider(
-                data_dir=data_dir,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        elif args.dataset == 'QAD':
-            dataset_number = None
-            if args.trace_ids is not None and len(args.trace_ids) == 1:
-                dataset_number = int(args.trace_ids[0])
-            provider = QADProvider(
-                data_dir=data_dir,
-                dataset_number=dataset_number,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-                decimation_factor=args.data_decimation_factor,
-            )
-        elif args.dataset == 'TSB-AD-M':
-            dataset_number = None
-            if args.trace_ids is not None:
-                try:
-                    dataset_number = [int(trace_id) for trace_id in args.trace_ids]
-                    if len(dataset_number) == 1:
-                        dataset_number = dataset_number[0]
-                except ValueError as exc:
-                    raise ValueError(
-                        f"--trace-ids for dataset {args.dataset} must be numeric file indices, got {args.trace_ids}"
-                    ) from exc
-            provider = TSBADMProvider(
-                data_dir=data_dir,
-                dataset_number=dataset_number,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        elif args.dataset in ['SMAP', 'MSL']:
-            provider = NASAProvider(
-                data_dir=data_dir, dataset=args.dataset,
-                window_length=args.data_window_length,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask)
-        elif args.dataset == 'PSM':
-            provider = PSMProvider(
-                data_dir=data_dir,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        else:
-            raise ValueError(f"Unknown dataset {args.dataset}")
+        provider = build_provider(args, data_dir)
     else:
         logging.info("Using provided data provider")
 
