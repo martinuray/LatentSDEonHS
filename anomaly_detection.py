@@ -1323,7 +1323,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
         logging.shutdown()
 
 
-def evaluate(
+def compute_eval_scores(
     args,
     dl: torch.utils.data.DataLoader,
     modules: nn.ModuleDict,
@@ -1331,10 +1331,15 @@ def evaluate(
     desired_t: torch.Tensor,
     device: str,
     normalization_stats=None,
-    epoch: int = 1,
-    test=True,
-    feature_weights=None,
 ):
+    """Forward-pass half of `evaluate`: raw per-timepoint anomaly scores.
+
+    Returns ``(stats, all_scores, all_labels)`` with the ELBO terms averaged
+    over the loader, `all_scores` of shape [time, feature] and `all_labels` of
+    shape [time]. Nothing here depends on how the scores are later smoothed or
+    aggregated, which is what lets a single (expensive) pass feed several
+    post-processing variants -- see compare_score_postprocessing.py.
+    """
     stats = defaultdict(list)
 
     all_scores = np.zeros(
@@ -1410,6 +1415,26 @@ def evaluate(
         normalize_counts[:, None],
         out=np.zeros_like(all_scores),
         where=normalize_counts[:, None] > 0,
+    )
+
+    return stats, all_scores, all_labels
+
+
+def evaluate(
+    args,
+    dl: torch.utils.data.DataLoader,
+    modules: nn.ModuleDict,
+    elbo_loss: nn.Module,
+    desired_t: torch.Tensor,
+    device: str,
+    normalization_stats=None,
+    epoch: int = 1,
+    test=True,
+    feature_weights=None,
+):
+    stats, all_scores, all_labels = compute_eval_scores(
+        args, dl, modules, elbo_loss, desired_t, device,
+        normalization_stats=normalization_stats,
     )
 
     if test:
