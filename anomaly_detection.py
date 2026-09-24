@@ -421,6 +421,12 @@ def train_one_dataset(
                 best_val_loss = val_loss
                 best_stats = tst_stats
                 es_counter = 0
+                # Always keep the model selected by validation loss on disk
+                # (overwritten on every improvement); save_checkpoint is a
+                # no-op unless --enable-checkpointing and --checkpoint-dir are set.
+                ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
+                if save_checkpoint(args, "best", ckpt_name, modules, desired_t):
+                    logging.debug(f"Saved best-model checkpoint at epoch {epoch} (val_loss={val_loss:.6f}).")
             else:
                 es_counter += 1
                 if es_counter >= 4 * (args.restart // args.log_every_n_epochs): # early stopping patience shall be longer than one cosine sheduling
