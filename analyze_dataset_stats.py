@@ -607,25 +607,20 @@ def to_latex_summary_table(rows: List[Dict]) -> str:
     """Render the per-benchmark summary as a booktabs tabular.
 
     Styled like the result tables in baselines/wandb_results_to_latex.py:
-    ``\\toprule`` / ``\\midrule`` / ``\\bottomrule``, a ``\\small \\textbf{...}``
-    column group with a partial ``\\cmidrule(lr)`` under it, bold header cells,
-    and data cells wrapped in ``{...}``. Anomaly ratios are reported as
-    percentages (x100), as every metric in that file is. Needs only booktabs in
-    the preamble -- there is nothing to rank here, so no ``\\cellcolor`` /
-    ``\\rankbox`` macros are used.
+    ``\\toprule`` / ``\\midrule`` / ``\\bottomrule``, bold header cells, and data
+    cells wrapped in ``{...}``. The header names the totals explicitly, so
+    unlike those tables there is no column group / ``\\cmidrule`` here. Needs
+    only booktabs in the preamble -- there is nothing to rank, so no
+    ``\\cellcolor`` / ``\\rankbox`` macros are used.
     """
-    header = "\n".join([
-        r"&&& \multicolumn{2}{c}{\small \textbf{Length}} & \\",
-        r"\cmidrule(lr){4-5}",
-        " & ".join([
-            r"\textbf{Dataset}",
-            r"\textbf{Traces}",
-            r"\textbf{Features}",
-            r"\textbf{Train}",
-            r"\textbf{Test}",
-            r"\textbf{Anomalies (\%)}",
-        ]) + r" \\",
-    ])
+    header = " & ".join([
+        r"\textbf{Benchmark}",
+        r"\textbf{\# Traces}",
+        r"\textbf{\# Features}",
+        r"\textbf{Total Train points}",
+        r"\textbf{Total Test points}",
+        r"\textbf{Total Anomaly Ratio}",
+    ]) + r" \\"
 
     lines = []
     for row in rows:
@@ -638,12 +633,14 @@ def to_latex_summary_table(rows: List[Dict]) -> str:
                 f"{{{_latex_escape(row['features'])}}}",
                 f"{{{row['train_points']:,}}}",
                 f"{{{row['test_points']:,}}}",
-                f"{{{row['anomaly_ratio'] * 100:.2f}}}",
+                # A ratio, matching the header (and the console table) -- not
+                # the x100 scaling the result tables use for their metrics.
+                f"{{{row['anomaly_ratio']:.4f}}}",
             ]
         lines.append(" & ".join(cells) + r" \\")
 
     return (
-        "\\begin{tabular}{l rr rr r}\n"
+        "\\begin{tabular}{lrrrrr}\n"
         "\\toprule\n"
         f"{header}\n"
         "\\midrule\n"
