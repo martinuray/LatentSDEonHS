@@ -3,6 +3,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -350,6 +351,11 @@ def build_modules_and_optim(args, input_dim, desired_t):
     return modules, optimizer, scheduler, elbo_loss
 
 
+def _sanitize_for_filename(value: str) -> str:
+    """Make a trace id safe for use inside a checkpoint filename."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(value))
+
+
 def train_one_dataset(
     args,
     dl_trn,
@@ -364,6 +370,13 @@ def train_one_dataset(
 ):
     desired_t = torch.linspace(0, 1.00, num_timepoints, device=args.device).float()
     modules, optimizer, scheduler, elbo_loss = build_modules_and_optim(args, input_dim, desired_t)
+
+    # In the multi-trace setting `stats_prefix` is the trace/sub-dataset id.
+    # Every checkpoint written from this call carries it in the filename
+    # (checkpoint_<experiment_id_str>_trace-<id>_<epoch>.h5) so that per-trace
+    # checkpoints of the same experiment never overwrite each other.
+    trace_id = str(stats_prefix) if stats_prefix else None
+    ckpt_name = f"{experiment_id_str}_trace-{_sanitize_for_filename(trace_id)}" if trace_id else experiment_id_str
 
     stats = defaultdict(list)
     stats_mask = {
@@ -421,6 +434,11 @@ def train_one_dataset(
                 best_val_loss = val_loss
                 best_stats = tst_stats
                 es_counter = 0
+                # Always keep the model selected by validation loss on disk
+                # (overwritten on every improvement); save_checkpoint is a
+                # no-op unless --enable-checkpointing and --checkpoint-dir are set.
+                if save_checkpoint(args, "best", ckpt_name, modules, desired_t, trace_id=trace_id):
+                    logging.debug(f"Saved best-model checkpoint at epoch {epoch} (val_loss={val_loss:.6f}).")
             else:
                 es_counter += 1
                 if es_counter >= 4 * (args.restart // args.log_every_n_epochs): # early stopping patience shall be longer than one cosine sheduling
@@ -445,8 +463,7 @@ def train_one_dataset(
                 wandb_run = None
 
             if args.checkpoint_at and (epoch in args.checkpoint_at):
-                ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
-                save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
+                save_checkpoint(args, epoch, ckpt_name, modules, desired_t, trace_id=trace_id)
 
             msg = pm.build_progress_message(stats, epoch_key=epoch // args.log_every_n_epochs, epoch=epoch)
             if stats_prefix:
@@ -958,6 +975,90 @@ def calculate_feature_reconstruction_weights(args, dl, modules, desired_t, devic
     return {"feature_mse": feature_mse, "feature_weights": feature_weights}
 
 
+def build_provider(args, data_dir: str | None = None):
+    """Instantiate the data provider for ``args.dataset`` exactly as the
+    training entry point does (shared with evaluate_checkpoints.py)."""
+    if data_dir is None:
+        data_dir = getattr(args, "data_dir", "data_dir")
+    logging.info("Instantiating data provider")
+    if args.dataset in ['SWaT', 'WaDi']:
+        provider = ADProvider(
+            data_dir=data_dir, dataset=args.dataset,
+            window_length=args.data_window_length, window_overlap=args.data_window_overlap,
+            n_samples=1000 if args.debug else None,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy
+        )
+    elif args.dataset == 'SMD':
+        provider = SMDProvider(
+            data_dir=data_dir,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    elif args.dataset == 'QAD':
+        dataset_number = None
+        if args.trace_ids is not None and len(args.trace_ids) == 1:
+            dataset_number = int(args.trace_ids[0])
+        provider = QADProvider(
+            data_dir=data_dir,
+            dataset_number=dataset_number,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+            decimation_factor=args.data_decimation_factor,
+        )
+    elif args.dataset == 'TSB-AD-M':
+        dataset_number = None
+        if args.trace_ids is not None:
+            try:
+                dataset_number = [int(trace_id) for trace_id in args.trace_ids]
+                if len(dataset_number) == 1:
+                    dataset_number = dataset_number[0]
+            except ValueError as exc:
+                raise ValueError(
+                    f"--trace-ids for dataset {args.dataset} must be numeric file indices, got {args.trace_ids}"
+                ) from exc
+        provider = TSBADMProvider(
+            data_dir=data_dir,
+            dataset_number=dataset_number,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    elif args.dataset in ['SMAP', 'MSL']:
+        provider = NASAProvider(
+            data_dir=data_dir, dataset=args.dataset,
+            window_length=args.data_window_length,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask)
+    elif args.dataset == 'PSM':
+        provider = PSMProvider(
+            data_dir=data_dir,
+            window_length=args.data_window_length,
+            window_overlap=args.data_window_overlap,
+            seed=args.seed,
+            subsample=args.subsample,
+            fixed_subsample_mask=args.fixed_subsample_mask,
+            data_normalization_strategy=args.data_normalization_strategy,
+        )
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}")
+    return provider
+
+
 def start_experiment(args, provider=None, store_final_metrics=True, run_number: int = 1, total_runs: int = 1):
     experiment_id = datetime.datetime.now().strftime('%y%m%d-%H:%M:%S')
     experiment_log_file_string = 'DEBUG' if args.debug else f'AD_{args.dataset}'
@@ -1013,82 +1114,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
     data_dir = getattr(args, "data_dir", "data_dir")
 
     if provider is None:
-        logging.info("Instantiating data provider")
-        if args.dataset in ['SWaT', 'WaDi']:
-            provider = ADProvider(
-                data_dir=data_dir, dataset=args.dataset,
-                window_length=args.data_window_length, window_overlap=args.data_window_overlap,
-                n_samples=1000 if args.debug else None,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy
-            )
-        elif args.dataset == 'SMD':
-            provider = SMDProvider(
-                data_dir=data_dir,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        elif args.dataset == 'QAD':
-            dataset_number = None
-            if args.trace_ids is not None and len(args.trace_ids) == 1:
-                dataset_number = int(args.trace_ids[0])
-            provider = QADProvider(
-                data_dir=data_dir,
-                dataset_number=dataset_number,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-                decimation_factor=args.data_decimation_factor,
-            )
-        elif args.dataset == 'TSB-AD-M':
-            dataset_number = None
-            if args.trace_ids is not None:
-                try:
-                    dataset_number = [int(trace_id) for trace_id in args.trace_ids]
-                    if len(dataset_number) == 1:
-                        dataset_number = dataset_number[0]
-                except ValueError as exc:
-                    raise ValueError(
-                        f"--trace-ids for dataset {args.dataset} must be numeric file indices, got {args.trace_ids}"
-                    ) from exc
-            provider = TSBADMProvider(
-                data_dir=data_dir,
-                dataset_number=dataset_number,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        elif args.dataset in ['SMAP', 'MSL']:
-            provider = NASAProvider(
-                data_dir=data_dir, dataset=args.dataset,
-                window_length=args.data_window_length,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask)
-        elif args.dataset == 'PSM':
-            provider = PSMProvider(
-                data_dir=data_dir,
-                window_length=args.data_window_length,
-                window_overlap=args.data_window_overlap,
-                seed=args.seed,
-                subsample=args.subsample,
-                fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy,
-            )
-        else:
-            raise ValueError(f"Unknown dataset {args.dataset}")
+        provider = build_provider(args, data_dir)
     else:
         logging.info("Using provided data provider")
 
@@ -1144,14 +1170,14 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
                     selected_indices,
                 )
 
-            for ds_idx, _ in enumerate(selected_indices):
+            for pos, ds_idx in enumerate(selected_indices):
                 trn_slice = DatasetSlice(active_provider._ds_trn, ds_idx)
                 tst_slice = DatasetSlice(active_provider._ds_tst, ds_idx)
                 val_slice = DatasetSlice(active_provider._ds_val, ds_idx)
 
                 dataset_id = str(trn_slice.dataset_id)
                 logging.info(
-                    f"Training on sub-dataset {dataset_id} ({ds_idx + 1}/{active_provider.num_datasets})"
+                    f"Training on sub-dataset {dataset_id} (idx={ds_idx}, {pos + 1}/{len(selected_indices)})"
                 )
 
                 dl_trn = DataLoader(
@@ -1297,7 +1323,7 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
         logging.shutdown()
 
 
-def evaluate(
+def compute_eval_scores(
     args,
     dl: torch.utils.data.DataLoader,
     modules: nn.ModuleDict,
@@ -1305,10 +1331,15 @@ def evaluate(
     desired_t: torch.Tensor,
     device: str,
     normalization_stats=None,
-    epoch: int = 1,
-    test=True,
-    feature_weights=None,
 ):
+    """Forward-pass half of `evaluate`: raw per-timepoint anomaly scores.
+
+    Returns ``(stats, all_scores, all_labels)`` with the ELBO terms averaged
+    over the loader, `all_scores` of shape [time, feature] and `all_labels` of
+    shape [time]. Nothing here depends on how the scores are later smoothed or
+    aggregated, which is what lets a single (expensive) pass feed several
+    post-processing variants -- see compare_score_postprocessing.py.
+    """
     stats = defaultdict(list)
 
     all_scores = np.zeros(
@@ -1384,6 +1415,26 @@ def evaluate(
         normalize_counts[:, None],
         out=np.zeros_like(all_scores),
         where=normalize_counts[:, None] > 0,
+    )
+
+    return stats, all_scores, all_labels
+
+
+def evaluate(
+    args,
+    dl: torch.utils.data.DataLoader,
+    modules: nn.ModuleDict,
+    elbo_loss: nn.Module,
+    desired_t: torch.Tensor,
+    device: str,
+    normalization_stats=None,
+    epoch: int = 1,
+    test=True,
+    feature_weights=None,
+):
+    stats, all_scores, all_labels = compute_eval_scores(
+        args, dl, modules, elbo_loss, desired_t, device,
+        normalization_stats=normalization_stats,
     )
 
     if test:

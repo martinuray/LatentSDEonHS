@@ -44,5 +44,5 @@
   "fixed_subsample_mask": false,
   "sphere_embedding": true,
   "data_decimation_factor": 10,
-  "score_smoothing_window": 10
+  "score_smoothing_window": 0
 }

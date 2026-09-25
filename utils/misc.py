@@ -12,7 +12,7 @@ import csv
 import torch
 from torch import Tensor
 from torch.nn import ModuleDict
-from typing import Union
+from typing import Optional, Union
 
 def check_exists(dir: str):
     if not os.path.exists(dir):
@@ -203,7 +203,7 @@ def build_progress_message(epoch: int, stats: dict, mask: dict, sep: str = "|") 
     return msg
 
 
-def save_checkpoint(args, epoch: Union[int,str], experiment_id: int, modules: ModuleDict, desired_t: Tensor):
+def save_checkpoint(args, epoch: Union[int,str], experiment_id: Union[int,str], modules: ModuleDict, desired_t: Tensor, trace_id: Optional[str] = None):
     """Save model checkpoint.
 
     Arguments:
@@ -212,8 +212,9 @@ def save_checkpoint(args, epoch: Union[int,str], experiment_id: int, modules: Mo
             Arguments returned by argparse
         epoch: int | str
             Epoch number or 'best'
-        experiment_id: int
-            Unique number identifying the experiment
+        experiment_id: int | str
+            Unique identifier of the experiment; in the multi-trace setting
+            this already carries the trace id (see anomaly_detection.py)
         modules: ModuleDict
             ModuleDict of the form {
                 'recog_net': recognition network instance,
@@ -223,6 +224,9 @@ def save_checkpoint(args, epoch: Union[int,str], experiment_id: int, modules: Mo
                 'aux_net': instance of the network mapping z's to auxilliary output}
         desired_t: torch.Tensor
             Tensor holding the desired timepoints
+        trace_id: str, optional
+            Id of the trace/sub-dataset this checkpoint belongs to (multi-trace
+            benchmarks). Stored in the checkpoint under the key 'trace_id'.
 
     Returns
     -------
@@ -234,7 +238,7 @@ def save_checkpoint(args, epoch: Union[int,str], experiment_id: int, modules: Mo
     if args.checkpoint_dir is None or args.checkpoint_dir == "None": return False
 
     assert os.path.exists(args.checkpoint_dir), f"{args.checkpoint_dir} does not exist!"
-    checkpoint = {"args": args, "desired_t": desired_t, "modules": modules.state_dict()}
+    checkpoint = {"args": args, "desired_t": desired_t, "modules": modules.state_dict(), "trace_id": trace_id}
     torch.save(
         checkpoint,
         os.path.join(args.checkpoint_dir, f"checkpoint_{experiment_id}_{epoch}.h5"),
