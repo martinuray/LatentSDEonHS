@@ -194,7 +194,7 @@ scores_full = _score_trace_with_checkpoint(checkpoint_path, trace_id=trace_id)
 r = float(np.nanpercentile(scores_full, q))
 
 data = data.iloc[start_idx // subsample:end_idx // subsample -1, col_idx]
-labels = labels.iloc[start_idx // subsample:end_idx // subsample -1, 0].to_numpy() == 1
+labels = labels.iloc[start_idx // subsample:end_idx // subsample-1, 0].to_numpy() == 1
 scores = scores_full[start_idx // subsample:end_idx // subsample]
 
 #%%
