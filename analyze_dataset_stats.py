@@ -682,7 +682,7 @@ def main():
     parser.add_argument("--json-out", default="", help="Optional path to save JSON summary.")
     parser.add_argument(
         "--latex-out",
-        default="",
+        default="out/doc/dataset_stats_table.tex",
         help=(
             "Optional path to save the LaTeX summary table (it is always printed). "
             "E.g. out/doc/dataset_stats_table.tex, next to the tables written by "
@@ -694,7 +694,7 @@ def main():
     benchmarks = (
         [args.benchmark]
         if args.benchmark != "all"
-        else ["SMD", "QAD", "SWaT", "WaDi", "SMAP", "MSL", "PSM", "creditcard", "gecco"]
+        else ["SMD", "QAD", "SWaT", "WaDi", "SMAP", "MSL", "PSM"]
     )
 
     summaries = {}
