@@ -10,7 +10,9 @@ import ast
 import glob
 import json
 import os
-from typing import Dict, List
+import pickle
+import re
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -122,20 +124,110 @@ def analyze_smd(data_dir: str) -> Dict:
     return _rows_to_summary("SMD", rows)
 
 
-def analyze_qad(data_dir: str, qad_subdir: str) -> Dict:
-    root = os.path.join(data_dir, "QAD", "raw", qad_subdir)
+class _QADCompatUnpickler(pickle.Unpickler):
+    """Load QAD pickles written with numpy>=2 under an older numpy at runtime.
+
+    Same remapping as ``data/qad_provider.py`` / ``baselines/baseline.py``;
+    duplicated here so this CLI stays importable without torch/sklearn.
+    """
+
+    _MODULE_REMAPS = {
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+    }
+
+    def find_class(self, module: str, name: str):
+        module = self._MODULE_REMAPS.get(module, module)
+        if module.startswith("numpy._core."):
+            module = module.replace("numpy._core.", "numpy.core.", 1)
+        return super().find_class(module, name)
+
+
+def _load_qad_pkl(path: str, is_label: bool = False) -> pd.DataFrame:
+    """Load one pickled QAD trace as a DataFrame (mirrors qad_provider.load_qad_pkl)."""
+    with open(path, "rb") as f:
+        loaded = _QADCompatUnpickler(f).load()
+
+    if isinstance(loaded, pd.Series):
+        data = loaded.to_frame(name="labels")
+    elif isinstance(loaded, pd.DataFrame):
+        data = loaded.copy()
+    else:
+        data = pd.DataFrame(loaded)
+
+    if is_label and len(data.columns) == 1 and "labels" not in data.columns:
+        data.columns = ["labels"]
+    return data
+
+
+def _resolve_qad_raw_dir(data_dir: str, qad_subdir: str) -> Tuple[str, str]:
+    """Locate the QAD raw folder and report which file format it holds.
+
+    The current datasets ship pickled pandas payloads straight in
+    ``data_dir/QAD/raw`` (``train_<id>.pkl`` / ``test_<id>.pkl`` /
+    ``test_label_<id>.pkl``), matching data/qad_provider.py and
+    baselines/baseline.py. Older checkouts kept the pickles under
+    ``qad_clean_pkl_100Hz`` or plain-text traces under `--qad-subdir`, so both
+    are still accepted as fallbacks.
+
+    Returns (root, file_format) with file_format in {"pkl", "txt"}.
+    """
+    flat = os.path.join(data_dir, "QAD", "raw")
+    candidates = [
+        (flat, "pkl"),
+        (os.path.join(flat, "qad_clean_pkl_100Hz"), "pkl"),
+        (os.path.join(flat, qad_subdir), "pkl"),
+        (os.path.join(flat, qad_subdir), "txt"),
+    ]
+    for root, file_format in candidates:
+        if glob.glob(os.path.join(root, f"train_*.{file_format}")):
+            return root, file_format
+
+    raise FileNotFoundError(
+        f"No QAD traces found: looked for train_*.pkl in '{flat}' (and "
+        f"'qad_clean_pkl_100Hz'/'{qad_subdir}' below it), and train_*.txt in "
+        f"'{os.path.join(flat, qad_subdir)}'"
+    )
+
+
+def analyze_qad(data_dir: str, qad_subdir: str, decimation: int = 1) -> Dict:
+    """QAD/QAPPD: one train/test/label triple per numeric trace id.
+
+    Feature and length counts are taken the way the models see them: the
+    non-sensor ``Enable`` flag is dropped and, for ``decimation`` > 1, every
+    n-th sample is kept (the raw traces are 100 Hz; the experiments run at
+    decimation 10, i.e. 10 Hz) -- the same treatment
+    data/qad_provider.py and baselines/baseline.py apply.
+    """
+    root, file_format = _resolve_qad_raw_dir(data_dir, qad_subdir)
+    decimation = max(1, int(decimation))
     rows = []
 
-    for train_path in sorted(glob.glob(os.path.join(root, "train_*.txt"))):
-        dsid = os.path.basename(train_path).replace("train_", "").replace(".txt", "")
-        test_path = os.path.join(root, f"test_{dsid}.txt")
-        label_path = os.path.join(root, f"test_label_{dsid}.txt")
+    for train_path in sorted(glob.glob(os.path.join(root, f"train_*.{file_format}"))):
+        match = re.match(rf"^train_(\d+)\.{file_format}$", os.path.basename(train_path))
+        if match is None:
+            continue
+        dsid = match.group(1)
+        test_path = os.path.join(root, f"test_{dsid}.{file_format}")
+        label_path = os.path.join(root, f"test_label_{dsid}.{file_format}")
         if not (os.path.isfile(test_path) and os.path.isfile(label_path)):
             continue
 
-        train = _safe_load_qad_txt(train_path)
-        test = _safe_load_qad_txt(test_path)
-        labels = _safe_load_qad_txt(label_path)
+        if file_format == "pkl":
+            train_df = _load_qad_pkl(train_path).drop(columns=["Enable"], errors="ignore")
+            test_df = _load_qad_pkl(test_path).drop(columns=["Enable"], errors="ignore")
+            label_df = _load_qad_pkl(label_path, is_label=True)
+            train = train_df[::decimation].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            test = test_df[::decimation].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            labels = pd.to_numeric(label_df.iloc[::decimation, 0], errors="coerce").to_numpy(dtype=float)
+        else:
+            train = _safe_load_qad_txt(train_path)[::decimation]
+            test = _safe_load_qad_txt(test_path)[::decimation]
+            labels = _safe_load_qad_txt(label_path)[::decimation]
+
+        # The provider truncates test and labels to their common length.
+        n_aligned = min(test.shape[0], labels.shape[0])
 
         num_features = int(train.shape[1]) if train.ndim > 1 else 1
         rows.append(
@@ -143,12 +235,13 @@ def analyze_qad(data_dir: str, qad_subdir: str) -> Dict:
                 "dataset_id": dsid,
                 "num_features": num_features,
                 "train_length": int(train.shape[0]),
-                "test_length": int(test.shape[0]),
-                "anomaly_ratio": _ratio_from_labels(labels),
+                "test_length": int(n_aligned),
+                "anomaly_ratio": _ratio_from_labels(labels[:n_aligned]),
             }
         )
 
-    return _rows_to_summary(f"QAD:{qad_subdir}", rows)
+    label = "QAD" if decimation == 1 else f"QAD (decimation={decimation})"
+    return _rows_to_summary(label, rows)
 
 
 def _anomaly_ratio_nasa(num_values: int, anomaly_sequences: str) -> float:
@@ -348,11 +441,11 @@ def analyze_neurips(data_dir: str, dataset: str) -> Dict:
     return _rows_to_summary(f"NeurIPS:{dataset}", rows)
 
 
-def analyze_benchmark(data_dir: str, benchmark: str, qad_subdir: str) -> Dict:
+def analyze_benchmark(data_dir: str, benchmark: str, qad_subdir: str, qad_decimation: int = 1) -> Dict:
     if benchmark == "SMD":
         return analyze_smd(data_dir)
     if benchmark == "QAD":
-        return analyze_qad(data_dir, qad_subdir=qad_subdir)
+        return analyze_qad(data_dir, qad_subdir=qad_subdir, decimation=qad_decimation)
     if benchmark in ["SMAP", "MSL"]:
         return analyze_nasa(data_dir, spacecraft=benchmark)
     if benchmark == "SWaT":
@@ -412,22 +505,79 @@ def _print_summary(summary: Dict, limit: int):
 def _latex_escape(text: str) -> str:
     """Escape basic LaTeX special chars in table cells."""
     repl = {
-        "\\": r"\\textbackslash{}",
-        "&": r"\\&",
-        "%": r"\\%",
-        "$": r"\\$",
-        "#": r"\\#",
-        "_": r"\\_",
-        "{": r"\\{",
-        "}": r"\\}",
-        "~": r"\\textasciitilde{}",
-        "^": r"\\textasciicircum{}",
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
     }
     return "".join(repl.get(ch, ch) for ch in str(text))
 
 
-def _print_final_table(summaries: Dict):
-    """Print a single consolidated table across all analyzed benchmarks."""
+# Display names for the LaTeX table, mirroring BENCHMARK_LABELS in
+# baselines/wandb_results_to_latex.py (where QAD is reported as QAPPD). The
+# sub-trace counts that file appends to its labels are left out here -- this
+# table has an explicit "Traces" column.
+LATEX_BENCHMARK_LABELS = {"QAD": "QAPPD"}
+# Filler for a benchmark whose files weren't found, as in the results tables.
+MISSING_CELL = "--"
+
+
+def _latex_benchmark_label(name: str) -> str:
+    """``QAD`` -> ``QAPPD``, keeping any parenthesized suffix intact.
+
+    ``analyze_qad`` labels a decimated run ``QAD (decimation=10)``, which has to
+    come out as ``QAPPD (decimation=10)``.
+    """
+    head, sep, tail = name.partition(" (")
+    return LATEX_BENCHMARK_LABELS.get(head, head) + sep + tail
+
+
+def _build_final_rows(summaries: Dict) -> List[Dict]:
+    """One row per analyzed benchmark, sorted alphabetically by display label.
+
+    Values stay numeric (``None`` where a benchmark yielded no datasets) so the
+    console and LaTeX renderers can format them independently.
+    """
+    rows = []
+    for name, summary in summaries.items():
+        if not summary["datasets"]:
+            rows.append({
+                "benchmark": name,
+                "traces": 0,
+                "features": None,
+                "train_points": None,
+                "test_points": None,
+                "anomaly_ratio": None,
+            })
+            continue
+
+        df = pd.DataFrame(summary["datasets"])
+        # features: report as a range if the sub-datasets disagree.
+        feat_vals = df["num_features"].unique()
+        features = (
+            str(int(feat_vals[0])) if len(feat_vals) == 1
+            else f"{int(df['num_features'].min())}-{int(df['num_features'].max())}"
+        )
+        rows.append({
+            "benchmark": name,
+            "traces": summary["num_datasets"],
+            "features": features,
+            "train_points": summary["total_train_length"],
+            "test_points": summary["total_test_length"],
+            "anomaly_ratio": summary["weighted_anomaly_ratio"],
+        })
+
+    return sorted(rows, key=lambda r: _latex_benchmark_label(r["benchmark"]).lower())
+
+
+def _print_final_table(rows: List[Dict]):
+    """Print a single consolidated console table across all analyzed benchmarks."""
     table = Table(title="[bold]All Benchmarks — Summary[/bold]")#, box=box.HEAVY_OUTLINE)
     table.add_column("Benchmark", style="bold cyan")
     table.add_column("Traces", justify="right")
@@ -436,69 +586,71 @@ def _print_final_table(summaries: Dict):
     table.add_column("Test points", justify="right")
     table.add_column("Anomaly ratio", justify="right", style="magenta")
 
-    final_rows = []
-    for name, summary in summaries.items():
-        if not summary["datasets"]:
-            table.add_row(name, "0", "-", "-", "-", "-")
-            final_rows.append(
-                {
-                    "benchmark": name,
-                    "traces": "0",
-                    "features": "-",
-                    "train_points": "-",
-                    "test_points": "-",
-                    "anomaly_ratio": "-",
-                }
-            )
+    for row in rows:
+        if row["train_points"] is None:
+            table.add_row(row["benchmark"], "0", "-", "-", "-", "-")
             continue
-
-        df = pd.DataFrame(summary["datasets"])
-        num_traces = summary["num_datasets"]
-        # features: report as range if not all the same, otherwise single value
-        feat_vals = df["num_features"].unique()
-        features_str = str(int(feat_vals[0])) if len(feat_vals) == 1 else f"{int(df['num_features'].min())}-{int(df['num_features'].max())}"
-        train_total = summary["total_train_length"]
-        test_total = summary["total_test_length"]
-        anom = summary["weighted_anomaly_ratio"]
-
         table.add_row(
-            name,
-            str(num_traces),
-            features_str,
-            f"{train_total:,}",
-            f"{test_total:,}",
-            f"{anom:.4f}",
-        )
-        final_rows.append(
-            {
-                "benchmark": name,
-                "traces": str(num_traces),
-                "features": features_str,
-                "train_points": str(train_total),
-                "test_points": str(test_total),
-                "anomaly_ratio": f"{anom:.4f}",
-            }
+            row["benchmark"],
+            str(row["traces"]),
+            row["features"],
+            f"{row['train_points']:,}",
+            f"{row['test_points']:,}",
+            f"{row['anomaly_ratio']:.4f}",
         )
 
     CONSOLE.print()
     CONSOLE.print(table)
 
-    print("\nLaTeX source:")
-    print(r"\begin{tabular}{lrrrrr}")
-    print(r"\hline")
-    print(r"Benchmark & Traces & Features & Train points & Test points & Anomaly ratio \\")
-    print(r"\hline")
-    for row in final_rows:
-        print(
-            f"{_latex_escape(row['benchmark'])} & "
-            f"{_latex_escape(row['traces'])} & "
-            f"{_latex_escape(row['features'])} & "
-            f"{_latex_escape(row['train_points'])} & "
-            f"{_latex_escape(row['test_points'])} & "
-            f"{_latex_escape(row['anomaly_ratio'])} \\\\"
-        )
-    print(r"\hline")
-    print(r"\end{tabular}")
+
+def to_latex_summary_table(rows: List[Dict]) -> str:
+    """Render the per-benchmark summary as a booktabs tabular.
+
+    Styled like the result tables in baselines/wandb_results_to_latex.py:
+    ``\\toprule`` / ``\\midrule`` / ``\\bottomrule``, a ``\\small \\textbf{...}``
+    column group with a partial ``\\cmidrule(lr)`` under it, bold header cells,
+    and data cells wrapped in ``{...}``. Anomaly ratios are reported as
+    percentages (x100), as every metric in that file is. Needs only booktabs in
+    the preamble -- there is nothing to rank here, so no ``\\cellcolor`` /
+    ``\\rankbox`` macros are used.
+    """
+    header = "\n".join([
+        r"&&& \multicolumn{2}{c}{\small \textbf{Length}} & \\",
+        r"\cmidrule(lr){4-5}",
+        " & ".join([
+            r"\textbf{Dataset}",
+            r"\textbf{Traces}",
+            r"\textbf{Features}",
+            r"\textbf{Train}",
+            r"\textbf{Test}",
+            r"\textbf{Anomalies (\%)}",
+        ]) + r" \\",
+    ])
+
+    lines = []
+    for row in rows:
+        cells = [_latex_escape(_latex_benchmark_label(row["benchmark"]))]
+        if row["train_points"] is None:
+            cells += [f"{{{row['traces']}}}"] + [MISSING_CELL] * 4
+        else:
+            cells += [
+                f"{{{row['traces']}}}",
+                f"{{{_latex_escape(row['features'])}}}",
+                f"{{{row['train_points']:,}}}",
+                f"{{{row['test_points']:,}}}",
+                f"{{{row['anomaly_ratio'] * 100:.2f}}}",
+            ]
+        lines.append(" & ".join(cells) + r" \\")
+
+    return (
+        "\\begin{tabular}{l rr rr r}\n"
+        "\\toprule\n"
+        f"{header}\n"
+        "\\midrule\n"
+        + "\n".join(lines) + "\n"
+        "\\bottomrule\n"
+        "\\end{tabular}"
+    )
 
 
 def main():
@@ -513,10 +665,33 @@ def main():
     parser.add_argument(
         "--qad-subdir",
         default="qad_clean_txt_100Hz",
-        help="QAD raw subfolder name under data_dir/QAD/raw/.",
+        help=(
+            "Fallback QAD raw subfolder under data_dir/QAD/raw/, for legacy layouts. "
+            "Current datasets keep train_<id>.pkl / test_<id>.pkl / test_label_<id>.pkl "
+            "directly in data_dir/QAD/raw/, which is used whenever present."
+        ),
+    )
+    parser.add_argument(
+        "--qad-decimation",
+        type=int,
+        default=1,
+        help=(
+            "Keep every n-th QAD sample before counting, as data/qad_provider.py does. "
+            "Raw traces are 100 Hz; pass 10 to report the 10 Hz setting the experiments "
+            "use. Default 1 (raw)."
+        ),
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit printed rows per benchmark (0 = all).")
     parser.add_argument("--json-out", default="", help="Optional path to save JSON summary.")
+    parser.add_argument(
+        "--latex-out",
+        default="",
+        help=(
+            "Optional path to save the LaTeX summary table (it is always printed). "
+            "E.g. out/doc/dataset_stats_table.tex, next to the tables written by "
+            "baselines/wandb_results_to_latex.py."
+        ),
+    )
     args = parser.parse_args()
 
     benchmarks = (
@@ -528,13 +703,26 @@ def main():
     summaries = {}
     for b in benchmarks:
         try:
-            summaries[b] = analyze_benchmark(args.data_dir, b, args.qad_subdir)
+            summaries[b] = analyze_benchmark(args.data_dir, b, args.qad_subdir, args.qad_decimation)
             _print_summary(summaries[b], args.limit)
         except FileNotFoundError as exc:
             CONSOLE.print(f"[yellow]Skipping {b}: {exc}[/yellow]")
 
     if summaries:
-        _print_final_table(summaries)
+        final_rows = _build_final_rows(summaries)
+        _print_final_table(final_rows)
+
+        latex = to_latex_summary_table(final_rows)
+        print("\nLaTeX table (dataset statistics)")
+        print(latex)
+
+        if args.latex_out:
+            latex_dir = os.path.dirname(args.latex_out)
+            if latex_dir:
+                os.makedirs(latex_dir, exist_ok=True)
+            with open(args.latex_out, "w", encoding="utf-8") as f:
+                f.write(latex)
+            print(f"\nSaved LaTeX table to: {args.latex_out}")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
