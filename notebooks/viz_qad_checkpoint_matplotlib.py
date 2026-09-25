@@ -280,19 +280,20 @@ def _plot_anomaly_score_timeline(scores, labels, out_path, title):
     plt.close(fig)
 
 
-def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anomaly_mask, out_path):
+def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anomaly_mask, out_path,
+                                         channel_labels=None):
     """Motivational-figure-style plot (stacked per-channel traces on top,
-    anomaly score panel at the bottom; see notebooks/gen_motiv_figure.py)
-    built purely from the test-set arrays already computed above for the
-    test reconstruction and anomaly-score-timeline plots. No new scores or
-    statistics are computed here, only re-plotting of existing data.
+    anomaly score panel at the bottom). No new scores or statistics are
+    computed here, only re-plotting of existing test-set data.
     """
     LINE_COLOR = "0.2"
-    ANOMALY_COLOR = "red"
-    ANOMALY_ALPHA = 0.1
+    GT_COLOR = "#E8A33D"      # ground-truth (labeled) anomaly regions
+    DET_COLOR = "#D62728"     # detected anomaly (score over threshold)
+    GT_ALPHA = 0.15
     GRID_ALPHA = 0.25
     LINE_WIDTH = 1.0
     YLABEL_X = -0.05
+    THRESHOLD = 0.4           # score panel threshold; drives both the red split and the line
 
     actual = np.asarray(actual)
     if actual.ndim == 3:
@@ -302,11 +303,15 @@ def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anom
     score_anomaly_mask = np.asarray(score_anomaly_mask, dtype=bool)
 
     n_samples = min(actual.shape[0], anomaly_mask.shape[0], score.shape[0], score_anomaly_mask.shape[0])
-    actual = actual[:n_samples]
+    channel_idx = [5, 11, 12]
+    actual = actual[:n_samples, channel_idx]
     anomaly_mask = anomaly_mask[:n_samples]
     score = score[:n_samples]
-    score_anomaly_mask = score_anomaly_mask[:n_samples]
     t = np.arange(n_samples)
+
+    # Real QAPPD feature names; falls back to generic labels if not passed.
+    if channel_labels is None:
+        channel_labels = [f"Feature {j}" for j in channel_idx]
 
     label_edges = np.diff(np.pad(anomaly_mask.astype(np.int8), (1, 1)))
     anomaly_starts = np.flatnonzero(label_edges == 1)
@@ -315,6 +320,14 @@ def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anom
         (int(t[start]), int(t[min(end, n_samples - 1)]) + 1)
         for start, end in zip(anomaly_starts, anomaly_ends)
     ]
+
+    def draw_gt_spans(ax):
+        """Mark ground-truth regions identically on every panel so a score
+        peak can be traced up to the data (panels share the x-axis)."""
+        for span_start, span_end in anomaly_spans:
+            ax.axvspan(span_start, span_end, color=GT_COLOR, alpha=GT_ALPHA, linewidth=0)
+            ax.axvline(span_start, color=GT_COLOR, alpha=0.6, linewidth=0.8, linestyle="--")
+            ax.axvline(span_end, color=GT_COLOR, alpha=0.6, linewidth=0.8, linestyle="--")
 
     n_channels = actual.shape[1] + 1
     spacer_height = 0.6
@@ -336,27 +349,32 @@ def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anom
     for i in range(actual.shape[1]):
         ax = axs[i]
         ax.plot(t, actual[:, i], color=LINE_COLOR, linewidth=LINE_WIDTH)
-        for span_start, span_end in anomaly_spans:
-            ax.axvspan(span_start, span_end, color=ANOMALY_COLOR, alpha=ANOMALY_ALPHA, linewidth=0)
-            ax.axvline(span_start, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
-            ax.axvline(span_end, color=ANOMALY_COLOR, alpha=0.5, linewidth=0.8, linestyle="--")
-        ax.set_ylabel(f"var {i}", rotation=90, va="center")
+        draw_gt_spans(ax)
+        ax.set_ylabel(channel_labels[i], rotation=90, va="center")
         ax.yaxis.set_label_coords(YLABEL_X, 0.5)
         ax.grid(axis="y", alpha=GRID_ALPHA, linewidth=0.6)
 
-    score_benign = score.copy()
-    score_anom = score.copy()
-    score_benign[score_anomaly_mask] = np.nan
-    score_anom[~score_anomaly_mask] = np.nan
+    # Color the score above the threshold in red. Extend the red by one sample
+    # into the below region on each side so the black and red lines share the
+    # boundary point: the last below point joins the first above point, and the
+    # last above point joins the first below point, with no gap.
+    above = score > THRESHOLD
+    above_ext = above.copy()
+    above_ext[:-1] |= above[1:]   # include the below-point just before each anomalous run
+    above_ext[1:] |= above[:-1]   # include the below-point just after each anomalous run
+    score_below = np.where(above, np.nan, score)
+    score_above = np.where(above_ext, score, np.nan)
 
-    axs[-1].plot(t, score_benign, color=LINE_COLOR, linewidth=LINE_WIDTH, label="anomaly score")
-    axs[-1].plot(t, score_anom, color="red", linewidth=LINE_WIDTH * 1.5)
-    axs[-1].set_ylabel("$-\\log p_\\theta$", rotation=90, va="center")
-    axs[-1].yaxis.set_label_coords(YLABEL_X, 0.5)
-    axs[-1].set_xlabel("Timepoint (concatenated test windows)")
-    axs[-1].set_xlim(t.min(), t.max())
-    axs[-1].set_title("Anomaly Scores")
-    axs[0].set_title("Sensory Data (test)")
+    ax_score = axs[-1]
+    ax_score.plot(t, score_below, color=LINE_COLOR, linewidth=LINE_WIDTH, label="anomaly score")
+    ax_score.plot(t, score_above, color=DET_COLOR, linewidth=LINE_WIDTH * 1.5)
+    draw_gt_spans(ax_score)   # same ground-truth markers as the panels above
+    ax_score.set_ylabel(r"Anomaly Score$", rotation=90, va="center")
+    ax_score.yaxis.set_label_coords(YLABEL_X, 0.5)
+    ax_score.set_xlabel("Timepoint (concatenated test windows)")
+    ax_score.set_xlim(t.min(), t.max())
+    ax_score.set_title("Anomaly score")
+    axs[0].set_title("Sensor data (test)")
 
     for ax in axs[:-1]:
         ax.tick_params(axis="x", which="both", labelbottom=False)
@@ -365,10 +383,28 @@ def _plot_motivational_style_test_figure(actual, anomaly_mask, score, score_anom
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
+    ax_score.axhline(y=THRESHOLD, color="purple", linestyle="--", linewidth=1.5)
+    ax_score.text(0.995, 0.1, "threshold", color="purple", va="bottom", ha="right",
+                  transform=ax_score.get_yaxis_transform())
+
+    # Name the two now-distinct colors so the figure reads without the caption.
+    ax_score.annotate("detection",
+                      xy=(9500, 4.5), xytext=(8000, 7.5),
+                      color=DET_COLOR, ha="left", va="center", fontsize=9,
+                      arrowprops=dict(arrowstyle="->", color=DET_COLOR, lw=0.8))
+    if anomaly_spans:
+        gs0, ge0 = anomaly_spans[0]
+        xc = (0.66 * gs0 + 0.33 * ge0)
+        axs[0].annotate("ground truth",
+                        xy=(xc, 0.2), xycoords=("data", "axes fraction"),
+                        xytext=(gs0 - 0.08 * n_samples, 0.20), textcoords=("data", "axes fraction"),
+                        color=GT_COLOR, ha="left", va="top", fontsize=9,
+                        arrowprops=dict(arrowstyle="->", color=GT_COLOR, lw=0.8))
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout(pad=0.2, h_pad=0.1)
-    fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
 
 
@@ -709,7 +745,7 @@ def main() -> None:
         motiv_window_length = int(train_args.data_window_length)
         motiv_start_idx = tst_indices[0] * motiv_window_length
         motiv_end_idx = (tst_indices[-1] + 1) * motiv_window_length
-        motiv_fig_path = out_dir / f"{experiment_id}_epoch{epoch:04d}_test_motivational_figure.pdf"
+        motiv_fig_path = out_dir / f"motivational_figure.pdf"
         _plot_motivational_style_test_figure(
             actual=tst_actual,
             anomaly_mask=tst_anomaly_mask,
@@ -718,7 +754,7 @@ def main() -> None:
             out_path=motiv_fig_path,
         )
         logging.info("Saved motivational-style test figure to %s", motiv_fig_path)
-
+        import sys; sys.exit(1)
         def _render_latent_sphere(
             ds,
             sphere_indices,
