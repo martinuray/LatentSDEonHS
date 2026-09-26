@@ -82,7 +82,8 @@ An eighth table covers the sparsity sweep, fetched from yet another project
 (default:
 https://wandb.ai/martin-uray-salzburg-university-of-applied-sciences/latent-sde-on-hs-sparsity-baselines,
 logged by baselines/eval_sparsity_baselines.py). It is QAD-only: each column
-group is one subsample level (1% / 5% of the original training data kept) and
+group is one subsample level (by default 1% and 5% of the original training
+data kept -- see --sparsity-subsamples) and
 each row is one (classifier, interpolation method) pair -- "COPOD (linear)",
 "COPOD (spline)", ... -- since every classifier was run under both a linear
 and a spline interpolation of the burst-masked gaps. Our two LSD rows come
@@ -92,11 +93,42 @@ taken from exactly the runs the other tables exclude: QAD runs with
 levels. They carry no interpolation variant -- the model consumes the sparse
 series directly -- so they get one row each.
 
+That sparsity table is written both combined (all selected levels side by side,
+``baseline_table_QAD_sparsity.tex``) and split into one standalone table per
+level (``baseline_table_QAD_sparsity_1pct.tex``, ``..._5pct.tex``, ...), for
+papers that want the levels in separate floats. The two differ in more than the
+column groups: the combined table shows both interpolation variants of every
+baseline, while the split per-level tables are restricted to the linear one
+(SPARSITY_SPLIT_INTERP_METHODS) to stay compact -- our LSD rows, which have no
+interpolation variant, appear in both. The split tables also rank rows within
+their own level (and among the shown rows only), whereas the combined one ranks
+across all levels and both variants, so a row's "Avg. Rank" legitimately differs
+between the two.
+
+A ninth table is a PSM-only ablation over decoder capacity
+(``baseline_table_PSM_decoder_ablation.tex``). It has one row per model
+configuration -- our Rn/Sn variants with the decoder the dataset config
+specifies (``cfg/anomaly_detection/PSM.json``: ``n_dec_layers`` x
+``dec_hidden_dim``), then the same two with the higher-capacity decoder (more
+layers, more units -- see ``--psm-high-capacity-decoder``), and the NeuralODE
+reference last. Of our own runs, only those whose remaining
+hyperparameters agree with that config are used (see matches_psm_spec;
+batch_size is deliberately not compared); the NeuralODE reference, by contrast,
+is filtered by dataset alone -- every PSM run of the ODE project counts, since
+anomaly_detection_ode.py is tuned separately and shares none of the LSD
+hyperparameters. Three runs per configuration, and unlike the other tables
+only the best two values per column are highlighted
+(PSM_ABLATION_HIGHLIGHT_TOP_N), since with five rows a top-3 highlight would
+colour most of them. It carries the same "Avg. Rank" column as the main
+tables, computed over its own three columns, but keeps its fixed row order
+instead of sorting by it.
+
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
 """
 
 import argparse
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -199,14 +231,29 @@ OURS_VARIANT_LABELS = {"Rn": LSD_RN_LABEL, "Sn": LSD_SN_LABEL}
 SPARSITY_DEFAULT_PROJECT = "latent-sde-on-hs-sparsity-baselines"
 SPARSITY_DEFAULT_ENTITY = "martin-uray-salzburg-university-of-applied-sciences"
 # Fraction of the original training data still available; one column group each.
+# The levels the sweep was run at, and the default set of column groups --
+# override with --sparsity-subsamples to report only some of them (e.g.
+# `--sparsity-subsamples 0.01` for a 1%-only table). Runs at a level outside
+# the selected set are never fetched, so dropping one also skips its W&B query.
 SPARSITY_SUBSAMPLES = [0.01, 0.05]
-# Every classifier was run under both interpolation strategies for the
-# burst-masked gaps, giving two rows ("<clf> (linear)" / "<clf> (spline)").
-SPARSITY_INTERP_METHODS = ["linear", "spline"]
+# Every classifier was run under each interpolation strategy for the
+# burst-masked gaps, giving one row per pair ("<clf> (linear)",
+# "<clf> (spline)", ...). These are the raw W&B `interp_method` config values;
+# see SPARSITY_INTERP_LABELS for how they're rendered.
+SPARSITY_INTERP_METHODS = ["linear", "spline", "forward_fill"]
+# interp_method -> row-label spelling. A bare underscore is a LaTeX error
+# outside math mode, so any method not listed here falls back to its name with
+# underscores replaced by spaces.
+SPARSITY_INTERP_LABELS = {"forward_fill": "forward fill"}
+# The combined (all-levels) sparsity table reports both strategies; the split
+# per-level tables are restricted to this subset to keep them compact -- linear
+# interpolation is the baselines' default gap filling, and the spline variant is
+# left to the combined table.
+SPARSITY_SPLIT_INTERP_METHODS = ["linear"]
 # Row groups, mirroring the main tables' shallow / deep / ours split. This is a
 # deliberate subset of CLASSIFIER_ORDER -- only these were run under sparsity.
-SPARSITY_GROUP_SHALLOW = ["COPOD", "IForest", "KNN", "LOF", "OCSVM"]
-SPARSITY_GROUP_DEEP = ["DeepIF", "COUTA", "USAD", "DeepSVDD"]
+SPARSITY_GROUP_SHALLOW = ["COPOD", "IForest", "KNN", "LOF", "OCSVM", "PCA"]
+SPARSITY_GROUP_DEEP = ["DeepIF", "USAD", "DeepSVDD"]
 SPARSITY_GROUP_OURS = [LSD_SN_LABEL, LSD_RN_LABEL]
 SPARSITY_CLASSIFIER_GROUPS = [SPARSITY_GROUP_SHALLOW, SPARSITY_GROUP_DEEP, SPARSITY_GROUP_OURS]
 # Our own LSD sparsity runs come from the "ours" project (eval_sparsity_data.py)
@@ -217,6 +264,43 @@ OURS_SPARSITY_INTERP = None
 # Unlike the main tables, DETERMINISTIC_CLASSIFIERS does *not* apply here: the
 # burst mask is drawn from the run seed, so even COPOD/KNN/LOF/OCSVM vary
 # across seeds and all DEFAULT_RUN_LIMIT runs carry information.
+
+# ---------------------------------------------------------------------------
+# PSM decoder-capacity ablation (see build_psm_ablation_table).
+# ---------------------------------------------------------------------------
+PSM_BENCHMARK = "PSM"
+# Three runs (seeds) per configuration, unlike the main tables' five.
+PSM_ABLATION_RUN_LIMIT = 3
+# How many ranks per column get a colour. Lower than the other tables' 3: with
+# five rows, colouring three of them would leave almost nothing uncoloured.
+PSM_ABLATION_HIGHLIGHT_TOP_N = 2
+# The "specification" the default-capacity runs must match: the dataset config
+# anomaly_detection.py is launched with. Its dec_hidden_dim / n_dec_layers
+# define the reference decoder; PSM_ABLATION_HIGH_CAPACITY_DECODER is the
+# widened/deepened one the ablation compares against.
+PSM_ABLATION_CONFIG_PATH = ROOT_DIR / "cfg" / "anomaly_detection" / f"{PSM_BENCHMARK}.json"
+# Used only if that config file is unreadable.
+PSM_ABLATION_SPEC_DECODER_FALLBACK = (2, 12)  # (n_dec_layers, dec_hidden_dim)
+PSM_ABLATION_HIGH_CAPACITY_DECODER = (4, 128)
+# Config keys a run must share with the JSON config to count as "meeting the
+# specification". Deliberately *not* included: batch_size (an optimization
+# detail that varies with the GPU a run landed on, and does not change the
+# model), and the decoder keys themselves, which are what the ablation varies.
+# Keys missing from either side are skipped -- anomaly_detection_ode.py drops
+# --n-deg / --klp-weight entirely, so the NeuralODE runs simply match on fewer.
+PSM_ABLATION_MATCH_KEYS = [
+    "z_dim", "h_dim", "n_deg", "lr", "n_epochs", "subsample",
+    "data_window_length", "data_window_overlap", "data_normalization_strategy",
+    "score_aggregation", "kl0_weight", "klp_weight", "initial_sigma",
+    "mc_train_samples", "mc_eval_samples",
+]
+# The NeuralODE reference row is not config-matched at all: its runs come from
+# anomaly_detection_ode.py, a separately tuned model (different lr, n_epochs,
+# window overlap, sigma, MC sample counts, decoder, and no n_deg/klp_weight at
+# all) that is never launched from the PSM dataset config. Matching it on *any*
+# LSD hyperparameter only silently drops runs whenever that tuning is revised,
+# so the ODE project is filtered by dataset alone -- every PSM run in it is the
+# NeuralODE reference (see fetch_psm_ablation_run_records's `dataset_only`).
 
 # Matches both "summary/per_dataset/<id>/<metric>" (from _wandb_summary_from_dataframe)
 # and "summary/per_dataset.<id>.<metric>" (from _flatten_numeric_metrics), the two
@@ -268,15 +352,54 @@ def parse_args() -> argparse.Namespace:
         "--skip-sparsity", action="store_true",
         help="Don't fetch/render the QAD sparsity table.",
     )
+    parser.add_argument(
+        "--skip-psm-ablation", action="store_true",
+        help="Don't fetch/render the PSM decoder-capacity ablation table.",
+    )
+    parser.add_argument(
+        "--psm-high-capacity-decoder", type=int, nargs=2, metavar=("LAYERS", "WIDTH"),
+        default=list(PSM_ABLATION_HIGH_CAPACITY_DECODER),
+        help=(
+            "Decoder size of the high-capacity arm of the PSM ablation, as "
+            "n_dec_layers dec_hidden_dim. The low-capacity arm always comes from "
+            f"{PSM_ABLATION_CONFIG_PATH.name}. Default: "
+            f"{' '.join(str(v) for v in PSM_ABLATION_HIGH_CAPACITY_DECODER)}."
+        ),
+    )
+    parser.add_argument(
+        "--sparsity-subsamples", type=float, nargs="+", default=list(SPARSITY_SUBSAMPLES),
+        metavar="FRACTION",
+        help=(
+            "Subsample levels to report in the QAD sparsity table, as fractions of the "
+            "original training data -- one column group each, in the order given. "
+            f"Default: {' '.join(f'{s:g}' for s in SPARSITY_SUBSAMPLES)} "
+            f"({', '.join(f'{s * 100:g}%%' for s in SPARSITY_SUBSAMPLES)}). "
+            "Pass e.g. `--sparsity-subsamples 0.01` for a 1%%-only table; levels that "
+            "aren't listed are filtered out at fetch time and never tabulated."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory to write the .tex files into.")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # A repeated level would produce two identically-labelled column groups, and
+    # one outside (0, 1] cannot match any run's `subsample`.
+    if len(set(args.sparsity_subsamples)) != len(args.sparsity_subsamples):
+        parser.error(f"--sparsity-subsamples has duplicate levels: {args.sparsity_subsamples}")
+    out_of_range = [s for s in args.sparsity_subsamples if not 0 < s <= 1]
+    if out_of_range:
+        parser.error(
+            f"--sparsity-subsamples takes fractions in (0, 1], got {out_of_range} "
+            "(1% is 0.01, not 1)"
+        )
+    return args
 
 
 RunEntry = tuple[pd.Timestamp, "int | None", dict[str, float]]
 # Most tables bucket runs by (benchmark, classifier); the sparsity table uses a
-# (subsample, classifier, interp_method) key instead. dedupe_by_seed treats the
-# key as opaque, so it works for either.
-RecordKey = TypeVar("RecordKey", bound=tuple)
+# (subsample, classifier, interp_method) key instead, and the PSM ablation a
+# plain row label. dedupe_by_seed treats the key as opaque, so it works for any
+# of them.
+RecordKey = TypeVar("RecordKey")
 
 
 def fetch_run_records(
@@ -492,7 +615,7 @@ SparsityKey = tuple[float, str, "str | None"]
 
 
 def fetch_sparsity_run_records(
-    project: str, entity: str | None
+    project: str, entity: str | None, subsamples: list[float] = SPARSITY_SUBSAMPLES
 ) -> dict[SparsityKey, list[RunEntry]]:
     """Fetch eval_sparsity_baselines.py runs, keyed by (subsample, clf, interp).
 
@@ -504,9 +627,11 @@ def fetch_sparsity_run_records(
     ``summary/macro/<benchmark>/<clf_name>/<metric>`` plays elsewhere.
 
     Only QAD runs at QAD_REQUIRED_DECIMATION are kept, matching the main QAD
-    table. Runs that are still in flight simply have no ``summary/...`` keys
+    table, and only at a subsample level in `subsamples` (the table's column
+    groups). Runs that are still in flight simply have no ``summary/...`` keys
     yet and drop out on their own.
     """
+    subsamples = list(subsamples)
     api = wandb.Api()
     path = f"{entity}/{project}" if entity else project
     runs = api.runs(path, order="-created_at")
@@ -524,7 +649,7 @@ def fetch_sparsity_run_records(
 
         interp = config.get("interp_method")
         subsample = task.get("subsample")
-        if interp not in SPARSITY_INTERP_METHODS or subsample not in SPARSITY_SUBSAMPLES:
+        if interp not in SPARSITY_INTERP_METHODS or subsample not in subsamples:
             continue
 
         created_at = pd.to_datetime(run.created_at, utc=True)
@@ -545,7 +670,7 @@ def fetch_sparsity_run_records(
 
 
 def fetch_ours_sparsity_run_records(
-    project: str, entity: str | None
+    project: str, entity: str | None, subsamples: list[float] = SPARSITY_SUBSAMPLES
 ) -> dict[SparsityKey, list[RunEntry]]:
     """Fetch our own LSD sparsity runs (eval_sparsity_data.py) for the sparsity table.
 
@@ -555,11 +680,12 @@ def fetch_ours_sparsity_run_records(
     ``args.fixed_subsample_mask`` set -- a mask drawn once at load time, which
     is what makes a run a sparsity experiment rather than a main-table one.
     The subsample level comes from ``args.subsample``; levels outside
-    SPARSITY_SUBSAMPLES (the table's column groups) are dropped.
+    `subsamples` (the table's column groups) are dropped.
 
     Keys use OURS_SPARSITY_INTERP for the interpolation slot: our model takes
     the subsampled series as-is, with no gap interpolation to vary.
     """
+    subsamples = list(subsamples)
     api = wandb.Api()
     path = f"{entity}/{project}" if entity else project
     runs = api.runs(path, order="-created_at")
@@ -591,7 +717,7 @@ def fetch_ours_sparsity_run_records(
         subsample = run_args.get("subsample")
         if not isinstance(subsample, (int, float)) or isinstance(subsample, bool):
             continue
-        if float(subsample) not in SPARSITY_SUBSAMPLES:
+        if float(subsample) not in subsamples:
             continue
 
         metrics = _extract_ad_summary_metrics(dict(run.summary))
@@ -632,7 +758,7 @@ def dedupe_by_seed(records: dict[RecordKey, list[RunEntry]]) -> dict[RecordKey, 
     created run. Entries without a resolvable seed are all kept (nothing to
     dedupe them against).
     """
-    deduped: dict[tuple[str, str], list[RunEntry]] = {}
+    deduped: dict[RecordKey, list[RunEntry]] = {}
     for key, entries in records.items():
         best_by_seed: dict[object, RunEntry] = {}
         unseeded: list[RunEntry] = []
@@ -687,6 +813,7 @@ def build_run_count_table(values: dict[tuple[str, str], dict[str, list[float]]])
 
 def _missing_sparsity_run_lines(
     sparsity_records: dict[SparsityKey, list[RunEntry]],
+    subsamples: list[float] = SPARSITY_SUBSAMPLES,
 ) -> list[str]:
     """Report lines for the QAD sparsity sweep's still-missing seeds.
 
@@ -701,7 +828,7 @@ def _missing_sparsity_run_lines(
     in build_sparsity_run_count_table cover those rows instead.
     """
     lines = []
-    for subsample in SPARSITY_SUBSAMPLES:
+    for subsample in subsamples:
         for group in sparsity_row_plan():
             for clf_name, interp, label in group:
                 entries = sparsity_records.get((subsample, clf_name, interp), [])
@@ -722,6 +849,7 @@ def report_missing_runs(
     records: dict[tuple[str, str], list[RunEntry]],
     benchmarks: list[str],
     sparsity_records: dict[SparsityKey, list[RunEntry]] | None = None,
+    sparsity_subsamples: list[float] = SPARSITY_SUBSAMPLES,
 ) -> None:
     """Print, for every (benchmark, classifier) pair, which of the 5 expected
     seeds (42-46) are still missing.
@@ -734,8 +862,9 @@ def report_missing_runs(
     this reports on every run W&B has, not just the ones a table will use.
 
     `sparsity_records` (same post-dedupe form, but keyed by
-    (subsample, classifier, interp)) appends the QAD sparsity sweep's 1% / 5%
-    configurations to the same list -- see _missing_sparsity_run_lines.
+    (subsample, classifier, interp)) appends the QAD sparsity sweep's
+    configurations, at the levels in `sparsity_subsamples`, to the same list --
+    see _missing_sparsity_run_lines.
     """
     missing_lines = []
     for benchmark in benchmarks:
@@ -754,7 +883,7 @@ def report_missing_runs(
                 )
 
     if sparsity_records is not None:
-        missing_lines += _missing_sparsity_run_lines(sparsity_records)
+        missing_lines += _missing_sparsity_run_lines(sparsity_records, sparsity_subsamples)
 
     print(f"\nRuns still left to do (expected seeds {EXPECTED_SEEDS[0]}-{EXPECTED_SEEDS[-1]}):")
     print("\n".join(missing_lines) if missing_lines else "  none -- all expected runs found.")
@@ -764,6 +893,14 @@ def report_missing_runs(
 # defined in the LaTeX preamble, e.g. \colorlet{first}{yellow!60}.
 RANK_COLORS = {1: "first", 2: "second", 3: "third"}
 
+# Filler for a (row, column) cell that has no runs behind it at all.
+# MISSING_CELL is the default everywhere; the two main baseline tables
+# (TABLE_GROUPS -- single-trace and multi-trace) use PENDING_CELL instead, to
+# read as "still running" rather than "not applicable". The clock glyph needs
+# \usepackage{fontawesome5} in the document preamble.
+MISSING_CELL = "--"
+PENDING_CELL = r"{\scriptsize\faClock[regular]}"
+
 
 def mean_std(vals: list[float]) -> tuple[float | None, float | None]:
     if not vals:
@@ -772,26 +909,32 @@ def mean_std(vals: list[float]) -> tuple[float | None, float | None]:
     return float(arr.mean()), float(arr.std(ddof=0))
 
 
-def format_cell(mean: float | None, std: float | None) -> str:
+def format_cell(mean: float | None, std: float | None, missing: str = MISSING_CELL) -> str:
     if mean is None:
-        return "--"
+        return missing
     return f"{mean:.2f} \\std{{{std:.2f}}}"
 
 
-def highlight_top3(mean_table: pd.DataFrame, text_table: pd.DataFrame) -> pd.DataFrame:
+def highlight_top3(mean_table: pd.DataFrame, text_table: pd.DataFrame, top_n: int = 3) -> pd.DataFrame:
     """In-place: wrap each populated cell in text_table for its column's top 3
     (by mean_table, higher = better; ties share a rank via "min" method) in
-    ``\\cellcolor{color}{...}``, everything else in bare ``{...}`` ("--"
-    placeholders stay unwrapped). Returns the computed per-column ranks.
+    ``\\cellcolor{color}{...}``, everything else in bare ``{...}``. Cells with
+    no runs stay unwrapped, whatever placeholder text they carry (see
+    MISSING_CELL / PENDING_CELL) -- emptiness is read off mean_table's NaNs,
+    not off the rendered string. Returns the computed per-column ranks.
+
+    `top_n` caps how many ranks get a colour (1 = winner only), for tables with
+    so few rows that colouring three of them says nothing; the returned ranks
+    are unaffected.
     """
     ranks = mean_table.rank(axis=0, method="min", ascending=False)
     for col in mean_table.columns:
         for idx in mean_table.index:
-            cell_text = text_table.loc[idx, col]
-            if cell_text == "--":
+            if pd.isna(mean_table.loc[idx, col]):
                 continue
+            cell_text = text_table.loc[idx, col]
             rank = ranks.loc[idx, col]
-            color = RANK_COLORS.get(rank) if pd.notna(rank) else None
+            color = RANK_COLORS.get(rank) if pd.notna(rank) and rank <= top_n else None
             if color is not None:
                 text_table.loc[idx, col] = f"\\cellcolor{{{color}}}{{{cell_text}}}"
             else:
@@ -826,8 +969,39 @@ def highlight_best_per_metric(
                     text_table.loc[idx, col] = f"{{{cell_text}}}"
 
 
+def rankbox_column(
+    avg_rank: pd.Series,
+    labels: list[str],
+    missing: str = MISSING_CELL,
+    top_n: int = len(RANK_COLORS),
+) -> pd.Series:
+    """Render an "Avg. Rank" column from per-row average ranks (lower = better).
+
+    Cells read ``\\rankbox{3.99}``, or ``\\rankbox[first|second|third]{1.20}``
+    for the `top_n` best average ranks (ties share a position via "min"); rows
+    with no rank at all get `missing`. Used by every table that carries a rank
+    column, so they all spell it the same way.
+    """
+    positions = avg_rank.rank(method="min", ascending=True)
+    texts = {}
+    for label in labels:
+        value = avg_rank.get(label)
+        if pd.isna(value):
+            texts[label] = missing
+            continue
+        position = positions.get(label)
+        color = RANK_COLORS.get(position) if pd.notna(position) and position <= top_n else None
+        if color is not None:
+            texts[label] = f"\\rankbox[{color}]{{{value:.2f}}}"
+        else:
+            texts[label] = f"\\rankbox{{{value:.2f}}}"
+    return pd.Series(texts)
+
+
 def build_latex_table(
-    values: dict[tuple[str, str], dict[str, list[float]]], benchmarks: list[str]
+    values: dict[tuple[str, str], dict[str, list[float]]],
+    benchmarks: list[str],
+    missing: str = MISSING_CELL,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return (formatted table, avg_rank series indexed by classifier name).
 
@@ -835,9 +1009,12 @@ def build_latex_table(
     (same numbers the table's "Avg. Rank" column renders) -- exposed so
     callers can combine it across multiple benchmark groups (see
     build_comparison_table).
+
+    `missing` is the text for every cell with no runs behind it, including the
+    "Avg. Rank" cell of a classifier that has no runs anywhere in this table.
     """
-    # Always list every known classifier (missing ones just show "--"), so the
-    # shallow/deep row grouping and its \midrule stay at a fixed position.
+    # Always list every known classifier (missing ones just show `missing`), so
+    # the shallow/deep row grouping and its \midrule stay at a fixed position.
     clf_names = sorted({clf for (_, clf) in values.keys()})
     ordered_clfs = CLASSIFIER_ORDER + sorted(set(clf_names) - set(CLASSIFIER_ORDER))
 
@@ -854,7 +1031,7 @@ def build_latex_table(
                 col = (benchmark, METRIC_LABELS[metric])
                 mean, std = mean_std(metric_values[metric])
                 mean_table.loc[clf_name, col] = mean
-                text_table.loc[clf_name, col] = format_cell(mean, std)
+                text_table.loc[clf_name, col] = format_cell(mean, std, missing)
 
     # Higher is always better for AUC/AUPRC/F1: highlight each column's top 3.
     ranks = highlight_top3(mean_table, text_table)
@@ -862,23 +1039,10 @@ def build_latex_table(
     # Mean average rank across this table's columns (lower = better), with
     # the best/2nd/3rd average rank highlighted the same way as the cells.
     avg_rank = ranks.mean(axis=1, skipna=True)
-    avg_rank_position = avg_rank.rank(method="min", ascending=True)
-    rank_texts = {}
-    for clf_name in ordered_clfs:
-        value = avg_rank.get(clf_name)
-        if pd.isna(value):
-            rank_texts[clf_name] = "--"
-            continue
-        position = avg_rank_position.get(clf_name)
-        color = RANK_COLORS.get(position) if pd.notna(position) else None
-        if color is not None:
-            rank_texts[clf_name] = f"\\rankbox[{color}]{{{value:.2f}}}"
-        else:
-            rank_texts[clf_name] = f"\\rankbox{{{value:.2f}}}"
 
     # Rank column first, then the method name (classifier is otherwise only
     # the DataFrame index, so surface it as an explicit leading column too).
-    text_table.insert(0, ("", "Avg. Rank"), pd.Series(rank_texts))
+    text_table.insert(0, ("", "Avg. Rank"), rankbox_column(avg_rank, ordered_clfs, missing))
     text_table.insert(1, ("", "Method"), pd.Series({c: display_label(c) for c in ordered_clfs}))
 
     # Sort rows ascending by average rank (lower = better) within each fixed
@@ -892,7 +1056,7 @@ def build_latex_table(
     row_groups = NAMED_CLASSIFIER_GROUPS + [extras]
     final_order = [clf for group in row_groups for clf in sorted(group, key=_sort_key)]
 
-    return text_table.loc[final_order].fillna("--"), avg_rank
+    return text_table.loc[final_order].fillna(missing), avg_rank
 
 
 # Benchmark header labels; benchmarks not listed here (SWaT, WaDi, PSM) are
@@ -953,7 +1117,7 @@ def to_latex(table: pd.DataFrame, benchmarks: list[str]) -> str:
     # (blank Rank/Model cells, \small\textbf benchmark names spanning 3 columns
     # each, partial \cmidrule under each) rather than derived from pandas'
     # MultiIndex column rendering, to match the exact requested layout.
-    column_format = "cl " + " ".join(["ccc"] * len(benchmarks))
+    column_format = "cl " + " ".join(["rrr"] * len(benchmarks))
     header = build_table_header(benchmarks)
     rows = render_data_rows(table)
     return (
@@ -995,7 +1159,7 @@ def build_appendix_qad_table(values: dict[tuple[str, str], dict[str, list[float]
 
 def to_appendix_qad_latex(table: pd.DataFrame) -> str:
     """Render the QAD decimation=1 appendix table: Model + AUC/AUPRC/F1, no rank column."""
-    column_format = "l ccc"
+    column_format = "l rrr"
     header = (
         f"& \\multicolumn{{3}}{{c}}{{\\small \\textbf{{{BENCHMARK_LABELS.get(QAD_BENCHMARK, QAD_BENCHMARK)}}}}} \\\\\n"
         f"\\cmidrule(lr){{2-4}}\n"
@@ -1053,7 +1217,7 @@ def to_ode_vs_lsd_latex(table: pd.DataFrame) -> str:
     A \\midrule separates the benchmark row groups (single-trace, multi-trace,
     QAD), mirroring how the per-group tables are split.
     """
-    column_format = "l " + " ".join(["ccc"] * len(ODE_VS_LSD_MODELS))
+    column_format = "l " + " ".join(["rrr"] * len(ODE_VS_LSD_MODELS))
     group_cells = " & ".join(
         f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{display_label(model)}}}}}" for model in ODE_VS_LSD_MODELS
     )
@@ -1095,17 +1259,37 @@ def sparsity_column_label(subsample: float) -> str:
     return f"{BENCHMARK_LABELS.get(QAD_BENCHMARK, QAD_BENCHMARK).split(' (')[0]} ({subsample * 100:g}\\%)"
 
 
+def sparsity_file_slug(subsample: float) -> str:
+    """Filename tag for a subsample level: 0.01 -> ``1pct``, 0.025 -> ``2p5pct``.
+
+    The decimal point becomes 'p' so the level survives as one path component
+    without a second '.' confusing anything that splits on extension.
+    """
+    return f"{subsample * 100:g}".replace(".", "p") + "pct"
+
+
 SparsityRow = tuple[str, "str | None", str]  # (clf_name, interp_method, label)
+
+
+def sparsity_interp_label(interp: str) -> str:
+    """Display spelling of an interpolation strategy: ``forward_fill`` -> ``forward fill``.
+
+    Keeps the raw W&B `interp_method` values out of the rendered tables, where a
+    bare underscore would break the LaTeX build (see SPARSITY_INTERP_LABELS).
+    """
+    return SPARSITY_INTERP_LABELS.get(interp, interp.replace("_", " "))
 
 
 def sparsity_row_label(clf_name: str, interp: "str | None") -> str:
     """Row label for a sparsity cell: ``COPOD (linear)``, or the bare model name
     for our LSD rows, which have no interpolation variant."""
     label = display_label(clf_name)
-    return f"{label} ({interp})" if interp else label
+    return f"{label} ({sparsity_interp_label(interp)})" if interp else label
 
 
-def sparsity_row_plan() -> list[list[SparsityRow]]:
+def sparsity_row_plan(
+    interp_methods: list[str] = SPARSITY_INTERP_METHODS,
+) -> list[list[SparsityRow]]:
     """Return the table's rows as ``(clf_name, interp, display label)``, grouped.
 
     One row per (classifier, interpolation method) pair -- "COPOD (linear)",
@@ -1113,39 +1297,59 @@ def sparsity_row_plan() -> list[list[SparsityRow]]:
     variants), which get a single row each (interp OURS_SPARSITY_INTERP), fed
     from the "ours" project's fixed-subsample-mask runs. The outer list is the
     \\midrule row grouping, mirroring SPARSITY_CLASSIFIER_GROUPS.
+
+    `interp_methods` restricts which baseline interpolation variants get a row:
+    the combined table keeps both (SPARSITY_INTERP_METHODS), the split per-level
+    tables only SPARSITY_SPLIT_INTERP_METHODS. Our own LSD rows are unaffected --
+    they have no interpolation variant to select.
     """
     plan: list[list[SparsityRow]] = []
     for group in SPARSITY_CLASSIFIER_GROUPS:
         rows: list[SparsityRow] = []
         for clf_name in group:
-            interps = [OURS_SPARSITY_INTERP] if clf_name in SPARSITY_OURS_ROWS else SPARSITY_INTERP_METHODS
+            interps = [OURS_SPARSITY_INTERP] if clf_name in SPARSITY_OURS_ROWS else interp_methods
             for interp in interps:
                 rows.append((clf_name, interp, sparsity_row_label(clf_name, interp)))
         plan.append(rows)
     return plan
 
 
-def build_sparsity_table(values: dict[SparsityKey, dict[str, list[float]]]) -> pd.DataFrame:
+def build_sparsity_table(
+    values: dict[SparsityKey, dict[str, list[float]]],
+    subsamples: list[float] = SPARSITY_SUBSAMPLES,
+    interp_methods: list[str] = SPARSITY_INTERP_METHODS,
+) -> pd.DataFrame:
     """QAD sparsity table: one column group per subsample level, rows per
     (classifier, interpolation) pair.
 
     Layout mirrors the main per-group tables -- leading "Avg. Rank" + "Model"
-    columns, AUC/AUPRC/F1 per group, top 3 highlighted per column -- but rows
-    keep sparsity_row_plan()'s fixed order rather than being sorted by rank,
-    so a classifier's linear/spline pair always stays adjacent.
+    columns, AUC/AUPRC/F1 per group, top 3 highlighted per column, and rows
+    sorted ascending by average rank within each of sparsity_row_plan()'s fixed
+    groups (so the shallow/deep/ours block membership never changes, only the
+    order inside it). A classifier's linear/spline rows are therefore no longer
+    guaranteed to be adjacent.
+
+    Sorting is per table and independent of every other table's: the ranks come
+    from this call's own columns, so a row's position in the combined table may
+    differ from its position in a single-level one.
+
+    `interp_methods` selects which baseline interpolation variants get a row
+    (see sparsity_row_plan); ranks and highlights are computed over the selected
+    rows only, so a linear-only table ranks the linear runs against each other.
     """
-    rows = [row for group in sparsity_row_plan() for row in group]
+    row_plan = sparsity_row_plan(interp_methods)
+    rows = [row for group in row_plan for row in group]
     labels = [label for _, _, label in rows]
 
     columns = pd.MultiIndex.from_product(
-        [[sparsity_column_label(s) for s in SPARSITY_SUBSAMPLES], [METRIC_LABELS[m] for m in METRICS]]
+        [[sparsity_column_label(s) for s in subsamples], [METRIC_LABELS[m] for m in METRICS]]
     )
     mean_table = pd.DataFrame(index=labels, columns=columns, dtype=float)
     text_table = pd.DataFrame(index=labels, columns=columns, dtype=object)
 
     empty = {m: [] for m in METRICS}
     for clf_name, interp, label in rows:
-        for subsample in SPARSITY_SUBSAMPLES:
+        for subsample in subsamples:
             metric_values = values.get((subsample, clf_name, interp), empty)
             for metric in METRICS:
                 col = (sparsity_column_label(subsample), METRIC_LABELS[metric])
@@ -1156,43 +1360,54 @@ def build_sparsity_table(values: dict[SparsityKey, dict[str, list[float]]]) -> p
     ranks = highlight_top3(mean_table, text_table)
 
     avg_rank = ranks.mean(axis=1, skipna=True)
-    avg_rank_position = avg_rank.rank(method="min", ascending=True)
-    rank_texts = {}
-    for label in labels:
-        value = avg_rank.get(label)
-        if pd.isna(value):
-            rank_texts[label] = "--"
-            continue
-        position = avg_rank_position.get(label)
-        color = RANK_COLORS.get(position) if pd.notna(position) else None
-        if color is not None:
-            rank_texts[label] = f"\\rankbox[{color}]{{{value:.2f}}}"
-        else:
-            rank_texts[label] = f"\\rankbox{{{value:.2f}}}"
 
-    text_table.insert(0, ("", "Avg. Rank"), pd.Series(rank_texts))
+    text_table.insert(0, ("", "Avg. Rank"), rankbox_column(avg_rank, labels))
     text_table.insert(1, ("", "Model"), pd.Series({label: label for label in labels}))
-    return text_table.fillna("--")
+
+    # Sort rows ascending by average rank (lower = better) within each fixed row
+    # group, as build_latex_table does; rows without any runs sort last. The
+    # group sizes are untouched, so to_sparsity_latex's \midrule positions
+    # (derived from the same row plan) stay correct.
+    def _sort_key(label: str) -> float:
+        value = avg_rank.get(label)
+        return value if pd.notna(value) else float("inf")
+
+    final_order = [
+        label
+        for group in row_plan
+        for label in sorted((lbl for _, _, lbl in group), key=_sort_key)
+    ]
+    return text_table.loc[final_order].fillna("--")
 
 
-def to_sparsity_latex(table: pd.DataFrame) -> str:
-    """Render the QAD sparsity table, with a \\midrule between row groups."""
-    column_format = "cl " + " ".join(["ccc"] * len(SPARSITY_SUBSAMPLES))
+def to_sparsity_latex(
+    table: pd.DataFrame,
+    subsamples: list[float] = SPARSITY_SUBSAMPLES,
+    interp_methods: list[str] = SPARSITY_INTERP_METHODS,
+) -> str:
+    """Render the QAD sparsity table, with a \\midrule between row groups.
+
+    `subsamples` must be the same list build_sparsity_table was given -- it
+    decides how many 3-column groups the header spans -- and `interp_methods`
+    the same selection, since the row-group boundaries depend on how many rows
+    each classifier contributes.
+    """
+    column_format = "cl " + " ".join(["rrr"] * len(subsamples))
     group_cells = " & ".join(
-        f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{sparsity_column_label(s)}}}}}" for s in SPARSITY_SUBSAMPLES
+        f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{sparsity_column_label(s)}}}}}" for s in subsamples
     )
     metric_cells = [r"\textbf{Rank}\big\downarrow", r"\textbf{Model}"]
-    for _ in SPARSITY_SUBSAMPLES:
+    for _ in subsamples:
         metric_cells += [r"\textbf{AUC} \big\uparrow", r"\textbf{AUPRC} \big\uparrow", r"\textbf{F1} \big\uparrow"]
     header = "\n".join([
         f"&& {group_cells} \\\\",
-        _cmidrule_spans(len(SPARSITY_SUBSAMPLES)),
+        _cmidrule_spans(len(subsamples)),
         " & ".join(metric_cells) + r" \\",
     ])
 
     boundaries = set()
     running_total = 0
-    for group in sparsity_row_plan()[:-1]:
+    for group in sparsity_row_plan(interp_methods)[:-1]:
         running_total += len(group)
         boundaries.add(running_total)
 
@@ -1214,7 +1429,10 @@ def to_sparsity_latex(table: pd.DataFrame) -> str:
     )
 
 
-def build_sparsity_run_count_table(values: dict[SparsityKey, dict[str, list[float]]]) -> pd.DataFrame:
+def build_sparsity_run_count_table(
+    values: dict[SparsityKey, dict[str, list[float]]],
+    subsamples: list[float] = SPARSITY_SUBSAMPLES,
+) -> pd.DataFrame:
     """Console-only: number of contributing runs per (clf, interp) x subsample.
 
     Every planned row is listed even when nothing was found for it (shown as
@@ -1230,9 +1448,292 @@ def build_sparsity_run_count_table(values: dict[SparsityKey, dict[str, list[floa
     expected = [label for group in sparsity_row_plan() for _, _, label in group]
     count_df = count_df.reindex(
         index=expected + sorted(set(count_df.index) - set(expected)),
-        columns=[sparsity_column_label(s) for s in SPARSITY_SUBSAMPLES],
+        columns=[sparsity_column_label(s) for s in subsamples],
     ).fillna(0).astype(int)
     count_df.index.name = "model (interp)"
+    return count_df
+
+
+# ---------------------------------------------------------------------------
+# PSM decoder-capacity ablation: LSD Rn/Sn at the config's decoder size vs. a
+# higher-capacity decoder, with the NeuralODE model as the third comparison.
+# ---------------------------------------------------------------------------
+# Row keys are opaque labels (not clf_names), so the generic helpers
+# (dedupe_by_seed, mean_std, highlight_top3) work unchanged.
+PsmAblationKey = str
+
+
+def load_psm_spec_decoder(config_path: Path = PSM_ABLATION_CONFIG_PATH) -> tuple[int, int]:
+    """(n_dec_layers, dec_hidden_dim) the PSM dataset config specifies."""
+    config = _load_json_config(config_path)
+    try:
+        return int(config["n_dec_layers"]), int(config["dec_hidden_dim"])
+    except (KeyError, TypeError, ValueError):
+        print(f"  (no decoder spec in {config_path}; assuming "
+              f"{PSM_ABLATION_SPEC_DECODER_FALLBACK[0]}x{PSM_ABLATION_SPEC_DECODER_FALLBACK[1]})")
+        return PSM_ABLATION_SPEC_DECODER_FALLBACK
+
+
+def _load_json_config(config_path: Path) -> dict:
+    """The dataset config as a dict, or {} if it can't be read."""
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _config_values_match(run_value, spec_value) -> bool:
+    """Compare one config entry, treating 1 and 1.0 (and True/1) as equal."""
+    if isinstance(run_value, bool) or isinstance(spec_value, bool):
+        return bool(run_value) == bool(spec_value)
+    if isinstance(run_value, (int, float)) and isinstance(spec_value, (int, float)):
+        return float(run_value) == float(spec_value)
+    return run_value == spec_value
+
+
+def matches_psm_spec(
+    run_args: dict, spec_config: dict, match_keys: list[str] = PSM_ABLATION_MATCH_KEYS
+) -> bool:
+    """Whether a run's args agree with the dataset config on `match_keys`.
+
+    Keys absent from either side are skipped, so a run that simply does not have
+    an option is judged only on the keys it actually has. The decoder keys are
+    excluded on purpose -- they are what the ablation varies -- and so is
+    batch_size, which differs per GPU without changing the model. The NeuralODE
+    reference isn't checked at all (fetch_psm_ablation_run_records is called
+    with dataset_only=True for it); see PSM_ABLATION_MATCH_KEYS for why.
+    """
+    for key in match_keys:
+        if key not in spec_config or key not in run_args:
+            continue
+        if not _config_values_match(run_args[key], spec_config[key]):
+            return False
+    return True
+
+
+def psm_ablation_row_label(model_label: str, decoder: "tuple[int, int] | None") -> str:
+    """``LSD on $\\mathbb{R}^n$ (ours), dec. $2\\times12$`` (or the bare model name)."""
+    if decoder is None:
+        return display_label(model_label)
+    layers, width = decoder
+    return f"{display_label(model_label)}, dec. ${layers}\\times{width}$"
+
+
+def psm_ablation_row_plan(
+    spec_decoder: tuple[int, int],
+    high_decoder: tuple[int, int] = PSM_ABLATION_HIGH_CAPACITY_DECODER,
+) -> list[list[tuple[str, "tuple[int, int] | None", str]]]:
+    """Rows as ``(model, decoder, label)``, grouped by \\midrule block.
+
+    Three blocks, in the order the ablation reads: our two variants at the
+    config's decoder size, the same two with the higher-capacity decoder, and
+    finally the NeuralODE reference (whose decoder is not varied).
+    """
+    return [
+        [(model, spec_decoder, psm_ablation_row_label(model, spec_decoder))
+         for model in (LSD_RN_LABEL, LSD_SN_LABEL)],
+        [(model, high_decoder, psm_ablation_row_label(model, high_decoder))
+         for model in (LSD_RN_LABEL, LSD_SN_LABEL)],
+        [(NEURALODE_CLASSIFIER, None, psm_ablation_row_label(NEURALODE_CLASSIFIER, None))],
+    ]
+
+
+def fetch_psm_ablation_run_records(
+    project: str,
+    entity: str | None,
+    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+    spec_config: dict,
+    model_label_fn,
+    match_keys: list[str] = PSM_ABLATION_MATCH_KEYS,
+    dataset_only: bool = False,
+) -> dict[PsmAblationKey, list[RunEntry]]:
+    """Fetch PSM runs for the ablation, bucketed by row label.
+
+    Like fetch_anomaly_detection_run_records, but the row a run belongs to also
+    depends on ``config.args`` (its decoder size), not just on run_context, and
+    runs whose remaining hyperparameters disagree with the dataset config are
+    dropped instead of silently averaged in (see matches_psm_spec).
+
+    `model_label_fn(run_context)` maps a run to its model label -- the constant
+    NeuralODE row for the ODE project, the Rn/Sn variant for ours. Rows whose
+    decoder is None (the NeuralODE reference) accept any decoder size.
+
+    `match_keys` are the config keys that gate a run. `dataset_only` drops every
+    filter except ``benchmark_name == PSM``: used for the NeuralODE project,
+    where all PSM runs are the reference by definition and none of the LSD
+    hyperparameters (or the decoder size) apply -- see
+    PSM_ABLATION_MATCH_KEYS's neighbouring comment.
+    """
+    api = wandb.Api()
+    path = f"{entity}/{project}" if entity else project
+    runs = api.runs(path, order="-created_at")
+
+    # (model, decoder) -> row label; decoder None means "any decoder".
+    row_lookup = {(model, decoder): label for group in row_plan for model, decoder, label in group}
+
+    records: dict[PsmAblationKey, list[RunEntry]] = defaultdict(list)
+
+    for run in runs:
+        config = run.config or {}
+        run_context = config.get("run_context", {}) or {}
+        run_args = config.get("args", {}) or {}
+
+        raw_benchmark = run_context.get("benchmark_name")
+        # As elsewhere, --trace-ids subsets ("PSM:ids") aren't full-benchmark runs.
+        if raw_benchmark != PSM_BENCHMARK:
+            continue
+
+        model_label = model_label_fn(run_context)
+        if not model_label:
+            continue
+
+        if dataset_only:
+            # Dataset is the only criterion; the row takes any decoder size.
+            label = row_lookup.get((model_label, None))
+        else:
+            # Sparsity-sweep runs train on a fixed subsampled mask; not this experiment.
+            if uses_fixed_subsample_mask(config):
+                continue
+            if not matches_psm_spec(run_args, spec_config, match_keys):
+                continue
+
+            decoder = (run_args.get("n_dec_layers"), run_args.get("dec_hidden_dim"))
+            try:
+                decoder = (int(decoder[0]), int(decoder[1]))
+            except (TypeError, ValueError):
+                decoder = None
+
+            label = row_lookup.get((model_label, decoder), row_lookup.get((model_label, None)))
+        if label is None:
+            continue  # a decoder size this table doesn't report on
+
+        metrics = _extract_ad_summary_metrics(dict(run.summary))
+        if not metrics:
+            continue  # still running, or failed before logging final metrics
+
+        created_at = pd.to_datetime(run.created_at, utc=True)
+        seed = run_context.get("run_seed")
+        records[label].append((created_at, seed, metrics))
+
+    return records
+
+
+def select_recent_runs_by_key(
+    records: dict[RecordKey, list[RunEntry]], limit: int
+) -> dict[RecordKey, dict[str, list[float]]]:
+    """Keep the `limit` most recent runs per key, as {key: {metric: [values]}}.
+
+    Key-agnostic counterpart of select_recent_runs / select_recent_sparsity_runs,
+    for tables with their own per-cell run budget (the PSM ablation has three
+    runs per configuration).
+    """
+    values: dict[RecordKey, dict[str, list[float]]] = {}
+    for key, entries in records.items():
+        most_recent = sorted(entries, key=lambda item: item[0], reverse=True)[:limit]
+        metric_values = {m: [] for m in METRICS}
+        for _, _, metrics in most_recent:
+            for metric, value in metrics.items():
+                metric_values[metric].append(value)
+        values[key] = metric_values
+    return values
+
+
+def build_psm_ablation_table(
+    values: dict[PsmAblationKey, dict[str, list[float]]],
+    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+) -> pd.DataFrame:
+    """PSM decoder-capacity ablation: one row per model/decoder configuration.
+
+    Leading "Avg. Rank" + "Model" columns then AUC/AUPRC/F1, as in the main
+    tables -- the rank is the mean of this table's own three per-column ranks
+    (lower = better), so it ranks the five configurations against each other
+    and nothing else. With only a handful of rows, the best two values per
+    column are highlighted rather than the top 3
+    (PSM_ABLATION_HIGHLIGHT_TOP_N), and the same cap applies to the rank
+    column.
+
+    Unlike the main tables, rows are *not* re-sorted by rank: the ablation
+    reads as default decoder -> high-capacity decoder -> NeuralODE reference,
+    which is row_plan's fixed order (see psm_ablation_row_plan).
+    """
+    labels = [label for group in row_plan for _, _, label in group]
+    columns = [METRIC_LABELS[m] for m in METRICS]
+    mean_table = pd.DataFrame(index=labels, columns=columns, dtype=float)
+    text_table = pd.DataFrame(index=labels, columns=columns, dtype=object)
+
+    empty = {m: [] for m in METRICS}
+    for label in labels:
+        metric_values = values.get(label, empty)
+        for metric in METRICS:
+            col = METRIC_LABELS[metric]
+            mean, std = mean_std(metric_values[metric])
+            mean_table.loc[label, col] = mean
+            text_table.loc[label, col] = format_cell(mean, std)
+
+    ranks = highlight_top3(mean_table, text_table, top_n=PSM_ABLATION_HIGHLIGHT_TOP_N)
+
+    avg_rank = ranks.mean(axis=1, skipna=True)
+    text_table.insert(
+        0, "Avg. Rank",
+        rankbox_column(avg_rank, labels, top_n=PSM_ABLATION_HIGHLIGHT_TOP_N),
+    )
+    text_table.insert(1, "Model", pd.Series({label: label for label in labels}))
+    return text_table.fillna(MISSING_CELL)
+
+
+def to_psm_ablation_latex(
+    table: pd.DataFrame,
+    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+) -> str:
+    """Render the PSM ablation table: Rank + Model + AUC/AUPRC/F1, \\midrule per block."""
+    header = (
+        f"&& \\multicolumn{{3}}{{c}}{{\\small \\textbf{{{BENCHMARK_LABELS.get(PSM_BENCHMARK, PSM_BENCHMARK)}}}}} \\\\\n"
+        f"{_cmidrule_spans(1)}\n"
+        f"\\textbf{{Rank}}\\big\\downarrow & \\textbf{{Model}} & \\textbf{{AUC}} \\big\\uparrow "
+        f"& \\textbf{{AUPRC}} \\big\\uparrow & \\textbf{{F1}} \\big\\uparrow \\\\"
+    )
+
+    boundaries = set()
+    running_total = 0
+    for group in row_plan[:-1]:
+        running_total += len(group)
+        boundaries.add(running_total)
+
+    lines = []
+    for i, row in enumerate(table.itertuples(index=False), start=1):
+        lines.append(" & ".join(str(value) for value in row) + r" \\")
+        if i in boundaries:
+            lines.append(r"\midrule")
+    rows = "\n".join(lines)
+
+    return (
+        f"\\begin{{tabular}}{{cl rrr}}\n"
+        f"\\toprule\n"
+        f"{header}\n"
+        f"\\midrule\n"
+        f"{rows}\n"
+        f"\\bottomrule\n"
+        f"\\end{{tabular}}"
+    )
+
+
+def build_psm_ablation_run_count_table(
+    values: dict[PsmAblationKey, dict[str, list[float]]],
+    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+) -> pd.DataFrame:
+    """Console-only: contributing runs per ablation row (0 when none were found)."""
+    counts = {}
+    for label, metric_values in values.items():
+        counts[label] = max((len(v) for v in metric_values.values()), default=0)
+
+    labels = [label for group in row_plan for _, _, label in group]
+    count_df = pd.DataFrame(
+        {"runs": [counts.get(label, 0) for label in labels]},
+        index=labels,
+    )
+    count_df.index.name = "configuration"
     return count_df
 
 
@@ -1330,8 +1831,12 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     avg_ranks_by_slug: dict[str, pd.Series] = {}
+    # The single-trace / multi-trace tables are still being filled in, so an
+    # empty cell there means "run pending" and gets the clock glyph; QAD's
+    # empty cells stay plain dashes.
     for slug, benchmarks in TABLE_GROUPS + [QAD_TABLE_GROUP]:
-        table, avg_rank = build_latex_table(values, benchmarks)
+        missing = PENDING_CELL if slug in {s for s, _ in TABLE_GROUPS} else MISSING_CELL
+        table, avg_rank = build_latex_table(values, benchmarks, missing)
         avg_ranks_by_slug[slug] = avg_rank
         latex = to_latex(table, benchmarks)
 
@@ -1379,9 +1884,11 @@ def main() -> None:
         # (subsample, classifier, interp) bucketing. Our LSD rows are the one
         # exception -- they come from the "ours" project, from precisely the
         # fixed-subsample-mask runs the tables above filter out.
-        raw_sparsity_records = fetch_sparsity_run_records(args.sparsity_project, args.sparsity_entity)
+        raw_sparsity_records = fetch_sparsity_run_records(
+            args.sparsity_project, args.sparsity_entity, args.sparsity_subsamples)
         if not args.skip_ours:
-            ours_sparsity_records = fetch_ours_sparsity_run_records(args.ours_project, args.ours_entity)
+            ours_sparsity_records = fetch_ours_sparsity_run_records(
+                args.ours_project, args.ours_entity, args.sparsity_subsamples)
             for key, entries in ours_sparsity_records.items():
                 raw_sparsity_records[key].extend(entries)
         sparsity_records = dedupe_by_seed(raw_sparsity_records)
@@ -1390,9 +1897,12 @@ def main() -> None:
 
             print(f"\nSparsity runs found per subsample/model configuration (most recent "
                   f"{DEFAULT_RUN_LIMIT} per cell):")
-            print(build_sparsity_run_count_table(sparsity_values).to_string())
+            print(build_sparsity_run_count_table(sparsity_values, args.sparsity_subsamples).to_string())
 
-            sparsity_latex = to_sparsity_latex(build_sparsity_table(sparsity_values))
+            sparsity_latex = to_sparsity_latex(
+                build_sparsity_table(sparsity_values, args.sparsity_subsamples),
+                args.sparsity_subsamples,
+            )
 
             print("\nLaTeX table (QAD sparsity sweep)")
             print(sparsity_latex)
@@ -1400,15 +1910,96 @@ def main() -> None:
             sparsity_out_path = args.output_dir / "baseline_table_QAD_sparsity.tex"
             sparsity_out_path.write_text(sparsity_latex)
             print(f"Saved to {sparsity_out_path}")
+
+            # One standalone table per subsample level, for papers that show the
+            # levels in separate floats instead of side by side. Each is built
+            # from its own single-element level list, so its "Avg. Rank" column
+            # ranks within that level only -- unlike the combined table above,
+            # which averages each row's ranks across every level's columns.
+            # These are also restricted to the baselines' linear interpolation
+            # (SPARSITY_SPLIT_INTERP_METHODS); the spline variant is reported by
+            # the combined table only.
+            for subsample in args.sparsity_subsamples:
+                single_latex = to_sparsity_latex(
+                    build_sparsity_table(
+                        sparsity_values, [subsample], SPARSITY_SPLIT_INTERP_METHODS
+                    ),
+                    [subsample],
+                    SPARSITY_SPLIT_INTERP_METHODS,
+                )
+
+                print(f"\nLaTeX table (QAD sparsity sweep, {subsample * 100:g}% only, "
+                      f"{'/'.join(SPARSITY_SPLIT_INTERP_METHODS)} interpolation)")
+                print(single_latex)
+
+                single_out_path = (
+                    args.output_dir / f"baseline_table_QAD_sparsity_{sparsity_file_slug(subsample)}.tex"
+                )
+                single_out_path.write_text(single_latex)
+                print(f"Saved to {single_out_path}")
         else:
             print(f"\nNo usable sparsity runs found in project '{args.sparsity_project}' "
                   f"(entity={args.sparsity_entity}), nor any fixed-subsample-mask QAD runs in "
                   f"'{args.ours_project}'; skipping the sparsity table.")
 
+    if not args.skip_psm_ablation:
+        # Its own bucketing again: PSM only, keyed by (model, decoder size), and
+        # restricted to runs whose remaining hyperparameters match the dataset
+        # config. Both projects contribute -- the NeuralODE reference from the
+        # ODE project, our Rn/Sn arms from the "ours" one.
+        spec_config = _load_json_config(PSM_ABLATION_CONFIG_PATH)
+        spec_decoder = load_psm_spec_decoder(PSM_ABLATION_CONFIG_PATH)
+        high_layers, high_width = (int(v) for v in args.psm_high_capacity_decoder)
+        high_decoder = (high_layers, high_width)
+        psm_row_plan = psm_ablation_row_plan(spec_decoder, high_decoder)
+
+        psm_records: dict[str, list[RunEntry]] = defaultdict(list)
+        if not args.skip_ours:
+            ours_psm = fetch_psm_ablation_run_records(
+                args.ours_project, args.ours_entity, psm_row_plan, spec_config,
+                model_label_fn=lambda rc: OURS_VARIANT_LABELS.get(rc.get("model_variant")),
+            )
+            for key, entries in ours_psm.items():
+                psm_records[key].extend(entries)
+        if not args.skip_neuralode:
+            # Filtered by dataset alone: every PSM run in the ODE project is the
+            # NeuralODE reference, and it brings its own tuned hyperparameters
+            # (see the comment above PSM_ABLATION_MATCH_KEYS).
+            ode_psm = fetch_psm_ablation_run_records(
+                args.ode_project, args.ode_entity, psm_row_plan, spec_config,
+                model_label_fn=lambda rc: NEURALODE_CLASSIFIER,
+                dataset_only=True,
+            )
+            for key, entries in ode_psm.items():
+                psm_records[key].extend(entries)
+
+        psm_values = select_recent_runs_by_key(dedupe_by_seed(psm_records), PSM_ABLATION_RUN_LIMIT)
+
+        print(f"\nPSM ablation runs found per configuration (decoder spec "
+              f"{spec_decoder[0]}x{spec_decoder[1]} from {PSM_ABLATION_CONFIG_PATH.name}, "
+              f"high capacity {high_decoder[0]}x{high_decoder[1]}, most recent "
+              f"{PSM_ABLATION_RUN_LIMIT} per cell; the {NEURALODE_CLASSIFIER} row takes "
+              f"every {PSM_BENCHMARK} run of '{args.ode_project}' unfiltered):")
+        print(build_psm_ablation_run_count_table(psm_values, psm_row_plan).to_string())
+
+        psm_latex = to_psm_ablation_latex(
+            build_psm_ablation_table(psm_values, psm_row_plan), psm_row_plan
+        )
+
+        print("\nLaTeX table (PSM decoder-capacity ablation)")
+        print(psm_latex)
+
+        psm_out_path = args.output_dir / "baseline_table_PSM_decoder_ablation.tex"
+        psm_out_path.write_text(psm_latex)
+        print(f"Saved to {psm_out_path}")
+
     all_benchmarks = [b for _, benchmarks in TABLE_GROUPS for b in benchmarks] + [
         QAD_BENCHMARK, QAD_DECIMATION1_BENCHMARK
     ]
-    report_missing_runs(records, all_benchmarks, sparsity_records=sparsity_records)
+    report_missing_runs(
+        records, all_benchmarks, sparsity_records=sparsity_records,
+        sparsity_subsamples=args.sparsity_subsamples,
+    )
 
 
 if __name__ == "__main__":
