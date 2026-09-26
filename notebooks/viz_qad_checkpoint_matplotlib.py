@@ -522,18 +522,18 @@ def _plot_latent_sphere_dashboard_matplotlib(
         z = np.cos(v)
         ax3d.plot_wireframe(x, y, z, color='0.75', alpha=0.4, linewidth=0.5)
 
-    for w in range(n_windows):
+    for w in range(0, (n_windows), 10):
         color = uniform_color if use_uniform_color else _window_index_color(w, n_windows)
         timeline_color = _window_index_color(w, n_windows)
         path_color = timeline_color if color_mode == "timeline" else color
         if force_black_paths:
-            path_color = (0.74, 0.74, 0.74, 1)
+            path_color = (0.43, 0.53, 0.93, 1)
 
         # Mean path overlay: emphasized trajectory on top of the shadow.
-        for s in range(n_samples):
-            xs = latents[w, s, :, 0]
-            ys = latents[w, s, :, 1]
-            zs = latents[w, s, :, 2]
+        for s in range(0, n_samples):
+            xs = latents[w, s, ::20, 0]
+            ys = latents[w, s, ::20, 1]
+            zs = latents[w, s, ::20, 2]
 
             if force_black_paths or color_mode == "timeline" or labels is None:
                 _plot_arrow_path(
@@ -543,7 +543,7 @@ def _plot_latent_sphere_dashboard_matplotlib(
                     zs,
                     color=path_color,
                     alpha=mean_alpha,
-                    linewidth=1.6,
+                    linewidth=0.8,
                     arrow_length_ratio=0.08,
                 )
             else:
@@ -563,14 +563,14 @@ def _plot_latent_sphere_dashboard_matplotlib(
     # Mark the global start of the first window and the end of the full sequence.
     start_xyz = latents[0, 0, 0, :3]
     end_xyz = latents[-1, 0, -1, :3]
-    ax3d.scatter(
-        start_xyz[0], start_xyz[1], start_xyz[2],
-        color="0.18", edgecolor="white", linewidth=0.4, marker="o", s=28, alpha=0.95
-    )
-    ax3d.scatter(
-        end_xyz[0], end_xyz[1], end_xyz[2],
-        color="0.08", edgecolor="white", linewidth=0.4, marker="X", s=38, alpha=0.95
-    )
+    #ax3d.scatter(
+    #    start_xyz[0], start_xyz[1], start_xyz[2],
+    #    color="0.18", edgecolor="white", linewidth=0.4, marker="o", s=28, alpha=0.95
+    #)
+    #ax3d.scatter(
+    #    end_xyz[0], end_xyz[1], end_xyz[2],
+    #    color="0.08", edgecolor="white", linewidth=0.4, marker="X", s=38, alpha=0.95
+    #)
 
     if latent_geometry == "sphere":
         ax3d.set_xlim(-1, 1)
@@ -754,7 +754,7 @@ def main() -> None:
             out_path=motiv_fig_path,
         )
         logging.info("Saved motivational-style test figure to %s", motiv_fig_path)
-        import sys; sys.exit(1)
+
         def _render_latent_sphere(
             ds,
             sphere_indices,
@@ -861,6 +861,8 @@ def main() -> None:
             latent_geometry=args.latent_geometry,
             force_black_paths=args.pdf,
         )
+        import sys;
+        sys.exit(1)
         sphere_trn_indices = range(len(trn_ds))
         _render_latent_sphere(
             ds=trn_ds,

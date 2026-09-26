@@ -26,7 +26,6 @@
   "sphere_embedding": true,
   "normalize_score": false,
   "data_normalization_strategy": "min-max",
-  "score_aggregation": "max",
   "lr": 1e-3,
   "kl0_weight": 0.001,
   "klp_weight": 0.001,

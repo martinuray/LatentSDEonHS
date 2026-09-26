@@ -31,7 +31,6 @@
   "subsample": 0.1,
   "normalize_score": true,
   "data_normalization_strategy": "min-max",
-  "score_aggregation": "max",
   "dec_hidden_dim": 24,
   "n_dec_layers": 2,
   "early_stopping_min_delta": 0.0,
