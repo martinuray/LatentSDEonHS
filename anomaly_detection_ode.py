@@ -100,6 +100,38 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
     group.add_argument("--subsample", type=float, default=0.5)
     group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=False)
+    group.add_argument(
+        "--score-aggregation",
+        choices=["l2", "max", "weighted-mse", "weighted-mse-exp"],
+        default="max",
+        help=(
+            "Strategy used to aggregate per-feature anomaly scores into a single "
+            "per-timepoint score (see anomaly_detection.eval_scores). 'max' "
+            "(default) keeps the historical ODE behaviour; 'weighted-mse'/"
+            "'weighted-mse-exp' weight each feature by the (exponentiated) "
+            "inverse of its training reconstruction MSE."
+        ),
+    )
+    group.add_argument(
+        "--score-smoothing-window",
+        type=int,
+        default=5,
+        help=(
+            "Half-width (in time steps) of the moving average applied to the "
+            "per-feature anomaly scores before aggregation/thresholding. "
+            "0 disables smoothing. Default 5 keeps the historical behaviour."
+        ),
+    )
+    group.add_argument(
+        "--data-decimation-factor",
+        type=int,
+        default=1,
+        help=(
+            "Keep every n-th raw sample before windowing (temporal decimation). "
+            "Currently honoured by the QAD provider only (100 Hz raw; 10 -> 10 Hz, "
+            "matching the baselines). Labels are decimated identically."
+        ),
+    )
     group.add_argument("--data-normalization-strategy", choices=["none", "std", "min-max"], default="min-max")
     group.add_argument("--dec-hidden-dim", type=int, default=11)
     group.add_argument("--n-dec-layers", type=int, default=2)
@@ -389,6 +421,56 @@ def calculate_z_normalization_values_ode(args, dl, modules, desired_t, device):
     return stats
 
 
+def calculate_feature_reconstruction_weights_ode(
+    args, dl, modules, desired_t, device, epsilon=1e-6, weighting="inverse"
+):
+    """Per-feature soft-voting weights from training reconstruction error.
+
+    Mirrors anomaly_detection.calculate_feature_reconstruction_weights, but
+    obtains the reconstruction mean from the latent-ODE rollout instead of the
+    path-distribution decoder. See that docstring for the rationale and the
+    meaning of `weighting`.
+    """
+    modules.eval()
+    se_sum = None
+    se_count = None
+
+    with torch.no_grad():
+        for _, batch in enumerate(dl):
+            parts = {key: val.to(device) for key, val in batch.items()}
+            inp = (parts["inp_obs"], parts["inp_msk"], parts["inp_tps"])
+
+            _, _, pxz = latent_ode_rollout(args, modules, inp, desired_t, args.mc_eval_samples)
+
+            # average the reconstruction mean over MC samples -> [batch, time, feature]
+            mu = pxz.loc.mean(dim=0)
+            evd_obs = parts["evd_obs"]
+            evd_msk = parts["evd_msk"].to(mu.dtype)
+
+            squared_error = (mu - evd_obs).square() * evd_msk
+
+            batch_se_sum = squared_error.sum(dim=(0, 1))
+            batch_se_count = evd_msk.sum(dim=(0, 1))
+
+            se_sum = batch_se_sum if se_sum is None else se_sum + batch_se_sum
+            se_count = batch_se_count if se_count is None else se_count + batch_se_count
+
+    feature_mse = (se_sum / se_count.clamp_min(1.0)).detach().cpu().numpy()
+
+    inverse_mse = 1.0 / (feature_mse + epsilon)
+    if weighting == "exp-inverse":
+        # Shift by the max before exponentiating (softmax(z) == softmax(z - max(z)))
+        # so well-reconstructed features cannot overflow float64.
+        raw_weights = np.exp(inverse_mse - inverse_mse.max())
+    elif weighting == "inverse":
+        raw_weights = inverse_mse
+    else:
+        raise ValueError(f"Unknown weighting '{weighting}'. Expected 'inverse' or 'exp-inverse'.")
+    feature_weights = raw_weights / raw_weights.sum()
+
+    return {"feature_mse": feature_mse, "feature_weights": feature_weights}
+
+
 def evaluate_ode(
     args,
     dl: torch.utils.data.DataLoader,
@@ -399,6 +481,7 @@ def evaluate_ode(
     normalization_stats=None,
     epoch: int = 1,
     test=True,
+    feature_weights=None,
 ):
     stats = defaultdict(list)
 
@@ -465,7 +548,11 @@ def evaluate_ode(
     )
 
     if test:
-        best_metrics = ad.eval_scores(all_scores, all_labels, window_length=args.data_window_length)
+        best_metrics = ad.eval_scores(
+            all_scores, all_labels, window_length=args.data_window_length,
+            aggregation_strategy=args.score_aggregation, feature_weights=feature_weights,
+            smoothing_window=args.score_smoothing_window,
+        )
         for key, value in best_metrics.items():
             stats[key.lower()] = value
 
@@ -515,9 +602,17 @@ def train_one_dataset(
             normalization_scores = calculate_z_normalization_values_ode(
                 args, dl_trn, modules, desired_t, args.device)
 
+        feature_weights = None
+        if args.score_aggregation in ("weighted-mse", "weighted-mse-exp"):
+            weighting = "exp-inverse" if args.score_aggregation == "weighted-mse-exp" else "inverse"
+            weight_stats = calculate_feature_reconstruction_weights_ode(
+                args, dl_trn, modules, desired_t, args.device, weighting=weighting)
+            feature_weights = weight_stats["feature_weights"]
+
         tst_stats = evaluate_ode(
             args, dl_tst, modules, elbo_loss, desired_t, args.device,
-            normalization_stats=normalization_scores, epoch=epoch
+            normalization_stats=normalization_scores, epoch=epoch,
+            feature_weights=feature_weights
         )
 
         val_stats = evaluate_ode(
@@ -663,10 +758,13 @@ def start_experiment(args, provider=None, store_final_metrics=True, run_number: 
                 data_dir=data_dir,
                 dataset_number=dataset_number,
                 window_length=args.data_window_length,
+                window_overlap=args.data_window_overlap,
                 seed=args.seed,
                 subsample=args.subsample,
                 fixed_subsample_mask=args.fixed_subsample_mask,
-                data_normalization_strategy=args.data_normalization_strategy            )
+                data_normalization_strategy=args.data_normalization_strategy,
+                decimation_factor=args.data_decimation_factor,
+            )
         elif args.dataset == 'TSB-AD-M':
             dataset_number = None
             if args.trace_ids is not None:

@@ -17,12 +17,16 @@
 # baselines/wandb_results_to_latex.py picks up our LSD sparsity runs -- and
 # from logs/final_metrics.csv.
 #
-# NOTE (QAD): anomaly_detection_ode.py has no --data-decimation-factor flag and
-# cfg/anomaly_detection_ode/ does not exist, so these runs use the parser
-# defaults: raw 100 Hz with 100-step non-overlapping windows. The LSD sparsity
-# runs use cfg/anomaly_detection/QAD.json (decimation 10, window 200,
-# overlap 0.9), so the two are not sample-rate-aligned. Put any settings needed
-# to align them in EXTRA_FLAGS once the ODE side supports them.
+# NOTE (QAD): anomaly_detection_ode.py now supports --data-decimation-factor,
+# --score-aggregation and --score-smoothing-window, but unless
+# cfg/anomaly_detection_ode/<DATASET>.json exists these runs still fall back to
+# the parser defaults: raw 100 Hz with 100-step non-overlapping windows. The LSD
+# sparsity runs use cfg/anomaly_detection/QAD.json (decimation 10, window 200,
+# overlap 0.9, weighted-mse aggregation, no score smoothing), so align the two
+# either via that config file or via EXTRA_FLAGS, e.g.
+#   EXTRA_FLAGS="--data-decimation-factor 10 --data-window-length 200 \
+#     --data-window-overlap 0.9 --normalize-score \
+#     --score-aggregation weighted-mse --score-smoothing-window 0"
 #
 # Usage:
 #   ./scripts/slurm/submit_eval_sparsity_ode.sh [DATASET]
