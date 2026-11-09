@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # SLURM configuration
-PARTITION="rtx2080ti,a6000"
+PARTITION="rtx2080ti"
 TIMEOUT="48:00:00"
 NUM_GPUS=1
 NUM_CPUS=8
@@ -20,7 +20,7 @@ JOB_NAME_PREFIX="ablation"
 # Experiment configuration
 DATASET="PSM"
 RUNS=1
-SEEDS=(41 42 43 44 45)
+SEEDS=(41 42 43)
 LOG_DIR="slurm_logs_ablation"
 
 # NOTE:
