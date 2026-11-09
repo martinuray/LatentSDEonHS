@@ -101,12 +101,13 @@ def extend_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--normalize-score", action=argparse.BooleanOptionalAction, default=True)
     group.add_argument(
         "--score-aggregation",
-        choices=["max", "weighted-mse", "weighted-mse-exp"],
-        default="max",
+        choices=["l2", "max", "weighted-mse", "weighted-mse-exp"],
+        default="l2",
         help=(
             "Strategy used to aggregate per-feature anomaly scores into a single "
-            "per-timepoint score. 'max': take the per-timepoint max across features "
-            "(default). 'weighted-mse': soft-voting ensemble that sums per-feature "
+            "per-timepoint score. 'l2': calculates the l2 norm across features "
+            "(default). 'max': take the per-timepoint max across features."
+            "'weighted-mse': soft-voting ensemble that sums per-feature"
             "scores weighted by the inverse of each feature's reconstruction MSE "
             "observed during training (features the model reconstructs more "
             "faithfully on nominal training data contribute proportionally more). "

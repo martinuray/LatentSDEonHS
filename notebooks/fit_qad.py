@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
              "and a contiguous block containing the labeled anomalous segment for test.",
     )
     recon.add_argument(
-        "--reconstruct-mc-samples", type=int, default=100,
+        "--reconstruct-mc-samples", type=int, default=5,
         help="Number of MC samples drawn when decoding the reconstruction; each is plotted "
              "as its own low-alpha trace (see notebooks/analyze_irregular_sine_exp.ipynb).",
     )
