@@ -81,7 +81,7 @@ for seed in "${SEEDS[@]}"; do
   # 2) Rn
   submit_variant_for_seed "Rn" "rtx2080ti" "--no-sphere-embedding" "${seed}"
 
-  # 3) Sn/Rn without SDE (placeholder flags: update RN_NO_SDE_EXTRA_FLAGS when available)
+  # 3) Sn/Rn without SDE
   submit_variant_for_seed "SnNoSDE" "a6000" "--sphere-embedding ${RN_NO_SDE_EXTRA_FLAGS}" "${seed}"
   submit_variant_for_seed "RnNoSDE" "a6000" "--no-sphere-embedding ${RN_NO_SDE_EXTRA_FLAGS}" "${seed}"
 

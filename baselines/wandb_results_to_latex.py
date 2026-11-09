@@ -43,10 +43,11 @@ restricted to a subset of traces via --trace-ids (benchmark_name containing
 ":") are excluded -- only full-benchmark runs, whose logged metrics are
 already the mean over every trace, are used. Runs with
 `args.fixed_subsample_mask` set are excluded as well: those belong to the QAD
-sparsity sweep (eval_sparsity_data.py forces that flag on) and are a different
-experiment, reported only in the sparsity table below. The same filter is
-applied to the NeuralODE project, so both sides of every comparison are
-restricted to the resampled-mask setting.
+sparsity sweep (eval_sparsity_data.py forces that flag on, and
+scripts/slurm/submit_eval_sparsity_ode.sh passes --fixed-subsample-mask) and
+are a different experiment, reported only in the sparsity table below. The same
+filter is applied to the NeuralODE project, so both sides of every comparison
+are restricted to the resampled-mask setting.
 
 Cells are rendered as ``mean \std{std}`` (the ``\std`` macro must be defined
 in the LaTeX preamble, e.g. ``\newcommand{\std}[1]{$\pm$#1}``). Within each
@@ -86,12 +87,19 @@ group is one subsample level (by default 1% and 5% of the original training
 data kept -- see --sparsity-subsamples) and
 each row is one (classifier, interpolation method) pair -- "COPOD (linear)",
 "COPOD (spline)", ... -- since every classifier was run under both a linear
-and a spline interpolation of the burst-masked gaps. Our two LSD rows come
-from the "ours" project instead (eval_sparsity_data.py logs there), and are
-taken from exactly the runs the other tables exclude: QAD runs with
-`args.fixed_subsample_mask` set and `args.subsample` at one of the sweep's
-levels. They carry no interpolation variant -- the model consumes the sparse
+and a spline interpolation of the burst-masked gaps. The NeuralODE row and our
+two LSD rows come from the two model projects instead (eval_sparsity_data.py
+logs ours there; scripts/slurm/submit_eval_sparsity_ode.sh submits the ODE
+side), and are taken from exactly the runs the other tables exclude: QAD runs
+with `args.fixed_subsample_mask` set and `args.subsample` at one of the sweep's
+levels. They carry no interpolation variant -- these models consume the sparse
 series directly -- so they get one row each.
+
+One caveat on the NeuralODE row: every other row is pinned to
+QAD_REQUIRED_DECIMATION, but anomaly_detection_ode.py has no
+--data-decimation-factor flag and never logs the key, so its runs are accepted
+without that check and in practice train on the raw 100 Hz series (see
+fetch_ad_sparsity_run_records).
 
 That sparsity table is written both combined (all selected levels side by side,
 ``baseline_table_QAD_sparsity.tex``) and split into one standalone table per
@@ -99,29 +107,34 @@ level (``baseline_table_QAD_sparsity_1pct.tex``, ``..._5pct.tex``, ...), for
 papers that want the levels in separate floats. The two differ in more than the
 column groups: the combined table shows both interpolation variants of every
 baseline, while the split per-level tables are restricted to the linear one
-(SPARSITY_SPLIT_INTERP_METHODS) to stay compact -- our LSD rows, which have no
-interpolation variant, appear in both. The split tables also rank rows within
+(SPARSITY_SPLIT_INTERP_METHODS) to stay compact -- the NeuralODE and LSD rows,
+which have no interpolation variant, appear in both. The split tables also rank rows within
 their own level (and among the shown rows only), whereas the combined one ranks
 across all levels and both variants, so a row's "Avg. Rank" legitimately differs
 between the two.
 
-A ninth table is a PSM-only ablation over decoder capacity
-(``baseline_table_PSM_decoder_ablation.tex``). It has one row per model
-configuration -- our Rn/Sn variants with the decoder the dataset config
-specifies (``cfg/anomaly_detection/PSM.json``: ``n_dec_layers`` x
-``dec_hidden_dim``), then the same two with the higher-capacity decoder (more
-layers, more units -- see ``--psm-high-capacity-decoder``), and the NeuralODE
-reference last. Of our own runs, only those whose remaining
+A ninth table is a PSM-only ablation (``baseline_table_PSM_decoder_ablation.tex``)
+over the model variants ``scripts/slurm/submit_ablation.sh`` submits. It has one
+row per model configuration -- our Rn/Sn variants with the decoder the dataset
+config specifies (``cfg/anomaly_detection/PSM.json``: ``n_dec_layers`` x
+``dec_hidden_dim``), the same two with the SDE dynamics replaced by their ODE
+limit (``--no-sde``, i.e. the drift without the Brownian term -- rendered
+"w/o SDE"), then the same two with the higher-capacity decoder (more layers,
+more units -- see ``--psm-high-capacity-decoder``), and the NeuralODE
+reference last. Rows are therefore keyed by (model variant, decoder size, SDE
+on/off): a ``--no-sde`` run never lands in the same cell as its SDE
+counterpart, even though both share ``run_context.model_variant``. Of our own
+runs, only those whose remaining
 hyperparameters agree with that config are used (see matches_psm_spec;
 batch_size is deliberately not compared); the NeuralODE reference, by contrast,
 is filtered by dataset alone -- every PSM run of the ODE project counts, since
 anomaly_detection_ode.py is tuned separately and shares none of the LSD
 hyperparameters. Three runs per configuration, and unlike the other tables
 only the best two values per column are highlighted
-(PSM_ABLATION_HIGHLIGHT_TOP_N), since with five rows a top-3 highlight would
-colour most of them. It carries the same "Avg. Rank" column as the main
-tables, computed over its own three columns, but keeps its fixed row order
-instead of sorting by it.
+(PSM_ABLATION_HIGHLIGHT_TOP_N), since every row is a variant of the same model
+and a top-3 highlight would colour most of them. It carries the same
+"Avg. Rank" column as the main tables, computed over its own three columns, but
+keeps its fixed row order instead of sorting by it.
 
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
@@ -250,30 +263,45 @@ SPARSITY_INTERP_LABELS = {"forward_fill": "forward fill"}
 # interpolation is the baselines' default gap filling, and the spline variant is
 # left to the combined table.
 SPARSITY_SPLIT_INTERP_METHODS = ["linear"]
-# Row groups, mirroring the main tables' shallow / deep / ours split. This is a
-# deliberate subset of CLASSIFIER_ORDER -- only these were run under sparsity.
+# Row groups, mirroring the main tables' shallow / deep / NeuralODE / ours
+# split. This is a deliberate subset of CLASSIFIER_ORDER -- only these were run
+# under sparsity.
 SPARSITY_GROUP_SHALLOW = ["COPOD", "IForest", "KNN", "LOF", "OCSVM", "PCA"]
 SPARSITY_GROUP_DEEP = ["DeepIF", "USAD", "DeepSVDD"]
+SPARSITY_GROUP_NEURALODE = [NEURALODE_CLASSIFIER]
 SPARSITY_GROUP_OURS = [LSD_SN_LABEL, LSD_RN_LABEL]
-SPARSITY_CLASSIFIER_GROUPS = [SPARSITY_GROUP_SHALLOW, SPARSITY_GROUP_DEEP, SPARSITY_GROUP_OURS]
+SPARSITY_CLASSIFIER_GROUPS = [
+    SPARSITY_GROUP_SHALLOW, SPARSITY_GROUP_DEEP, SPARSITY_GROUP_NEURALODE, SPARSITY_GROUP_OURS
+]
 # Our own LSD sparsity runs come from the "ours" project (eval_sparsity_data.py)
 # and have no interpolation variant -- the model handles the sparse series
 # natively -- so their rows use this sentinel as the interp part of the key.
 SPARSITY_OURS_ROWS = set(SPARSITY_GROUP_OURS)
 OURS_SPARSITY_INTERP = None
+# Rows fed from the anomaly_detection*.py projects rather than the baselines'
+# sparsity sweep: both the NeuralODE model and ours consume the subsampled
+# series directly, with no gap interpolation to vary, so each gets a single row
+# keyed on OURS_SPARSITY_INTERP instead of one row per interpolation strategy.
+SPARSITY_NO_INTERP_ROWS = SPARSITY_OURS_ROWS | set(SPARSITY_GROUP_NEURALODE)
 # Unlike the main tables, DETERMINISTIC_CLASSIFIERS does *not* apply here: the
 # burst mask is drawn from the run seed, so even COPOD/KNN/LOF/OCSVM vary
 # across seeds and all DEFAULT_RUN_LIMIT runs carry information.
 
 # ---------------------------------------------------------------------------
-# PSM decoder-capacity ablation (see build_psm_ablation_table).
+# PSM ablation over the variants scripts/slurm/submit_ablation.sh submits
+# (see build_psm_ablation_table).
 # ---------------------------------------------------------------------------
 PSM_BENCHMARK = "PSM"
 # Three runs (seeds) per configuration, unlike the main tables' five.
 PSM_ABLATION_RUN_LIMIT = 3
-# How many ranks per column get a colour. Lower than the other tables' 3: with
-# five rows, colouring three of them would leave almost nothing uncoloured.
+# How many ranks per column get a colour. Lower than the other tables' 3: every
+# row here is a variant of the same model, so colouring three of them would
+# leave almost nothing uncoloured.
 PSM_ABLATION_HIGHLIGHT_TOP_N = 2
+# Row-label suffix for the --no-sde arm (ODE dynamics: the learned drift without
+# the Brownian term). anomaly_detection.py's `--sde` defaults to True, so runs
+# predating the flag count as the SDE arm (see psm_ablation_run_uses_sde).
+PSM_ABLATION_NO_SDE_SUFFIX = "w/o SDE"
 # The "specification" the default-capacity runs must match: the dataset config
 # anomaly_detection.py is launched with. Its dec_hidden_dim / n_dec_layers
 # define the reference decoder; PSM_ABLATION_HIGH_CAPACITY_DECODER is the
@@ -285,7 +313,8 @@ PSM_ABLATION_HIGH_CAPACITY_DECODER = (4, 128)
 # Config keys a run must share with the JSON config to count as "meeting the
 # specification". Deliberately *not* included: batch_size (an optimization
 # detail that varies with the GPU a run landed on, and does not change the
-# model), and the decoder keys themselves, which are what the ablation varies.
+# model), and the keys the ablation varies -- the decoder size and `sde`, which
+# select the row a run goes into rather than whether it is used at all.
 # Keys missing from either side are skipped -- anomaly_detection_ode.py drops
 # --n-deg / --klp-weight entirely, so the NeuralODE runs simply match on fewer.
 PSM_ABLATION_MATCH_KEYS = [
@@ -354,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--skip-psm-ablation", action="store_true",
-        help="Don't fetch/render the PSM decoder-capacity ablation table.",
+        help="Don't fetch/render the PSM decoder-capacity / no-SDE ablation table.",
     )
     parser.add_argument(
         "--psm-high-capacity-decoder", type=int, nargs=2, metavar=("LAYERS", "WIDTH"),
@@ -495,8 +524,9 @@ def uses_fixed_subsample_mask(config: dict) -> bool:
 
     Runs predating the flag have no such entry; the argparse default is False,
     so a missing key means "resampled every iteration". Only the QAD sparsity
-    sweep (eval_sparsity_data.py) turns it on, which is what separates those
-    runs from the ones every other table reports on.
+    sweep turns it on (eval_sparsity_data.py forces it; the ODE side gets it
+    from scripts/slurm/submit_eval_sparsity_ode.sh), which is what separates
+    those runs from the ones every other table reports on.
     """
     return bool((config.get("args") or {}).get("fixed_subsample_mask", False))
 
@@ -521,7 +551,7 @@ def fetch_anomaly_detection_run_records(
 
     Sparsity-sweep runs (``args.fixed_subsample_mask`` set) are always
     skipped: they train on a fixed, heavily subsampled mask and belong to the
-    sparsity table only -- see fetch_ours_sparsity_run_records.
+    sparsity table only -- see fetch_ad_sparsity_run_records.
     """
     api = wandb.Api()
     path = f"{entity}/{project}" if entity else project
@@ -669,20 +699,35 @@ def fetch_sparsity_run_records(
     return records
 
 
-def fetch_ours_sparsity_run_records(
-    project: str, entity: str | None, subsamples: list[float] = SPARSITY_SUBSAMPLES
+def fetch_ad_sparsity_run_records(
+    project: str,
+    entity: str | None,
+    model_label_fn,
+    subsamples: list[float] = SPARSITY_SUBSAMPLES,
+    require_decimation: bool = True,
 ) -> dict[SparsityKey, list[RunEntry]]:
-    """Fetch our own LSD sparsity runs (eval_sparsity_data.py) for the sparsity table.
+    """Fetch anomaly_detection[_ode].py sparsity runs for the sparsity table.
 
-    These live in the same project as the main "ours" runs, not in the
-    baselines' sparsity project, and are exactly the runs
-    fetch_ours_run_records skips: QAD at QAD_REQUIRED_DECIMATION with
-    ``args.fixed_subsample_mask`` set -- a mask drawn once at load time, which
-    is what makes a run a sparsity experiment rather than a main-table one.
-    The subsample level comes from ``args.subsample``; levels outside
-    `subsamples` (the table's column groups) are dropped.
+    These live in the model projects, not in the baselines' sparsity project,
+    and are exactly the runs fetch_ours_run_records / the NeuralODE fetch skip:
+    QAD with ``args.fixed_subsample_mask`` set -- a mask drawn once at load
+    time, which is what makes a run a sparsity experiment rather than a
+    main-table one. The subsample level comes from ``args.subsample``; levels
+    outside `subsamples` (the table's column groups) are dropped.
 
-    Keys use OURS_SPARSITY_INTERP for the interpolation slot: our model takes
+    `model_label_fn(run_context)` maps a run to its row: the Rn/Sn variant for
+    the "ours" project (eval_sparsity_data.py), the constant NeuralODE row for
+    the ODE one (scripts/slurm/submit_eval_sparsity_ode.sh).
+
+    `require_decimation` demands ``args.data_decimation_factor ==
+    QAD_REQUIRED_DECIMATION``, as the baselines and our own runs are filtered.
+    The ODE side passes False: anomaly_detection_ode.py has no
+    --data-decimation-factor flag and never logs the key, so requiring it would
+    drop every run. A run that *does* log a different decimation is still
+    dropped either way. Note that this makes the NeuralODE row the one place
+    where the sampling rate is not verified to match the rest of the table.
+
+    Keys use OURS_SPARSITY_INTERP for the interpolation slot: these models take
     the subsampled series as-is, with no gap interpolation to vary.
     """
     subsamples = list(subsamples)
@@ -707,10 +752,12 @@ def fetch_ours_sparsity_run_records(
             continue
         if raw_benchmark != QAD_BENCHMARK:
             continue
-        if run_args.get("data_decimation_factor") != QAD_REQUIRED_DECIMATION:
-            continue
+        decimation = run_args.get("data_decimation_factor")
+        if require_decimation or decimation is not None:
+            if decimation != QAD_REQUIRED_DECIMATION:
+                continue
 
-        clf_name = OURS_VARIANT_LABELS.get(run_context.get("model_variant"))
+        clf_name = model_label_fn(run_context)
         if not clf_name:
             continue
 
@@ -825,7 +872,9 @@ def _missing_sparsity_run_lines(
     Our own LSD rows are reported only as present/absent: eval_sparsity_data.py
     seeds its runs by task index (0, 1, 2, ...), not from EXPECTED_SEEDS, so
     naming specific missing seeds would be meaningless. The per-cell run counts
-    in build_sparsity_run_count_table cover those rows instead.
+    in build_sparsity_run_count_table cover those rows instead. The NeuralODE
+    row is *not* exempt -- scripts/slurm/submit_eval_sparsity_ode.sh submits it
+    with EXPECTED_SEEDS, so a named missing seed is actionable there.
     """
     lines = []
     for subsample in subsamples:
@@ -1282,7 +1331,7 @@ def sparsity_interp_label(interp: str) -> str:
 
 def sparsity_row_label(clf_name: str, interp: "str | None") -> str:
     """Row label for a sparsity cell: ``COPOD (linear)``, or the bare model name
-    for our LSD rows, which have no interpolation variant."""
+    for the NeuralODE/LSD rows, which have no interpolation variant."""
     label = display_label(clf_name)
     return f"{label} ({sparsity_interp_label(interp)})" if interp else label
 
@@ -1293,21 +1342,22 @@ def sparsity_row_plan(
     """Return the table's rows as ``(clf_name, interp, display label)``, grouped.
 
     One row per (classifier, interpolation method) pair -- "COPOD (linear)",
-    "COPOD (spline)", ... -- except for SPARSITY_OURS_ROWS (our own LSD
-    variants), which get a single row each (interp OURS_SPARSITY_INTERP), fed
-    from the "ours" project's fixed-subsample-mask runs. The outer list is the
-    \\midrule row grouping, mirroring SPARSITY_CLASSIFIER_GROUPS.
+    "COPOD (spline)", ... -- except for SPARSITY_NO_INTERP_ROWS (the NeuralODE
+    model and our own LSD variants), which get a single row each (interp
+    OURS_SPARSITY_INTERP), fed from the model projects' fixed-subsample-mask
+    runs. The outer list is the \\midrule row grouping, mirroring
+    SPARSITY_CLASSIFIER_GROUPS.
 
     `interp_methods` restricts which baseline interpolation variants get a row:
     the combined table keeps both (SPARSITY_INTERP_METHODS), the split per-level
-    tables only SPARSITY_SPLIT_INTERP_METHODS. Our own LSD rows are unaffected --
-    they have no interpolation variant to select.
+    tables only SPARSITY_SPLIT_INTERP_METHODS. The NeuralODE and LSD rows are
+    unaffected -- they have no interpolation variant to select.
     """
     plan: list[list[SparsityRow]] = []
     for group in SPARSITY_CLASSIFIER_GROUPS:
         rows: list[SparsityRow] = []
         for clf_name in group:
-            interps = [OURS_SPARSITY_INTERP] if clf_name in SPARSITY_OURS_ROWS else interp_methods
+            interps = [OURS_SPARSITY_INTERP] if clf_name in SPARSITY_NO_INTERP_ROWS else interp_methods
             for interp in interps:
                 rows.append((clf_name, interp, sparsity_row_label(clf_name, interp)))
         plan.append(rows)
@@ -1455,12 +1505,16 @@ def build_sparsity_run_count_table(
 
 
 # ---------------------------------------------------------------------------
-# PSM decoder-capacity ablation: LSD Rn/Sn at the config's decoder size vs. a
-# higher-capacity decoder, with the NeuralODE model as the third comparison.
+# PSM ablation: LSD Rn/Sn at the config's decoder size, the same two without
+# the SDE (--no-sde) and with a higher-capacity decoder, plus the NeuralODE
+# model as the outside comparison -- the variants submit_ablation.sh submits.
 # ---------------------------------------------------------------------------
 # Row keys are opaque labels (not clf_names), so the generic helpers
 # (dedupe_by_seed, mean_std, highlight_top3) work unchanged.
 PsmAblationKey = str
+# One table row: the model, its decoder size (None = any, for NeuralODE),
+# whether SDE dynamics are on (None = any), and the row label.
+PsmAblationRow = tuple[str, "tuple[int, int] | None", "bool | None", str]
 
 
 def load_psm_spec_decoder(config_path: Path = PSM_ABLATION_CONFIG_PATH) -> tuple[int, int]:
@@ -1513,37 +1567,61 @@ def matches_psm_spec(
     return True
 
 
-def psm_ablation_row_label(model_label: str, decoder: "tuple[int, int] | None") -> str:
-    """``LSD on $\\mathbb{R}^n$ (ours), dec. $2\\times12$`` (or the bare model name)."""
+def psm_ablation_row_label(
+    model_label: str, decoder: "tuple[int, int] | None", sde: "bool | None" = True
+) -> str:
+    """``LSD on $\\mathbb{R}^n$ (ours), dec. $2\\times12$, w/o SDE`` (or the bare model name).
+
+    The ``w/o SDE`` suffix marks the ``--no-sde`` arm; a row with no decoder
+    (the NeuralODE reference) is labelled by its model name alone.
+    """
     if decoder is None:
         return display_label(model_label)
     layers, width = decoder
-    return f"{display_label(model_label)}, dec. ${layers}\\times{width}$"
+    label = f"{display_label(model_label)}, dec. ${layers}\\times{width}$"
+    if sde is False:
+        label = f"{label}, {PSM_ABLATION_NO_SDE_SUFFIX}"
+    return label
 
 
 def psm_ablation_row_plan(
     spec_decoder: tuple[int, int],
     high_decoder: tuple[int, int] = PSM_ABLATION_HIGH_CAPACITY_DECODER,
-) -> list[list[tuple[str, "tuple[int, int] | None", str]]]:
-    """Rows as ``(model, decoder, label)``, grouped by \\midrule block.
+) -> list[list[PsmAblationRow]]:
+    """Rows as ``(model, decoder, sde, label)``, grouped by \\midrule block.
 
-    Three blocks, in the order the ablation reads: our two variants at the
-    config's decoder size, the same two with the higher-capacity decoder, and
-    finally the NeuralODE reference (whose decoder is not varied).
+    Four blocks, in the order the ablation reads: our two variants at the
+    config's decoder size, the same two without the SDE (``--no-sde``), the
+    same two with the higher-capacity decoder, and finally the NeuralODE
+    reference (whose decoder and dynamics are not varied, hence None/None).
+    These are exactly the arms scripts/slurm/submit_ablation.sh submits; the
+    high-capacity decoder is only run with the SDE, so there is no
+    high-capacity w/o-SDE row.
     """
     return [
-        [(model, spec_decoder, psm_ablation_row_label(model, spec_decoder))
+        [(model, spec_decoder, True, psm_ablation_row_label(model, spec_decoder, True))
          for model in (LSD_RN_LABEL, LSD_SN_LABEL)],
-        [(model, high_decoder, psm_ablation_row_label(model, high_decoder))
+        [(model, spec_decoder, False, psm_ablation_row_label(model, spec_decoder, False))
          for model in (LSD_RN_LABEL, LSD_SN_LABEL)],
-        [(NEURALODE_CLASSIFIER, None, psm_ablation_row_label(NEURALODE_CLASSIFIER, None))],
+        [(model, high_decoder, True, psm_ablation_row_label(model, high_decoder, True))
+         for model in (LSD_RN_LABEL, LSD_SN_LABEL)],
+        [(NEURALODE_CLASSIFIER, None, None, psm_ablation_row_label(NEURALODE_CLASSIFIER, None))],
     ]
+
+
+def psm_ablation_run_uses_sde(run_args: dict) -> bool:
+    """Whether a run trained with SDE dynamics (``--sde``, the parser default).
+
+    Runs logged before the flag existed have no ``sde`` key and count as the
+    SDE arm, matching anomaly_detection.py's default.
+    """
+    return bool(run_args.get("sde", True))
 
 
 def fetch_psm_ablation_run_records(
     project: str,
     entity: str | None,
-    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+    row_plan: list[list[PsmAblationRow]],
     spec_config: dict,
     model_label_fn,
     match_keys: list[str] = PSM_ABLATION_MATCH_KEYS,
@@ -1552,13 +1630,17 @@ def fetch_psm_ablation_run_records(
     """Fetch PSM runs for the ablation, bucketed by row label.
 
     Like fetch_anomaly_detection_run_records, but the row a run belongs to also
-    depends on ``config.args`` (its decoder size), not just on run_context, and
-    runs whose remaining hyperparameters disagree with the dataset config are
-    dropped instead of silently averaged in (see matches_psm_spec).
+    depends on ``config.args`` (its decoder size and whether it ran with the
+    SDE), not just on run_context, and runs whose remaining hyperparameters
+    disagree with the dataset config are dropped instead of silently averaged
+    in (see matches_psm_spec).
 
     `model_label_fn(run_context)` maps a run to its model label -- the constant
-    NeuralODE row for the ODE project, the Rn/Sn variant for ours. Rows whose
-    decoder is None (the NeuralODE reference) accept any decoder size.
+    NeuralODE row for the ODE project, the Rn/Sn variant for ours. That label
+    alone does not identify a row: ``run_context.model_variant`` is Sn/Rn
+    regardless of ``--no-sde``, so the SDE flag is read from ``config.args``
+    (see psm_ablation_run_uses_sde). Rows whose decoder/sde are None (the
+    NeuralODE reference) accept any decoder size and either dynamics.
 
     `match_keys` are the config keys that gate a run. `dataset_only` drops every
     filter except ``benchmark_name == PSM``: used for the NeuralODE project,
@@ -1570,8 +1652,11 @@ def fetch_psm_ablation_run_records(
     path = f"{entity}/{project}" if entity else project
     runs = api.runs(path, order="-created_at")
 
-    # (model, decoder) -> row label; decoder None means "any decoder".
-    row_lookup = {(model, decoder): label for group in row_plan for model, decoder, label in group}
+    # (model, decoder, sde) -> row label; None means "any decoder"/"any dynamics".
+    row_lookup = {
+        (model, decoder, sde): label
+        for group in row_plan for model, decoder, sde, label in group
+    }
 
     records: dict[PsmAblationKey, list[RunEntry]] = defaultdict(list)
 
@@ -1590,8 +1675,8 @@ def fetch_psm_ablation_run_records(
             continue
 
         if dataset_only:
-            # Dataset is the only criterion; the row takes any decoder size.
-            label = row_lookup.get((model_label, None))
+            # Dataset is the only criterion; the row takes any decoder/dynamics.
+            label = row_lookup.get((model_label, None, None))
         else:
             # Sparsity-sweep runs train on a fixed subsampled mask; not this experiment.
             if uses_fixed_subsample_mask(config):
@@ -1605,9 +1690,12 @@ def fetch_psm_ablation_run_records(
             except (TypeError, ValueError):
                 decoder = None
 
-            label = row_lookup.get((model_label, decoder), row_lookup.get((model_label, None)))
+            sde = psm_ablation_run_uses_sde(run_args)
+            label = row_lookup.get(
+                (model_label, decoder, sde), row_lookup.get((model_label, None, None))
+            )
         if label is None:
-            continue  # a decoder size this table doesn't report on
+            continue  # a decoder/dynamics combination this table doesn't report on
 
         metrics = _extract_ad_summary_metrics(dict(run.summary))
         if not metrics:
@@ -1642,23 +1730,23 @@ def select_recent_runs_by_key(
 
 def build_psm_ablation_table(
     values: dict[PsmAblationKey, dict[str, list[float]]],
-    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+    row_plan: list[list[PsmAblationRow]],
 ) -> pd.DataFrame:
-    """PSM decoder-capacity ablation: one row per model/decoder configuration.
+    """PSM ablation: one row per model/decoder/dynamics configuration.
 
     Leading "Avg. Rank" + "Model" columns then AUC/AUPRC/F1, as in the main
     tables -- the rank is the mean of this table's own three per-column ranks
-    (lower = better), so it ranks the five configurations against each other
-    and nothing else. With only a handful of rows, the best two values per
+    (lower = better), so it ranks the ablation's configurations against each
+    other and nothing else. With only a handful of rows, the best two values per
     column are highlighted rather than the top 3
     (PSM_ABLATION_HIGHLIGHT_TOP_N), and the same cap applies to the rank
     column.
 
     Unlike the main tables, rows are *not* re-sorted by rank: the ablation
-    reads as default decoder -> high-capacity decoder -> NeuralODE reference,
-    which is row_plan's fixed order (see psm_ablation_row_plan).
+    reads as default decoder -> w/o SDE -> high-capacity decoder -> NeuralODE
+    reference, which is row_plan's fixed order (see psm_ablation_row_plan).
     """
-    labels = [label for group in row_plan for _, _, label in group]
+    labels = [label for group in row_plan for *_, label in group]
     columns = [METRIC_LABELS[m] for m in METRICS]
     mean_table = pd.DataFrame(index=labels, columns=columns, dtype=float)
     text_table = pd.DataFrame(index=labels, columns=columns, dtype=object)
@@ -1685,7 +1773,7 @@ def build_psm_ablation_table(
 
 def to_psm_ablation_latex(
     table: pd.DataFrame,
-    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+    row_plan: list[list[PsmAblationRow]],
 ) -> str:
     """Render the PSM ablation table: Rank + Model + AUC/AUPRC/F1, \\midrule per block."""
     header = (
@@ -1721,14 +1809,14 @@ def to_psm_ablation_latex(
 
 def build_psm_ablation_run_count_table(
     values: dict[PsmAblationKey, dict[str, list[float]]],
-    row_plan: list[list[tuple[str, "tuple[int, int] | None", str]]],
+    row_plan: list[list[PsmAblationRow]],
 ) -> pd.DataFrame:
     """Console-only: contributing runs per ablation row (0 when none were found)."""
     counts = {}
     for label, metric_values in values.items():
         counts[label] = max((len(v) for v in metric_values.values()), default=0)
 
-    labels = [label for group in row_plan for _, _, label in group]
+    labels = [label for group in row_plan for *_, label in group]
     count_df = pd.DataFrame(
         {"runs": [counts.get(label, 0) for label in labels]},
         index=labels,
@@ -1881,15 +1969,29 @@ def main() -> None:
     sparsity_records = None
     if not args.skip_sparsity:
         # Independent of everything above: its own project, its own
-        # (subsample, classifier, interp) bucketing. Our LSD rows are the one
-        # exception -- they come from the "ours" project, from precisely the
-        # fixed-subsample-mask runs the tables above filter out.
+        # (subsample, classifier, interp) bucketing. The NeuralODE and LSD rows
+        # are the exception -- they come from the two model projects, from
+        # precisely the fixed-subsample-mask runs the tables above filter out.
         raw_sparsity_records = fetch_sparsity_run_records(
             args.sparsity_project, args.sparsity_entity, args.sparsity_subsamples)
         if not args.skip_ours:
-            ours_sparsity_records = fetch_ours_sparsity_run_records(
-                args.ours_project, args.ours_entity, args.sparsity_subsamples)
+            ours_sparsity_records = fetch_ad_sparsity_run_records(
+                args.ours_project, args.ours_entity,
+                model_label_fn=lambda rc: OURS_VARIANT_LABELS.get(rc.get("model_variant")),
+                subsamples=args.sparsity_subsamples,
+            )
             for key, entries in ours_sparsity_records.items():
+                raw_sparsity_records[key].extend(entries)
+        if not args.skip_neuralode:
+            # anomaly_detection_ode.py logs no data_decimation_factor, so the
+            # decimation filter can't apply here (see fetch_ad_sparsity_run_records).
+            ode_sparsity_records = fetch_ad_sparsity_run_records(
+                args.ode_project, args.ode_entity,
+                model_label_fn=lambda rc: NEURALODE_CLASSIFIER,
+                subsamples=args.sparsity_subsamples,
+                require_decimation=False,
+            )
+            for key, entries in ode_sparsity_records.items():
                 raw_sparsity_records[key].extend(entries)
         sparsity_records = dedupe_by_seed(raw_sparsity_records)
         if sparsity_records:
@@ -1943,10 +2045,10 @@ def main() -> None:
                   f"'{args.ours_project}'; skipping the sparsity table.")
 
     if not args.skip_psm_ablation:
-        # Its own bucketing again: PSM only, keyed by (model, decoder size), and
-        # restricted to runs whose remaining hyperparameters match the dataset
-        # config. Both projects contribute -- the NeuralODE reference from the
-        # ODE project, our Rn/Sn arms from the "ours" one.
+        # Its own bucketing again: PSM only, keyed by (model, decoder size, SDE
+        # on/off), and restricted to runs whose remaining hyperparameters match
+        # the dataset config. Both projects contribute -- the NeuralODE
+        # reference from the ODE project, our Rn/Sn arms from the "ours" one.
         spec_config = _load_json_config(PSM_ABLATION_CONFIG_PATH)
         spec_decoder = load_psm_spec_decoder(PSM_ABLATION_CONFIG_PATH)
         high_layers, high_width = (int(v) for v in args.psm_high_capacity_decoder)
@@ -1977,7 +2079,8 @@ def main() -> None:
 
         print(f"\nPSM ablation runs found per configuration (decoder spec "
               f"{spec_decoder[0]}x{spec_decoder[1]} from {PSM_ABLATION_CONFIG_PATH.name}, "
-              f"high capacity {high_decoder[0]}x{high_decoder[1]}, most recent "
+              f"high capacity {high_decoder[0]}x{high_decoder[1]}, '"
+              f"{PSM_ABLATION_NO_SDE_SUFFIX}' rows from --no-sde runs, most recent "
               f"{PSM_ABLATION_RUN_LIMIT} per cell; the {NEURALODE_CLASSIFIER} row takes "
               f"every {PSM_BENCHMARK} run of '{args.ode_project}' unfiltered):")
         print(build_psm_ablation_run_count_table(psm_values, psm_row_plan).to_string())
@@ -1986,7 +2089,7 @@ def main() -> None:
             build_psm_ablation_table(psm_values, psm_row_plan), psm_row_plan
         )
 
-        print("\nLaTeX table (PSM decoder-capacity ablation)")
+        print("\nLaTeX table (PSM decoder-capacity / SDE ablation)")
         print(psm_latex)
 
         psm_out_path = args.output_dir / "baseline_table_PSM_decoder_ablation.tex"
