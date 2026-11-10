@@ -1333,7 +1333,7 @@ def main():
                     best_val_loss = val_stats["loss"]
                     best_epoch = epoch
                     patience_counter = 0
-                    save_checkpoint(args, "best", experiment_id, modules, desired_t)
+                    save_checkpoint(args, "best", experiment_id, modules, desired_t, trace_id=args.trace_id)
                 else:
                     patience_counter += 1
 
@@ -1374,7 +1374,7 @@ def main():
                     )
 
             if args.checkpoint_every_n_epochs and epoch % args.checkpoint_every_n_epochs == 0:
-                save_checkpoint(args, epoch, experiment_id, modules, desired_t)
+                save_checkpoint(args, epoch, experiment_id, modules, desired_t, trace_id=args.trace_id)
 
             if args.reconstruct_at_k and epoch % args.reconstruct_at_k == 0:
                 reconstruction_paths.append(
@@ -1393,7 +1393,7 @@ def main():
 
         if best_epoch > 0:
             logging.info("Best validation checkpoint: epoch=%04d, val_loss=%.6f", best_epoch, best_val_loss)
-        save_checkpoint(args, last_epoch_completed, experiment_id, modules, desired_t)
+        save_checkpoint(args, last_epoch_completed, experiment_id, modules, desired_t, trace_id=args.trace_id)
     finally:
         if hasattr(provider, "cleanup"):
             provider.cleanup()

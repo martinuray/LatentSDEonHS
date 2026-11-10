@@ -203,7 +203,7 @@ def build_progress_message(epoch: int, stats: dict, mask: dict, sep: str = "|") 
     return msg
 
 
-def save_checkpoint(args, epoch: Union[int,str], experiment_id: Union[int,str], modules: ModuleDict, desired_t: Tensor, trace_id: Optional[str] = None):
+def save_checkpoint(args, epoch: Union[int,str], experiment_id: Union[int,str], modules: ModuleDict, desired_t: Tensor, trace_id: Optional[str] = None, seed: Optional[int] = None):
     """Save model checkpoint.
 
     Arguments:
@@ -227,6 +227,9 @@ def save_checkpoint(args, epoch: Union[int,str], experiment_id: Union[int,str], 
         trace_id: str, optional
             Id of the trace/sub-dataset this checkpoint belongs to (multi-trace
             benchmarks). Stored in the checkpoint under the key 'trace_id'.
+        seed: int, optional
+            Seed this run was initialized with. Defaults to `args.seed` and is
+            stored in the checkpoint under the key 'seed'.
 
     Returns
     -------
@@ -238,7 +241,15 @@ def save_checkpoint(args, epoch: Union[int,str], experiment_id: Union[int,str], 
     if args.checkpoint_dir is None or args.checkpoint_dir == "None": return False
 
     assert os.path.exists(args.checkpoint_dir), f"{args.checkpoint_dir} does not exist!"
-    checkpoint = {"args": args, "desired_t": desired_t, "modules": modules.state_dict(), "trace_id": trace_id}
+    if seed is None:
+        seed = getattr(args, "seed", None)
+    checkpoint = {
+        "args": args,
+        "desired_t": desired_t,
+        "modules": modules.state_dict(),
+        "trace_id": str(trace_id) if trace_id is not None else None,
+        "seed": int(seed) if seed is not None else None,
+    }
     torch.save(
         checkpoint,
         os.path.join(args.checkpoint_dir, f"checkpoint_{experiment_id}_{epoch}.h5"),

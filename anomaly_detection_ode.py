@@ -575,6 +575,13 @@ def train_one_dataset(
     desired_t = torch.linspace(0, 1.00, num_timepoints, device=args.device).float()
     modules, optimizer, scheduler, elbo_loss = build_modules_and_optim(args, input_dim, desired_t)
 
+    # In the multi-trace setting `stats_prefix` is the trace/sub-dataset id.
+    # Every checkpoint written from this call carries it in the filename
+    # (checkpoint_<experiment_id_str>_trace-<id>_<epoch>.h5) and in the
+    # checkpoint payload, so per-trace checkpoints never overwrite each other.
+    trace_id = str(stats_prefix) if stats_prefix else None
+    ckpt_name = f"{experiment_id_str}_trace-{ad._sanitize_for_filename(trace_id)}" if trace_id else experiment_id_str
+
     stats = defaultdict(list)
     stats_mask = {
         "oth": ["esc", "lr"],
@@ -653,8 +660,7 @@ def train_one_dataset(
             wandb_run = None
 
         if args.checkpoint_at and (epoch in args.checkpoint_at):
-            ckpt_name = f"{experiment_id_str}_{stats_prefix}" if stats_prefix else experiment_id_str
-            save_checkpoint(args, epoch, ckpt_name, modules, desired_t)
+            save_checkpoint(args, epoch, ckpt_name, modules, desired_t, trace_id=trace_id)
 
         msg = pm.build_progress_message(stats, epoch, epoch_key=epoch % log_every_n_epochs)
         if stats_prefix:
