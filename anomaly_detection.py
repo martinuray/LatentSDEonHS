@@ -784,6 +784,59 @@ def normalise_scores(test_delta, norm="median-iqr", smooth=True,
         return smooth_scores(err_scores, smooth_window)
     return err_scores
 
+def _weighted_mse_agg(scores: np.ndarray, feature_weights: np.ndarray, strategy: str) -> np.ndarray:
+    if feature_weights is None:
+        raise ValueError(
+            f"aggregation_strategy='{strategy}' requires feature_weights "
+            "(per-feature weights derived from training reconstruction MSE, "
+            "see calculate_feature_reconstruction_weights)."
+        )
+    weights = np.asarray(feature_weights).reshape(1, -1)
+    return (scores * weights).sum(axis=1)
+
+
+# Reductions from per-feature scores [time, feature] to one score per timepoint.
+# Every entry takes (scores, feature_weights); only the weighted variants look
+# at the weights.
+AGG_STRATEGIES = {
+    'l1': lambda x, w: np.linalg.norm(x, ord=1, axis=1),
+    'l2': lambda x, w: np.linalg.norm(x, ord=2, axis=1),
+    'linfty': lambda x, w: np.linalg.norm(x, ord=np.inf, axis=1),
+    'mean': lambda x, w: x.mean(1),
+    'max': lambda x, w: x.max(1),
+    'median': lambda x, w: np.median(x, axis=1),
+    'p75': lambda x, w: np.percentile(x, 75, axis=1),
+    'p95': lambda x, w: np.percentile(x, 95, axis=1),
+    # Soft-voting ensemble: each feature's (normalized) error contributes to
+    # the aggregated score in proportion to a weight learned from training
+    # reconstruction error, instead of an unweighted reduction like max/mean.
+    # Both variants share the same weighted-sum aggregation; they only differ
+    # in how `feature_weights` was derived (see
+    # calculate_feature_reconstruction_weights's `weighting` argument).
+    'weighted-mse': lambda x, w: _weighted_mse_agg(x, w, 'weighted-mse'),
+    'weighted-mse-exp': lambda x, w: _weighted_mse_agg(x, w, 'weighted-mse-exp'),
+}
+
+
+def aggregate_feature_scores(
+        scores: np.ndarray,
+        aggregation_strategy: str = "max",
+        feature_weights: np.ndarray = None) -> np.ndarray:
+    """Reduce per-feature scores [time, feature] to one score per timepoint.
+
+    Shared by the evaluation pipeline below and by scripts that need the
+    aggregated per-timepoint score itself rather than metrics derived from it
+    (e.g. conformal_anomaly_detection.py), so that every consumer applies the
+    exact same reduction.
+    """
+    if aggregation_strategy not in AGG_STRATEGIES:
+        raise ValueError(
+            f"Unknown aggregation strategy '{aggregation_strategy}'. "
+            f"Available: {sorted(AGG_STRATEGIES.keys())}"
+        )
+    return AGG_STRATEGIES[aggregation_strategy](np.asarray(scores), feature_weights)
+
+
 def eval_scores_for_all_score_normalizations(
         scores: np.ndarray,
         test_labels: np.ndarray,
@@ -799,35 +852,6 @@ def eval_scores_for_all_score_normalizations(
     normalisations = [None]
     aggregation_strategies = [aggregation_strategy]
 
-    def _weighted_mse_agg(x):
-        if feature_weights is None:
-            raise ValueError(
-                f"aggregation_strategy='{aggregation_strategy}' requires feature_weights "
-                "(per-feature weights derived from training reconstruction MSE, "
-                "see calculate_feature_reconstruction_weights)."
-            )
-        weights = np.asarray(feature_weights).reshape(1, -1)
-        return (x * weights).sum(axis=1)
-
-    AGG_STRATEGIES = {
-        'l1': lambda x: np.linalg.norm(x, ord=1, axis=1),
-        'l2': lambda x: np.linalg.norm(x, ord=2, axis=1),
-        'linfty': lambda x: np.linalg.norm(x, ord=np.inf, axis=1),
-        'mean': lambda x: x.mean(1),
-        'max': lambda x: x.max(1),
-        'median': lambda x: np.median(x, axis=1),
-        'p75': lambda x: np.percentile(x, 75, axis=1),
-        'p95': lambda x: np.percentile(x, 95, axis=1),
-        # Soft-voting ensemble: each feature's (normalized) error contributes to
-        # the aggregated score in proportion to a weight learned from training
-        # reconstruction error, instead of an unweighted reduction like max/mean.
-        # Both variants share the same weighted-sum aggregation below; they only
-        # differ in how `feature_weights` was derived (see
-        # calculate_feature_reconstruction_weights's `weighting` argument).
-        'weighted-mse': _weighted_mse_agg,
-        'weighted-mse-exp': _weighted_mse_agg,
-    }
-
     if aggregation_strategy not in AGG_STRATEGIES:
         raise ValueError(
             f"Unknown aggregation strategy '{aggregation_strategy}'. "
@@ -842,7 +866,8 @@ def eval_scores_for_all_score_normalizations(
         n_key = n if n is not None else 'no'
 
         for aggregation_strategy_ in aggregation_strategies:
-            normed_agg_scores = AGG_STRATEGIES[aggregation_strategy_](normed_scores)
+            normed_agg_scores = aggregate_feature_scores(
+                normed_scores, aggregation_strategy_, feature_weights)
             results = get_ts_eval(normed_agg_scores, test_labels.flatten(), window_length=window_length)
 
             agg_scores[(aggregation_strategy_, n_key)] = results['f1']
