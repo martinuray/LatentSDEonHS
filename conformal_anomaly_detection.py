@@ -43,10 +43,24 @@ reported for comparability with ``evaluate_checkpoints.py``. The metrics that
 are new here are the ones at fixed levels ``--alphas``: no threshold search, no
 test labels involved in the decision.
 
-Seeds are aggregated per trace: mean/std over the seeds of a trace, plus a
-seed-ensemble that combines the per-seed p-values of the same timepoint with
-the Vovk-Wang average, ``p = min(1, 2 * mean_i p_i)``, which stays valid under
-arbitrary dependence between the seeds.
+Multi-trace benchmarks (QAD, TSB-AD-M, SMD, ...) are trained one model per
+trace, so the natural input here is one checkpoint per (trace, seed). Each
+checkpoint carries its trace id and its seed, hence the whole grid can simply
+be handed over at once (or discovered with ``--checkpoint-dir``); the run is
+then *ordered by trace*, and each trace is calibrated against its own
+validation split -- calibration scores are never pooled across traces, which
+would compare scores of models that saw different data. Reported are
+
+* per checkpoint: calibration size, test size, metrics per alpha,
+* per trace: mean/std over that trace's seeds, plus a seed-ensemble that
+  combines the per-seed p-values of the same timepoint with the Vovk-Wang
+  average ``p = min(1, 2 * mean_i p_i)`` (valid under arbitrary dependence
+  between the seeds),
+* macro: unweighted mean over traces, as in ``evaluate_checkpoints.py``,
+* pooled: all traces evaluated together per seed, then averaged over seeds.
+  Pooling raw scores across traces is meaningless, but p-values are already
+  per-trace calibrated and so share one scale -- a single alpha therefore
+  applies benchmark-wide (``--no-pool-traces`` to skip).
 
 One caveat about the seed: the providers draw the train/val permutation while
 *processing* the raw data and then cache the result under
@@ -61,12 +75,22 @@ saw during training.
 
 Examples::
 
+    # two seeds of one trace, seeds given explicitly
     python conformal_anomaly_detection.py --dataset QAD \\
         --checkpoints checkpoints/checkpoint_AD_QAD_250901-10:00:00_trace-1_best.h5 \\
                       checkpoints/checkpoint_AD_QAD_250901-12:00:00_trace-1_best.h5 \\
         --seeds 1 2 --alphas 0.01 0.05 0.1
 
-    # seeds taken from each checkpoint, inline form, all best checkpoints of a dir
+    # one checkpoint per (trace, seed): trace and seed come from the checkpoints
+    python conformal_anomaly_detection.py --dataset QAD \\
+        --checkpoint-dir checkpoints --checkpoint-pattern 'checkpoint_AD_QAD_*_best.h5' \\
+        --regenerate-processed-data --final-metrics-csv logs/conformal/qad.csv
+
+    # same, restricted to three traces, seeds spelled out per checkpoint
+    python conformal_anomaly_detection.py --dataset QAD --trace-ids 1 2 3 \\
+        --checkpoints 'ckpt_trace-1_best.h5=1' 'ckpt_trace-2_best.h5=1' 'ckpt_trace-3_best.h5=1'
+
+    # single-trace dataset
     python conformal_anomaly_detection.py --dataset PSM \\
         --checkpoint-dir checkpoints --checkpoint-pattern 'checkpoint_AD_PSM_*_best.h5'
 """
@@ -121,6 +145,10 @@ from utils.parser import generic_parser
 # Separator of the inline ``PATH=SEED`` form of --checkpoints. '=' and not ':'
 # because checkpoint names carry the experiment timestamp (``..._250901-10:00:00_...``).
 SEED_SEPARATOR = "="
+
+# Report key for checkpoints without a trace id (single-trace datasets such as
+# SWaT/PSM), so reports and CSV rows read "PSM:single" instead of "PSM:None".
+SINGLE_TRACE_KEY = "single"
 
 # Columns of the per-alpha tables, in the order they are worth reading.
 ALPHA_METRIC_COLS = (
@@ -215,6 +243,17 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
         help=(
             "Per trace, additionally combine the per-seed p-values of each timepoint "
             "into one ensemble p-value (Vovk-Wang: min(1, 2 * mean))."
+        ),
+    )
+    group.add_argument(
+        "--pool-traces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On multi-trace benchmarks, additionally evaluate all traces together: "
+            "every trace's p-values come from its own calibration set, so they share "
+            "one scale and one alpha applies benchmark-wide. Pooled per seed, then "
+            "averaged over seeds (see pool_over_traces)."
         ),
     )
     group.add_argument(
@@ -387,13 +426,19 @@ def _point_metrics(labels: np.ndarray, predictions: np.ndarray) -> dict:
     return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
 
-def metrics_at_alpha(p_values: np.ndarray, labels: np.ndarray, alpha: float) -> dict:
+def metrics_at_alpha(p_values: np.ndarray, labels: np.ndarray, alpha: float,
+                     include_ts: bool = True) -> dict:
     """Decision quality and calibration validity at one significance level.
 
     ``empirical_fpr`` is the observed rate of ``p <= alpha`` among the nominal
     test timepoints; under exchangeability with the calibration set it should be
     at most ``alpha``, so ``calibration_gap = empirical_fpr - alpha`` tells how
     far the guarantee is from holding on this trace.
+
+    ``include_ts=False`` drops the range-based (time-series) precision/recall.
+    They are only meaningful on one continuous series, so the pooled view over
+    several traces -- a concatenation, whose trace boundaries would merge
+    unrelated ranges -- leaves them out.
     """
     predictions = p_values <= alpha
     nominal = labels == 0
@@ -406,6 +451,8 @@ def metrics_at_alpha(p_values: np.ndarray, labels: np.ndarray, alpha: float) -> 
         "calibration_gap": empirical_fpr - float(alpha),
         **_point_metrics(labels, predictions),
     }
+    if not include_ts:
+        return stats
 
     ts_precision, ts_recall = ts_precision_and_recall(
         labels.astype(int), predictions.astype(int), alpha=0,
@@ -559,13 +606,12 @@ def combine_seed_p_values(per_seed: list[dict], alphas: list[float], ranking_met
         logging.warning("Seeds of this trace share no test timepoint; skipping the seed ensemble.")
         return None
 
-    p_stack, labels = [], None
+    p_stack = []
     for seed_result in per_seed:
-        index = seed_result["arrays"]["test_index"]
-        positions = np.searchsorted(index, shared)
+        positions = np.searchsorted(seed_result["arrays"]["test_index"], shared)
         p_stack.append(seed_result["arrays"]["test_p_value"][positions])
-        if labels is None:
-            labels = seed_result["arrays"]["test_labels"][positions]
+    first = per_seed[0]["arrays"]
+    labels = first["test_labels"][np.searchsorted(first["test_index"], shared)]
 
     combined = np.minimum(1.0, 2.0 * np.mean(np.vstack(p_stack), axis=0))
     out = {
@@ -584,6 +630,51 @@ def combine_seed_p_values(per_seed: list[dict], alphas: list[float], ranking_met
     return out
 
 
+def pool_over_traces(results: list[dict], alphas: list[float]) -> dict | None:
+    """Evaluate all traces at once, each calibrated against its own trace.
+
+    The per-trace means ("macro") weight a 2k-timepoint trace like a 200k one,
+    and they say nothing about using *one* operating point across the whole
+    benchmark. Pooling does: because every trace's scores were turned into
+    p-values against that trace's own nominal calibration set, the numbers live
+    on the same [0, 1] scale no matter how differently the traces are scaled or
+    how well the model fits each one, so concatenating them is meaningful --
+    which is exactly what concatenating raw anomaly scores across traces is
+    not. One alpha then applies benchmark-wide, and ``empirical_fpr`` says
+    whether it holds there.
+
+    Done per seed (so every trace contributes once), then averaged over seeds.
+    Range-based metrics are left out, see ``metrics_at_alpha``.
+    """
+    by_seed: dict[int, list[dict]] = defaultdict(list)
+    for result in results:
+        by_seed[result["seed"]].append(result)
+    if not by_seed:
+        return None
+
+    per_seed_rows = []
+    for seed in sorted(by_seed):
+        group = sorted(by_seed[seed], key=lambda res: res["trace_key"])
+        p_values = np.concatenate([res["arrays"]["test_p_value"] for res in group])
+        labels = np.concatenate([res["arrays"]["test_labels"] for res in group])
+        per_seed_rows.append({
+            "seed": int(seed),
+            "num_traces": len(group),
+            "traces": [res["trace_key"] for res in group],
+            "num_test": int(p_values.size),
+            "per_alpha": [metrics_at_alpha(p_values, labels, alpha, include_ts=False)
+                          for alpha in alphas],
+        })
+
+    pooled = aggregate_over_seeds(per_seed_rows, alphas)
+    pooled.pop("ranking", None)
+    pooled["seeds"] = [row["seed"] for row in per_seed_rows]
+    pooled["num_traces_per_seed"] = [row["num_traces"] for row in per_seed_rows]
+    pooled["num_test_per_seed"] = [row["num_test"] for row in per_seed_rows]
+    pooled["per_seed"] = per_seed_rows
+    return pooled
+
+
 def _alpha_frame(rows: list[dict]) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     frame = frame[[col for col in ALPHA_METRIC_COLS if col in frame.columns]]
@@ -594,9 +685,187 @@ def _strip_arrays(result: dict) -> dict:
     return {key: value for key, value in result.items() if key != "arrays"}
 
 
+def _shrink_arrays(result: dict, keep: tuple[str, ...]):
+    """Drop the score arrays that are no longer needed, in place.
+
+    One run can hold a checkpoint per (trace, seed); keeping every score array
+    of a 100-trace benchmark alive until the end is pointless once the arrays
+    have been written to disk and the trace's own aggregation is done.
+    """
+    result["arrays"] = {key: value for key, value in result["arrays"].items() if key in keep}
+
+
 def _save_arrays(path: Path, arrays: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint metadata / per-trace processing
+# --------------------------------------------------------------------------- #
+def _resolve_seed(path: Path, ckpt: dict, ckpt_args: Namespace, requested: int | None,
+                  cli_args: Namespace, explicit: set[str]) -> int:
+    """Seed to run this checkpoint under.
+
+    Precedence: a seed given for this checkpoint (``--seeds``/``PATH=SEED``, or
+    a plain ``--seed`` standing in for all of them) beats the seed stored in the
+    checkpoint, which beats the parser default.
+    """
+    # Checkpoints written before the 'seed' key existed (and ones that stored it
+    # as None) fall back to the seed inside the stored args.
+    raw_stored = ckpt.get("seed")
+    if raw_stored is None:
+        raw_stored = getattr(ckpt_args, "seed", None)
+    stored = None if raw_stored is None else int(raw_stored)
+    # A plain `--seed` acts like `--seeds <seed>`: one seed for every checkpoint.
+    if requested is None and "seed" in explicit:
+        requested = int(cli_args.seed)
+
+    if requested is None:
+        if stored is not None:
+            return stored
+        logging.warning(
+            "%s stores no seed and none was given; using --seed %s. The validation "
+            "split is only the checkpoint's own if this matches its training seed.",
+            path.name, cli_args.seed,
+        )
+        return int(cli_args.seed)
+
+    if stored is not None and stored != requested:
+        logging.warning(
+            "Seed %d given for %s, but the checkpoint was trained with seed %s. "
+            "The validation split will differ from the one used during training.",
+            requested, path.name, stored,
+        )
+    return int(requested)
+
+
+def collect_candidates(
+    specs: list[tuple[Path, int | None]], cli_args: Namespace, explicit: set[str]
+) -> tuple[list[dict], list[dict]]:
+    """Read trace id, seed and effective args off every checkpoint.
+
+    Only metadata is kept; the weights are loaded again when the checkpoint is
+    actually calibrated. That is what allows the run to be ordered by trace
+    (one provider alive at a time) instead of by the order the checkpoints were
+    listed in.
+    """
+    candidates, failures = [], []
+    for path, requested_seed in specs:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        ckpt_args = ckpt.get("args")
+        if ckpt_args is None:
+            logging.warning("Skipping %s: no stored args.", path.name)
+            failures.append({"checkpoint": str(path), "seed": requested_seed, "error": "no stored args"})
+            continue
+        if isinstance(ckpt_args, dict):
+            ckpt_args = Namespace(**ckpt_args)
+        if getattr(ckpt_args, "dataset", None) != cli_args.dataset:
+            logging.warning(
+                "Skipping %s: checkpoint dataset %s != --dataset %s.",
+                path.name, getattr(ckpt_args, "dataset", None), cli_args.dataset,
+            )
+            continue
+
+        trace_id = _trace_from_checkpoint(ckpt, ckpt_args, path)
+        if cli_args.trace_ids is not None and trace_id not in cli_args.trace_ids:
+            logging.debug("Skipping %s: trace %s not in --trace-ids.", path.name, trace_id)
+            continue
+
+        args = resolve_effective_args(ckpt_args, cli_args, explicit)
+        args.device = _select_device(args.device)
+        args.trace_ids = [trace_id] if trace_id is not None else None
+        args.seed = _resolve_seed(path, ckpt, ckpt_args, requested_seed, cli_args, explicit)
+        # Knobs of this script only; never taken from the checkpoint.
+        for key in ("alphas", "p_value_mode", "ranking_metrics", "combine_seeds",
+                    "pool_traces", "save_scores", "regenerate_processed_data"):
+            setattr(args, key, getattr(cli_args, key))
+
+        candidates.append({
+            "path": path,
+            "trace_id": trace_id,
+            "trace_key": str(trace_id) if trace_id is not None else SINGLE_TRACE_KEY,
+            "seed": args.seed,
+            "args": args,
+        })
+        del ckpt
+    return candidates, failures
+
+
+def process_trace(
+    trace: str, candidates: list[dict], cli_args: Namespace, out_dir: Path, run_id: str
+) -> tuple[list[dict], list[dict]]:
+    """Calibrate every checkpoint of one trace, then release its providers.
+
+    Providers are cached within the trace (several seeds of a trace usually
+    share one data configuration) and dropped afterwards, so a benchmark with
+    many traces does not keep every trace's windows in memory.
+    """
+    provider_cache: dict[tuple, object] = {}
+    results, failures = [], []
+    try:
+        for cand in sorted(candidates, key=lambda c: c["seed"]):
+            path, args = cand["path"], cand["args"]
+            if args.seed > 0:
+                set_seed(args.seed)
+
+            cache_key = tuple(getattr(args, key, None) for key in DATA_ARG_KEYS) + (trace,)
+            provider = provider_cache.get(cache_key)
+            if provider is None:
+                if cli_args.regenerate_processed_data:
+                    # Drawn after set_seed above, so the train/val permutation is
+                    # the one this seed produced during training.
+                    delete_processed_data(args.dataset, data_dir=getattr(args, "data_dir", "data_dir"))
+                provider = build_provider(args)
+                provider_cache[cache_key] = provider
+            ds_idx = _resolve_trace_index(provider, cand["trace_id"])
+
+            logging.info("Calibrating %s (trace=%s, idx=%d, seed=%d)", path.name, trace, ds_idx, args.seed)
+            logging.debug("Effective args: %s", vars(args))
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            try:
+                result = calibrate_and_score(args, ckpt, provider, ds_idx)
+            except (RuntimeError, ValueError) as exc:
+                logging.error("Skipping %s: %s", path.name, exc)
+                failures.append({"checkpoint": str(path), "seed": args.seed,
+                                 "trace_id": cand["trace_id"], "error": str(exc)})
+                continue
+            finally:
+                del ckpt
+
+            result.update({
+                "checkpoint": str(path),
+                "seed": int(args.seed),
+                "trace_id": cand["trace_id"],
+                "trace_key": cand["trace_key"],
+                "dataset": args.dataset,
+                "score_aggregation": args.score_aggregation,
+                "score_smoothing_window": args.score_smoothing_window,
+                "normalize_score": args.normalize_score,
+                "mc_eval_samples": args.mc_eval_samples,
+            })
+            logging.info(
+                "[%s/seed=%d] %d calibration scores, %d test timepoints (%.2f%% anomalous):\n%s",
+                trace, args.seed, result["num_calibration"], result["num_test"],
+                100 * result["anomaly_rate"],
+                _alpha_frame(result["per_alpha"]).to_string(float_format=lambda v: f"{v:.4f}"),
+            )
+            if cli_args.save_scores:
+                npz_path = (out_dir / "scores" /
+                            f"CONFORMAL_{cli_args.dataset}_{run_id}__{path.stem}__seed{args.seed}.npz")
+                _save_arrays(npz_path, result["arrays"])
+                result["scores_file"] = str(npz_path)
+                logging.debug("Stored score arrays at %s", npz_path)
+            results.append(result)
+    finally:
+        for provider in provider_cache.values():
+            if hasattr(provider, "cleanup"):
+                try:
+                    provider.cleanup()
+                except Exception as err:
+                    logging.warning("Provider cleanup failed: %s", err)
+        provider_cache.clear()
+    return results, failures
 
 
 # --------------------------------------------------------------------------- #
@@ -658,120 +927,39 @@ def main():
     for path, seed in specs:
         logging.info("  %s (seed=%s)", path, "from checkpoint" if seed is None else seed)
 
-    # ---- per checkpoint -----------------------------------------------------
-    provider_cache: dict[tuple, object] = {}
-    results, failures = [], []
-    for path, seed in specs:
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        ckpt_args = ckpt.get("args")
-        if ckpt_args is None:
-            logging.warning("Skipping %s: no stored args.", path.name)
-            failures.append({"checkpoint": str(path), "seed": seed, "error": "no stored args"})
-            continue
-        if isinstance(ckpt_args, dict):
-            ckpt_args = Namespace(**ckpt_args)
-        if getattr(ckpt_args, "dataset", None) != cli_args.dataset:
-            logging.warning(
-                "Skipping %s: checkpoint dataset %s != --dataset %s.",
-                path.name, getattr(ckpt_args, "dataset", None), cli_args.dataset,
-            )
-            continue
+    # ---- metadata pass: group the checkpoints by trace ----------------------
+    candidates, failures = collect_candidates(specs, cli_args, explicit)
+    if not candidates:
+        raise SystemExit(f"None of the {len(specs)} checkpoint(s) matched {cli_args.dataset}; see log above.")
 
-        trace_id = _trace_from_checkpoint(ckpt, ckpt_args, path)
-        if cli_args.trace_ids is not None and trace_id not in cli_args.trace_ids:
-            logging.debug("Skipping %s: trace %s not in --trace-ids.", path.name, trace_id)
-            continue
-
-        args = resolve_effective_args(ckpt_args, cli_args, explicit)
-        args.device = _select_device(args.device)
-        args.trace_ids = [trace_id] if trace_id is not None else None
-        # Knobs of this script only; never taken from the checkpoint.
-        for key in ("alphas", "p_value_mode", "ranking_metrics", "combine_seeds", "save_scores"):
-            setattr(args, key, getattr(cli_args, key))
-
-        # Checkpoints written before the 'seed' key existed (and ones that stored
-        # it as None) fall back to the seed inside the stored args.
-        stored_seed = ckpt.get("seed")
-        if stored_seed is None:
-            stored_seed = getattr(ckpt_args, "seed", None)
-        # A plain `--seed` acts like `--seeds <seed>`: one seed for every checkpoint.
-        if seed is None and "seed" in explicit:
-            seed = cli_args.seed
-        if seed is None:
-            if stored_seed is None:
-                logging.warning(
-                    "%s stores no seed and none was given; using --seed %s. The validation "
-                    "split is only the checkpoint's own if this matches its training seed.",
-                    path.name, args.seed,
-                )
-            else:
-                args.seed = int(stored_seed)
-        else:
-            if stored_seed is not None and int(stored_seed) != int(seed):
-                logging.warning(
-                    "Seed %d given for %s, but the checkpoint was trained with seed %s. "
-                    "The validation split will differ from the one used during training.",
-                    seed, path.name, stored_seed,
-                )
-            args.seed = int(seed)
-
-        if args.seed > 0:
-            set_seed(args.seed)
-
-        cache_key = tuple(getattr(args, key, None) for key in DATA_ARG_KEYS) + (trace_id,)
-        provider = provider_cache.get(cache_key)
-        if provider is None:
-            if cli_args.regenerate_processed_data:
-                # Drawn after set_seed above, so the train/val permutation is the
-                # one this seed produced during training.
-                delete_processed_data(args.dataset, data_dir=getattr(args, "data_dir", "data_dir"))
-            provider = build_provider(args)
-            provider_cache[cache_key] = provider
-        ds_idx = _resolve_trace_index(provider, trace_id)
-
-        logging.info("Calibrating %s (trace=%s, idx=%d, seed=%d)", path.name, trace_id, ds_idx, args.seed)
-        logging.debug("Effective args: %s", vars(args))
-        try:
-            result = calibrate_and_score(args, ckpt, provider, ds_idx)
-        except (RuntimeError, ValueError) as exc:
-            logging.error("Skipping %s: %s", path.name, exc)
-            failures.append({"checkpoint": str(path), "seed": args.seed, "trace_id": trace_id, "error": str(exc)})
-            continue
-
-        result.update({
-            "checkpoint": str(path),
-            "seed": int(args.seed),
-            "trace_id": trace_id,
-            "dataset": args.dataset,
-            "score_aggregation": args.score_aggregation,
-            "score_smoothing_window": args.score_smoothing_window,
-            "normalize_score": args.normalize_score,
-            "mc_eval_samples": args.mc_eval_samples,
-        })
-        logging.info(
-            "[%s/seed=%d] %d calibration scores, %d test timepoints (%.2f%% anomalous):\n%s",
-            trace_id, args.seed, result["num_calibration"], result["num_test"],
-            100 * result["anomaly_rate"],
-            _alpha_frame(result["per_alpha"]).to_string(float_format=lambda v: f"{v:.4f}"),
+    by_trace_candidates: dict[str, list[dict]] = defaultdict(list)
+    for cand in candidates:
+        by_trace_candidates[cand["trace_key"]].append(cand)
+    traces = sorted(by_trace_candidates, key=lambda t: (len(t), t))
+    logging.info(
+        "%d checkpoint(s) over %d trace(s); seeds per trace: %s",
+        len(candidates), len(traces),
+        {trace: sorted(cand["seed"] for cand in by_trace_candidates[trace]) for trace in traces},
+    )
+    seed_counts = {len(by_trace_candidates[trace]) for trace in traces}
+    if len(seed_counts) > 1:
+        logging.warning(
+            "Traces do not all have the same number of checkpoints (%s). Per-trace means "
+            "and the macro average are then over different numbers of seeds.",
+            sorted(seed_counts),
         )
-        if cli_args.save_scores:
-            npz_path = out_dir / "scores" / f"CONFORMAL_{cli_args.dataset}_{run_id}__{path.stem}__seed{args.seed}.npz"
-            _save_arrays(npz_path, result["arrays"])
-            result["scores_file"] = str(npz_path)
-            logging.debug("Stored score arrays at %s", npz_path)
-        results.append(result)
 
-    if not results:
-        raise SystemExit(f"None of the {len(specs)} checkpoint(s) could be calibrated; see log above.")
+    # ---- per trace: calibrate every seed, aggregate, release the provider ---
+    results, per_trace, ensembles = [], {}, {}
+    for trace in traces:
+        trace_results, trace_failures = process_trace(
+            trace, by_trace_candidates[trace], cli_args, out_dir, run_id,
+        )
+        failures.extend(trace_failures)
+        if not trace_results:
+            logging.warning("Trace %s: no checkpoint could be calibrated.", trace)
+            continue
 
-    # ---- per trace / over seeds --------------------------------------------
-    by_trace: dict[str, list[dict]] = defaultdict(list)
-    for result in results:
-        by_trace[str(result["trace_id"])].append(result)
-
-    per_trace, ensembles = {}, {}
-    for trace, trace_results in by_trace.items():
-        trace_results.sort(key=lambda res: res["seed"])
         per_trace[trace] = aggregate_over_seeds(trace_results, cli_args.alphas)
         per_trace[trace]["seeds"] = [res["seed"] for res in trace_results]
         logging.info(
@@ -790,10 +978,32 @@ def main():
                     _alpha_frame(ensemble["per_alpha"]).to_string(float_format=lambda v: f"{v:.4f}"),
                 )
                 if cli_args.save_scores:
-                    npz_path = out_dir / "scores" / f"CONFORMAL_{cli_args.dataset}_{run_id}__trace-{trace}__ensemble.npz"
+                    npz_path = (out_dir / "scores" /
+                                f"CONFORMAL_{cli_args.dataset}_{run_id}__trace-{trace}__ensemble.npz")
                     _save_arrays(npz_path, ensemble["arrays"])
                     ensemble["scores_file"] = str(npz_path)
                 ensembles[trace] = _strip_arrays(ensemble)
+
+        # Everything per-trace is computed; only what the pooled view needs survives.
+        for res in trace_results:
+            _shrink_arrays(res, keep=("test_p_value", "test_labels") if cli_args.pool_traces else ())
+        results.extend(trace_results)
+
+    if not results:
+        raise SystemExit(f"None of the {len(candidates)} checkpoint(s) could be calibrated; see log above.")
+
+    # ---- pooled over traces (one operating point for the whole benchmark) --
+    # With a single trace the pooled view is the per-trace view, so skip it.
+    pooled = (pool_over_traces(results, cli_args.alphas)
+              if cli_args.pool_traces and len(per_trace) > 1 else None)
+    if pooled is not None:
+        logging.info(
+            "Pooled over all traces, per-trace calibration (mean over %d seed(s) %s; "
+            "%s traces / %s timepoints per seed):\n%s",
+            pooled["num_seeds"], pooled["seeds"], pooled["num_traces_per_seed"],
+            pooled["num_test_per_seed"],
+            _alpha_frame(pooled["per_alpha"]).to_string(float_format=lambda v: f"{v:.4f}"),
+        )
 
     # ---- macro over traces --------------------------------------------------
     macro_rows = []
@@ -844,6 +1054,7 @@ def main():
         "failed_checkpoints": failures,
         "per_trace": per_trace,
         "seed_ensemble": ensembles,
+        "pooled_over_traces": pooled,
         "macro_per_alpha": macro_rows,
         **macro_ranking,
     }
@@ -870,7 +1081,16 @@ def main():
                 run_datetime=run_id,
                 metrics={**row, "num_traces": len(per_trace)},
             )
-        logging.info("Appended per-trace and macro rows to %s", cli_args.final_metrics_csv)
+        if pooled is not None:
+            for row in pooled["per_alpha"]:
+                append_final_metrics_csv(
+                    csv_path=cli_args.final_metrics_csv,
+                    benchmark=f"{cli_args.dataset}:pooled:alpha={row['alpha']:g}",
+                    run_datetime=run_id,
+                    metrics={**row, "num_seeds": pooled["num_seeds"], "num_traces": len(per_trace)},
+                )
+        logging.info("Appended per-trace, macro%s rows to %s",
+                     " and pooled" if pooled is not None else "", cli_args.final_metrics_csv)
 
 
 if __name__ == "__main__":
