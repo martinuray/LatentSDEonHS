@@ -145,6 +145,29 @@ also holds raw-100 Hz QAD runs that are not comparable (unlike PSM, which has
 no decimation setting at all). Both exclude the sparsity sweep's
 fixed-subsample-mask runs.
 
+A tenth table (``baseline_table_QAD_per_trace.tex``) resolves QAD into its
+individual traces for the qualitative discussion: one row per trace, with
+our two LSD variants and the NeuralODE reference as column groups
+(QAD_PER_TRACE_MODELS -- the PYOD baselines are deliberately absent, this is
+not another ranking). For the same reason it is the one table here that
+highlights nothing: no ``\cellcolor``, no "Avg. Rank". Its last row is the
+benchmark aggregate and is read
+straight out of the same `values` dict the QAD table is built from, so it
+reproduces that table's cells exactly; `_report_per_trace_aggregate_mismatch`
+warns on the console if the mean of the trace rows disagrees with it, which
+can only happen if some run failed to log every trace. The rightmost column,
+"Type of Anomaly", is prose to be filled in by hand through the
+QAD_TRACE_ANOMALY_TYPES mapping (empty for traces not listed there, so the
+table can be generated before the mapping is complete -- the missing trace
+ids are printed). Below the trace rows, after some vertical space and in the
+same tabular, a second block summarises the same numbers by anomaly type:
+one row per distinct label, traces pooled over all their runs, with the outer
+columns swapped (type on the left, that type's traces on the right). Unlike
+every other table this one needs its own pass over
+the two model projects, since the main tables keep only each run's macro
+metrics and not the per-trace summary keys; ``--skip-qad-per-trace`` turns it
+off.
+
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
 """
@@ -227,6 +250,50 @@ CLASSIFIER_ORDER = [clf for group in NAMED_CLASSIFIER_GROUPS for clf in group]
 # it's a decimation ablation, not a benchmark of its own.
 ODE_VS_LSD_MODELS = [NEURALODE_CLASSIFIER, LSD_RN_LABEL, LSD_SN_LABEL]
 ODE_VS_LSD_BENCHMARK_GROUPS = [benchmarks for _, benchmarks in TABLE_GROUPS] + [[QAD_BENCHMARK]]
+
+# The QAD per-trace table (see build_qad_per_trace_table): one row per QAD
+# trace, these three models as column groups. Only our own models and the
+# NeuralODE reference -- the PYOD baselines are deliberately left out, this
+# table is for the qualitative per-trace discussion, not another ranking.
+QAD_PER_TRACE_MODELS = [LSD_RN_LABEL, LSD_SN_LABEL, NEURALODE_CLASSIFIER]
+# Label of that table's rightmost column, filled in by hand via
+# QAD_TRACE_ANOMALY_TYPES below.
+ANOMALY_TYPE_COLUMN = "Type of Anomaly"
+# Hand-maintained: QAD trace id -> the kind of anomaly that trace contains.
+# The id is the trace's `dataset_id`, which for QAD is the number of its
+# `train_<n>.pkl` (see QADProvider._resolve_dataset_ids), so the keys are "1"
+# ... "10" -- int keys work too, they are normalised on lookup. The values are
+# rendered verbatim, so LaTeX in them is fine (``\\textit{...}``, math, ...).
+# Traces missing here render an empty cell, so the table can be generated
+# before this is complete; run_qad_per_trace() prints which ids are still
+# unlabelled. Example:
+#
+#     QAD_TRACE_ANOMALY_TYPES = {
+#         "1": "stiction, slow onset",
+#         "2": r"valve leakage ($t > 40$\,s)",
+#     }
+QAD_TRACE_ANOMALY_TYPES: dict[str, str] = {
+    "1": "P,D",
+    "2": "D",
+    "3": "P",
+    "4": "P",
+    "5": "D",
+    "6": "P,D",
+    "7": "V",
+    "8": "D",
+    "9": "P,D",
+    "10": "P,D",
+}
+
+
+def anomaly_type(trace: str) -> str:
+    """QAD_TRACE_ANOMALY_TYPES lookup that accepts int as well as str keys.
+
+    QAD's trace ids are numbers that only become strings on their way through
+    W&B, so a hand-written mapping keyed by ``7`` instead of ``"7"`` is the
+    obvious mistake to make -- and it would silently render an empty cell.
+    """
+    return {str(key): value for key, value in QAD_TRACE_ANOMALY_TYPES.items()}.get(trace, "")
 
 # clf_name -> shorter display label for the LaTeX "Method"/"Model" column;
 # classifiers not listed here are shown under their plain name. Internal
@@ -441,6 +508,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-sparsity", action="store_true",
         help="Don't fetch/render the QAD sparsity table.",
     )
+    parser.add_argument(
+        "--skip-qad-per-trace", action="store_true",
+        help="Don't fetch/render the QAD per-trace table (it needs its own pass over the two "
+             "model projects to read their per-trace summary keys).",
+    )
     # One --skip-<benchmark>-ablation / --<benchmark>-high-capacity-decoder pair
     # per ablation table, so the PSM and QAD ablations can be skipped and
     # configured independently.
@@ -595,33 +667,25 @@ def uses_fixed_subsample_mask(config: dict) -> bool:
     return bool((config.get("args") or {}).get("fixed_subsample_mask", False))
 
 
-def fetch_anomaly_detection_run_records(
+def _iter_anomaly_detection_runs(
     project: str,
     entity: str | None,
     clf_name_fn,
     min_created_at: pd.Timestamp | None = None,
     require_full_trace: bool = False,
-) -> dict[tuple[str, str], list[RunEntry]]:
-    """Fetch runs logged via anomaly_detection.py's shared W&B helpers.
+):
+    """Yield ``(record_benchmark, clf_name, created_at, seed, run)`` per usable run.
 
-    Used for both the NeuralODE project and the "ours" (LSD) project: both
-    log a single model per run (no `clf_name`/benchmark-list config) and
-    identify themselves via ``run_context.benchmark_name`` /
-    ``run_context.model_variant``. `clf_name_fn(run_context)` maps a run's
-    context to the row/classifier label to bucket it under (return a falsy
-    value to skip the run). If `require_full_trace` is set, runs restricted
-    to a subset of traces via --trace-ids (benchmark_name containing ":")
-    are skipped -- their logged metrics wouldn't be a mean over every trace.
-
-    Sparsity-sweep runs (``args.fixed_subsample_mask`` set) are always
-    skipped: they train on a fixed, heavily subsampled mask and belong to the
-    sparsity table only -- see fetch_ad_sparsity_run_records.
+    The run-acceptance logic of the anomaly_detection.py-style projects, shared
+    by fetch_anomaly_detection_run_records (which reads each run's macro
+    metrics) and fetch_qad_per_trace_records (which reads the same runs'
+    per-trace metrics). It lives in one place on purpose: the per-trace table's
+    final row is only guaranteed to match the QAD table's row if both sides
+    select runs with literally the same code.
     """
     api = wandb.Api()
     path = f"{entity}/{project}" if entity else project
     runs = api.runs(path, order="-created_at")
-
-    records: dict[tuple[str, str], list[RunEntry]] = defaultdict(list)
 
     for run in runs:
         config = run.config or {}
@@ -664,7 +728,36 @@ def fetch_anomaly_detection_run_records(
         if benchmark != QAD_BENCHMARK and min_created_at is not None and created_at < min_created_at:
             continue
 
-        seed = run_context.get("run_seed")
+        yield record_benchmark, clf_name, created_at, run_context.get("run_seed"), run
+
+
+def fetch_anomaly_detection_run_records(
+    project: str,
+    entity: str | None,
+    clf_name_fn,
+    min_created_at: pd.Timestamp | None = None,
+    require_full_trace: bool = False,
+) -> dict[tuple[str, str], list[RunEntry]]:
+    """Fetch runs logged via anomaly_detection.py's shared W&B helpers.
+
+    Used for both the NeuralODE project and the "ours" (LSD) project: both
+    log a single model per run (no `clf_name`/benchmark-list config) and
+    identify themselves via ``run_context.benchmark_name`` /
+    ``run_context.model_variant``. `clf_name_fn(run_context)` maps a run's
+    context to the row/classifier label to bucket it under (return a falsy
+    value to skip the run). If `require_full_trace` is set, runs restricted
+    to a subset of traces via --trace-ids (benchmark_name containing ":")
+    are skipped -- their logged metrics wouldn't be a mean over every trace.
+
+    Sparsity-sweep runs (``args.fixed_subsample_mask`` set) are always
+    skipped: they train on a fixed, heavily subsampled mask and belong to the
+    sparsity table only -- see fetch_ad_sparsity_run_records.
+    """
+    records: dict[tuple[str, str], list[RunEntry]] = defaultdict(list)
+
+    for record_benchmark, clf_name, created_at, seed, run in _iter_anomaly_detection_runs(
+        project, entity, clf_name_fn, min_created_at, require_full_trace
+    ):
         metrics = _extract_ad_summary_metrics(dict(run.summary))
         if not metrics:
             continue  # run failed or never produced usable metrics
@@ -701,6 +794,50 @@ def fetch_ours_run_records(
         min_created_at=min_created_at,
         require_full_trace=True,
     )
+
+
+def _per_trace_summary_metrics(summary: dict) -> dict[str, dict[str, float]]:
+    """Return ``{dataset_id: {metric: value}}`` of one anomaly_detection.py run.
+
+    Reads the ``summary/per_dataset/<id>/<metric>`` entries that
+    anomaly_detection.py's `_wandb_log_final_outputs` writes for every
+    sub-trace of a multi-trace benchmark. These are the per-trace counterparts
+    of the macro values `_extract_ad_summary_metrics` returns -- in fact that
+    function *computes* its QAD value as the unweighted mean of exactly these.
+    """
+    per_trace: dict[str, dict[str, float]] = defaultdict(dict)
+    for key, value in summary.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        match = PER_DATASET_KEY_RE.match(key)
+        if match:
+            per_trace[match.group("dataset_id")][match.group("metric")] = float(value)
+    return dict(per_trace)
+
+
+def fetch_qad_per_trace_records(
+    project: str, entity: str | None, clf_name_fn, require_full_trace: bool
+) -> dict[tuple[str, str], list[RunEntry]]:
+    """Fetch QAD runs resolved per trace: ``{(dataset_id, model): [RunEntry, ...]}``.
+
+    Same runs as fetch_anomaly_detection_run_records (same generator, same
+    filters, QAD_REQUIRED_DECIMATION included), but each run contributes one
+    entry *per trace* instead of a single macro entry. The key puts the trace
+    where the other tables put the benchmark and the model where they put the
+    classifier, so dedupe_by_seed / select_recent_runs apply unchanged.
+    """
+    records: dict[tuple[str, str], list[RunEntry]] = defaultdict(list)
+
+    for record_benchmark, clf_name, created_at, seed, run in _iter_anomaly_detection_runs(
+        project, entity, clf_name_fn, min_created_at=None, require_full_trace=require_full_trace
+    ):
+        if record_benchmark != QAD_BENCHMARK:
+            continue
+        for dataset_id, metrics in _per_trace_summary_metrics(dict(run.summary)).items():
+            if metrics:
+                records[(dataset_id, clf_name)].append((created_at, seed, metrics))
+
+    return records
 
 
 # (subsample, clf_name, interp_method); interp is OURS_SPARSITY_INTERP (None)
@@ -1367,6 +1504,192 @@ def to_ode_vs_lsd_latex(table: pd.DataFrame) -> str:
     )
 
 
+def _natural_sort_key(text: str) -> list:
+    """Sort key that orders embedded numbers numerically: trace_2 before trace_10."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def latex_escape(text: str) -> str:
+    """Escape the characters that make LaTeX choke on a raw W&B identifier.
+
+    Needed for the QAD trace ids, which are the only row labels in this file
+    that are not hand-written: an id like ``trace_01`` would otherwise be read
+    as a subscript. Deliberately not applied to QAD_TRACE_ANOMALY_TYPES --
+    those are hand-written and may legitimately contain markup.
+    """
+    for char in ("\\", "&", "%", "$", "#", "_", "{", "}"):
+        text = text.replace(char, f"\\{char}")
+    return text.replace("~", r"\textasciitilde{}").replace("^", r"\textasciicircum{}")
+
+
+def build_qad_per_trace_table(
+    per_trace_values: dict[tuple[str, str], dict[str, list[float]]],
+    values: dict[tuple[str, str], dict[str, list[float]]],
+) -> tuple[pd.DataFrame, list[str]]:
+    """QAD per-trace table: one row per trace, QAD_PER_TRACE_MODELS as column groups.
+
+    Returns (formatted table, trace ids in row order). The layout follows
+    build_ode_vs_lsd_table -- models as column groups -- but resolves QAD into
+    its individual traces instead of collapsing it into one row, for the
+    qualitative discussion of which anomaly types each model does and does not
+    catch. Unlike every other table in this file it highlights nothing: the
+    point here is the per-trace pattern next to the anomaly type, and a
+    per-row winner would invite reading it as yet another ranking.
+
+    The final row is the benchmark aggregate and is taken straight from
+    `values`, the very dict the QAD table is built from, so it reproduces that
+    table's numbers exactly rather than being recomputed from the trace rows.
+    That matters for the std in particular: the aggregate's std is the spread
+    of the per-run *macro* values over seeds, which is not recoverable from
+    the per-trace standard deviations.
+
+    A trailing ANOMALY_TYPE_COLUMN is filled from QAD_TRACE_ANOMALY_TYPES and
+    left empty for traces not listed there (and always empty on the aggregate
+    row, which spans every anomaly type).
+    """
+    traces = sorted({trace for (trace, _) in per_trace_values}, key=_natural_sort_key)
+    metric_labels = [METRIC_LABELS[m] for m in METRICS]
+    total_label = BENCHMARK_LABELS.get(QAD_BENCHMARK, QAD_BENCHMARK)
+    rows = traces + [total_label]
+
+    columns = pd.MultiIndex.from_product([QAD_PER_TRACE_MODELS, metric_labels])
+    text_table = pd.DataFrame(index=rows, columns=columns, dtype=object)
+    text_table.index.name = "trace"
+
+    # No mean_table companion here: the other tables keep the numeric means
+    # around only to rank or highlight them, and this one does neither.
+    for model in QAD_PER_TRACE_MODELS:
+        # The trace rows come from the per-trace keys, the aggregate row from
+        # `values` under the plain benchmark key -- the QAD table's own source.
+        sources = {trace: per_trace_values.get((trace, model)) for trace in traces}
+        sources[total_label] = values.get((QAD_BENCHMARK, model))
+        for row, metric_values in sources.items():
+            metric_values = metric_values or {}
+            for metric in METRICS:
+                mean, std = mean_std(metric_values.get(metric, []))
+                text_table.loc[row, (model, METRIC_LABELS[metric])] = format_cell(mean, std)
+
+    # Trace ids come from W&B, so they have to be escaped (``trace_01`` would
+    # read as a subscript); the aggregate label is ours and already LaTeX.
+    text_table.insert(0, ("", "Trace"), pd.Series(
+        {trace: latex_escape(trace) for trace in traces} | {total_label: total_label}
+    ))
+    text_table[("", ANOMALY_TYPE_COLUMN)] = pd.Series(
+        {trace: anomaly_type(trace) for trace in traces} | {total_label: ""}
+    )
+    return text_table.fillna("--"), traces
+
+
+def build_qad_anomaly_type_summary(
+    per_trace_values: dict[tuple[str, str], dict[str, list[float]]],
+) -> pd.DataFrame:
+    """Aggregate the per-trace values by anomaly type: one row per type.
+
+    Traces are grouped by their QAD_TRACE_ANOMALY_TYPES label *verbatim*, so a
+    trace labelled "P,D" forms its own group instead of counting towards both
+    "P" and "D". The groups therefore partition the traces -- every trace is in
+    exactly one row and the trace counts add up -- which keeps the summary
+    reconcilable with the per-trace block above it. Traces with no label yet
+    are collected under MISSING_CELL rather than dropped, so a half-filled
+    mapping can never make traces disappear unnoticed.
+
+    Within a group, every run of every trace is pooled into one sample. That
+    keeps "+/-" meaning what it means in every other table here (spread over
+    runs, not over traces) and makes a single-trace type reproduce that
+    trace's own row exactly, instead of claiming a std of 0.00.
+    """
+    by_type: dict[str, list[str]] = defaultdict(list)
+    for trace in sorted({trace for (trace, _) in per_trace_values}, key=_natural_sort_key):
+        by_type[anomaly_type(trace) or MISSING_CELL].append(trace)
+
+    types = sorted(by_type)
+    columns = pd.MultiIndex.from_product([QAD_PER_TRACE_MODELS, [METRIC_LABELS[m] for m in METRICS]])
+    text_table = pd.DataFrame(index=types, columns=columns, dtype=object)
+    text_table.index.name = "anomaly_type"
+
+    for type_label in types:
+        for model in QAD_PER_TRACE_MODELS:
+            for metric in METRICS:
+                pooled = [
+                    value
+                    for trace in by_type[type_label]
+                    for value in per_trace_values.get((trace, model), {}).get(metric, [])
+                ]
+                text_table.loc[type_label, (model, METRIC_LABELS[metric])] = format_cell(*mean_std(pooled))
+
+    # The type labels are hand-written (QAD_TRACE_ANOMALY_TYPES), so they go in
+    # verbatim like in the block above; the trace ids are W&B's and are escaped.
+    text_table.insert(0, ("", "Anomaly type"), pd.Series({label: label for label in types}))
+    text_table[("", "Traces")] = pd.Series({
+        label: ", ".join(latex_escape(trace) for trace in by_type[label]) for label in types
+    })
+    return text_table.fillna(MISSING_CELL)
+
+
+def _per_trace_metric_cells(first_cell: str, last_cell: str) -> str:
+    """One header row of the per-trace table: row label, 3 metrics per model, trailing label."""
+    cells = [first_cell]
+    for _ in QAD_PER_TRACE_MODELS:
+        cells += [r"\textbf{AUC} \big\uparrow", r"\textbf{AUPRC} \big\uparrow", r"\textbf{F1} \big\uparrow"]
+    cells.append(last_cell)
+    return " & ".join(cells) + r" \\"
+
+
+def to_qad_per_trace_latex(table: pd.DataFrame, summary: pd.DataFrame | None = None) -> str:
+    """Render the QAD per-trace table, optionally with the by-anomaly-type summary.
+
+    A \\midrule separates the aggregate row (the per-trace block's last) from
+    the trace rows; the anomaly-type column is left-aligned prose, not a
+    number, so it sits outside the \\cmidrule groups.
+
+    `summary` (from build_qad_anomaly_type_summary) is appended as a second
+    block in the *same* tabular, after some vertical space and its own header
+    row -- same column widths, so the two blocks stay aligned, which they would
+    not in two separate tabulars. Its outer columns swap roles: the left one
+    now holds the anomaly type and the right one the traces of that type, so
+    the mapping is readable in both directions without cross-referencing.
+    """
+    column_format = "l " + " ".join(["rrr"] * len(QAD_PER_TRACE_MODELS)) + " l"
+    group_cells = " & ".join(
+        f"\\multicolumn{{3}}{{c}}{{\\small \\textbf{{{display_label(model)}}}}}"
+        for model in QAD_PER_TRACE_MODELS
+    )
+    header = "\n".join([
+        f"& {group_cells} & \\\\",
+        _cmidrule_spans(len(QAD_PER_TRACE_MODELS), first_metric_col=2),
+        _per_trace_metric_cells(r"\textbf{Trace}", f"\\textbf{{{ANOMALY_TYPE_COLUMN}}}"),
+    ])
+
+    lines = []
+    for i, row in enumerate(table.itertuples(index=False), start=1):
+        # The aggregate is the last row; set it off like the other tables' groups.
+        if i == len(table):
+            lines.append(r"\midrule")
+        lines.append(" & ".join(str(value) for value in row) + r" \\")
+
+    if summary is not None and not summary.empty:
+        lines += [
+            r"\addlinespace[2.5ex]",
+            r"\midrule",
+            _per_trace_metric_cells(r"\textbf{Anomaly type}", r"\textbf{Traces}"),
+            r"\midrule",
+        ]
+        lines += [" & ".join(str(value) for value in row) + r" \\"
+                  for row in summary.itertuples(index=False)]
+
+    rows = "\n".join(lines)
+
+    return (
+        f"\\begin{{tabular}}{{{column_format}}}\n"
+        f"\\toprule\n"
+        f"{header}\n"
+        f"\\midrule\n"
+        f"{rows}\n"
+        f"\\bottomrule\n"
+        f"\\end{{tabular}}"
+    )
+
+
 def sparsity_column_label(subsample: float) -> str:
     """Column-group header for a subsample level, e.g. 0.01 -> ``QAPPD (1\\%)``."""
     return f"{BENCHMARK_LABELS.get(QAD_BENCHMARK, QAD_BENCHMARK).split(' (')[0]} ({subsample * 100:g}\\%)"
@@ -1971,6 +2294,92 @@ def run_ablation(args: argparse.Namespace, spec: AblationSpec) -> None:
     print(f"Saved to {out_path}")
 
 
+def _report_per_trace_aggregate_mismatch(
+    per_trace_values: dict[tuple[str, str], dict[str, list[float]]],
+    values: dict[tuple[str, str], dict[str, list[float]]],
+    traces: list[str],
+    tolerance: float = 0.01,
+) -> None:
+    """Warn where the trace rows' mean disagrees with the aggregate row.
+
+    The aggregate row is the QAD table's own number, and QAD's per-run macro
+    value is the unweighted mean over that run's traces (see
+    `_extract_ad_summary_metrics`), so the mean of the trace rows has to
+    reproduce it. It does not if a run logged only some traces, or if a trace
+    has a different number of runs behind it than the aggregate does -- both
+    silent, both worth knowing about before the table goes into the paper.
+    """
+    for model in QAD_PER_TRACE_MODELS:
+        aggregate = values.get((QAD_BENCHMARK, model), {})
+        for metric in METRICS:
+            aggregate_mean, _ = mean_std(aggregate.get(metric, []))
+            trace_means = [
+                mean for mean, _ in (
+                    mean_std(per_trace_values.get((trace, model), {}).get(metric, []))
+                    for trace in traces
+                ) if mean is not None
+            ]
+            if aggregate_mean is None or not trace_means:
+                continue
+            deviation = abs(float(np.mean(trace_means)) - aggregate_mean)
+            if deviation > tolerance:
+                print(f"  WARNING: {model} / {METRIC_LABELS[metric]}: mean over {len(trace_means)} trace "
+                      f"rows is {np.mean(trace_means):.2f}, aggregate row is {aggregate_mean:.2f} "
+                      f"(off by {deviation:.2f}) -- some run did not log every trace.")
+
+
+def run_qad_per_trace(args: argparse.Namespace, values: dict[tuple[str, str], dict[str, list[float]]]) -> None:
+    """Fetch, build and write the QAD per-trace table (one row per QAD trace).
+
+    Needs its own pass over the two model projects: the main tables keep only
+    each run's macro metrics, so the per-trace summary keys are not available
+    from `values`. `values` is still passed in -- the aggregate row is read
+    from it so that row is the QAD table's row by construction.
+    """
+    records: dict[tuple[str, str], list[RunEntry]] = defaultdict(list)
+    if not args.skip_ours:
+        ours = fetch_qad_per_trace_records(
+            args.ours_project, args.ours_entity,
+            clf_name_fn=lambda rc: OURS_VARIANT_LABELS.get(rc.get("model_variant")),
+            require_full_trace=True,
+        )
+        for key, entries in ours.items():
+            records[key].extend(entries)
+    if not args.skip_neuralode:
+        ode = fetch_qad_per_trace_records(
+            args.ode_project, args.ode_entity,
+            clf_name_fn=lambda rc: NEURALODE_CLASSIFIER,
+            require_full_trace=False,
+        )
+        for key, entries in ode.items():
+            records[key].extend(entries)
+
+    if not records:
+        print("\nNo QAD runs with per-trace summary keys found; skipping the per-trace table.")
+        return
+
+    per_trace_values = select_recent_runs(dedupe_by_seed(records))
+
+    print(f"\nQAD per-trace runs found per trace/model (most recent {DEFAULT_RUN_LIMIT} per cell):")
+    print(build_run_count_table(per_trace_values).to_string())
+
+    table, traces = build_qad_per_trace_table(per_trace_values, values)
+    _report_per_trace_aggregate_mismatch(per_trace_values, values, traces)
+
+    untyped = [trace for trace in traces if not anomaly_type(trace)]
+    if untyped:
+        print(f"\n'{ANOMALY_TYPE_COLUMN}' is empty for {len(untyped)} of {len(traces)} traces; fill in "
+              f"QAD_TRACE_ANOMALY_TYPES for: {', '.join(repr(trace) for trace in untyped)}")
+
+    latex = to_qad_per_trace_latex(table, build_qad_anomaly_type_summary(per_trace_values))
+    print("\nLaTeX table (QAD per trace, with the by-anomaly-type summary)")
+    print(latex)
+
+    out_path = args.output_dir / "baseline_table_QAD_per_trace.tex"
+    out_path.write_text(latex)
+    print(f"Saved to {out_path}")
+
+
 def build_comparison_table(avg_rank_single: pd.Series, avg_rank_multi: pd.Series) -> pd.DataFrame:
     """Combine two tables' avg-rank columns into Overall/Single Trace/Multi Trace.
 
@@ -2111,6 +2520,9 @@ def main() -> None:
     ode_vs_lsd_out_path = args.output_dir / "baseline_table_ode_vs_lsd.tex"
     ode_vs_lsd_out_path.write_text(ode_vs_lsd_latex)
     print(f"Saved to {ode_vs_lsd_out_path}")
+
+    if not args.skip_qad_per_trace:
+        run_qad_per_trace(args, values)
 
     sparsity_records = None
     if not args.skip_sparsity:
