@@ -168,6 +168,19 @@ the two model projects, since the main tables keep only each run's macro
 metrics and not the per-trace summary keys; ``--skip-qad-per-trace`` turns it
 off.
 
+An eleventh table (``baseline_table_runtime.tex``) reports runtimes: one row
+per method (CLASSIFIER_ORDER, same row groups as the main tables) and one
+column per benchmark (RUNTIME_BENCHMARKS: SWaT, WaDi, PSM, SMAP, MSL, SMD,
+QAPPD), each cell ``mean \std{std}`` in seconds. Neither baseline.py nor
+anomaly_detection*.py logs a dedicated training-time key, so the value used
+is W&B's own per-run wall-clock ``_runtime`` -- one W&B run is one (benchmark,
+method, seed), so this is the total time of that seed over every trace of the
+benchmark, including data loading and scoring the test set. It is read from
+the very runs the main tables use (same filters, same seed dedupe), except
+that DETERMINISTIC_CLASSIFIERS are not cut to one run here: their scores are
+identical across seeds, their runtimes are not. Nothing is highlighted, since
+runs landed on different hardware.
+
 A console-only table reports how many (post-filtering) W&B runs were
 found per (benchmark, classifier) configuration.
 """
@@ -195,6 +208,12 @@ DEFAULT_OUTPUT_DIR = ROOT_DIR / "out" / "doc"
 
 METRICS = ["auc_roc", "auc_pr", "f1"]
 METRIC_LABELS = {"auc_roc": "AUC", "auc_pr": "AUPRC", "f1": "F1"}
+# Extra entry stored alongside METRICS in each run's metrics dict: W&B's
+# per-run wall-clock seconds (summary `_runtime`), for the runtime table only.
+# Every selector that builds metric tables reads METRICS alone, so this key
+# never leaks into them.
+RUNTIME_KEY = "runtime_sec"
+WANDB_RUNTIME_SUMMARY_KEY = "_runtime"
 
 TABLE_GROUPS = [
     ("SWaT_WaDi_PSM", ["SWaT", "WaDi", "PSM"]),
@@ -219,6 +238,8 @@ QAD_REQUIRED_DECIMATION = 10
 QAD_APPENDIX_DECIMATION = 1
 QAD_DECIMATION1_BENCHMARK = "QAD (decimation=1)"
 KNOWN_BENCHMARKS = {benchmark for _, benchmarks in TABLE_GROUPS for benchmark in benchmarks} | {QAD_BENCHMARK}
+# Column order of the runtime table (see build_runtime_table).
+RUNTIME_BENCHMARKS = ["SWaT", "WaDi", "PSM", "SMAP", "MSL", "SMD", QAD_BENCHMARK]
 
 # These classifiers are deterministic (no randomness across seeds), so
 # repeating them doesn't add information: only the most recent run is used.
@@ -621,10 +642,18 @@ def fetch_run_records(
                 metrics[metric] = float(value)
         if not metrics:
             continue  # run failed or never produced a successful macro row
+        _add_runtime(metrics, summary)
 
         records[(record_benchmark, clf_name)].append((created_at, seed, metrics))
 
     return records
+
+
+def _add_runtime(metrics: dict[str, float], summary) -> None:
+    """In-place: store the run's W&B wall-clock seconds under RUNTIME_KEY, if logged."""
+    value = summary.get(WANDB_RUNTIME_SUMMARY_KEY)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        metrics[RUNTIME_KEY] = float(value)
 
 
 def _extract_ad_summary_metrics(summary: dict) -> dict[str, float]:
@@ -758,9 +787,11 @@ def fetch_anomaly_detection_run_records(
     for record_benchmark, clf_name, created_at, seed, run in _iter_anomaly_detection_runs(
         project, entity, clf_name_fn, min_created_at, require_full_trace
     ):
-        metrics = _extract_ad_summary_metrics(dict(run.summary))
+        summary = dict(run.summary)
+        metrics = _extract_ad_summary_metrics(summary)
         if not metrics:
             continue  # run failed or never produced usable metrics
+        _add_runtime(metrics, summary)
 
         records[(record_benchmark, clf_name)].append((created_at, seed, metrics))
 
@@ -1038,11 +1069,74 @@ def select_recent_runs(
 
         metric_values = {m: [] for m in METRICS}
         for _, _, metrics in most_recent:
-            for metric, value in metrics.items():
-                metric_values[metric].append(value)
+            for metric in METRICS:
+                if metric in metrics:
+                    metric_values[metric].append(metrics[metric])
         values[(benchmark, clf_name)] = metric_values
 
     return values
+
+
+def select_recent_runtimes(records: dict[tuple[str, str], list[RunEntry]]) -> dict[tuple[str, str], list[float]]:
+    """Runtime counterpart of select_recent_runs: {(benchmark, clf): [seconds, ...]}.
+
+    Takes the DEFAULT_RUN_LIMIT most recent runs that logged a runtime, for
+    *every* classifier -- DETERMINISTIC_CLASSIFIERS included, since only their
+    scores repeat across seeds, not their runtimes.
+    """
+    runtimes: dict[tuple[str, str], list[float]] = {}
+    for key, entries in records.items():
+        timed = [entry for entry in entries if RUNTIME_KEY in entry[2]]
+        most_recent = sorted(timed, key=lambda item: item[0], reverse=True)[:DEFAULT_RUN_LIMIT]
+        runtimes[key] = [metrics[RUNTIME_KEY] for _, _, metrics in most_recent]
+    return runtimes
+
+
+def format_runtime_cell(vals: list[float]) -> str:
+    """``mean \\std{std}`` in seconds (no x100 scaling); one decimal below 100 s."""
+    if not vals:
+        return MISSING_CELL
+    arr = np.asarray(vals, dtype=float)
+    mean, std = float(arr.mean()), float(arr.std(ddof=0))
+    fmt = ".1f" if mean < 100 else ".0f"
+    return f"{mean:{fmt}} \\std{{{std:{fmt}}}}"
+
+
+def build_runtime_table(runtimes: dict[tuple[str, str], list[float]]) -> pd.DataFrame:
+    """Runtime table: one row per method (CLASSIFIER_ORDER), one column per RUNTIME_BENCHMARKS entry."""
+    table = pd.DataFrame(index=CLASSIFIER_ORDER, columns=RUNTIME_BENCHMARKS, dtype=object)
+    for clf_name in CLASSIFIER_ORDER:
+        for benchmark in RUNTIME_BENCHMARKS:
+            table.loc[clf_name, benchmark] = format_runtime_cell(runtimes.get((benchmark, clf_name), []))
+    table.insert(0, "Model", pd.Series({c: display_label(c) for c in CLASSIFIER_ORDER}))
+    return table
+
+
+def build_runtime_count_table(runtimes: dict[tuple[str, str], list[float]]) -> pd.DataFrame:
+    """Console-only: number of timed runs behind each runtime-table cell."""
+    return pd.DataFrame(
+        {b: [len(runtimes.get((b, c), [])) for c in CLASSIFIER_ORDER] for b in RUNTIME_BENCHMARKS},
+        index=pd.Index(CLASSIFIER_ORDER, name="classifier"),
+    )
+
+
+def to_runtime_latex(table: pd.DataFrame) -> str:
+    """Render the runtime table: Model + one seconds column per benchmark, \\midrule between row groups."""
+    column_format = "l " + "r" * len(RUNTIME_BENCHMARKS)
+    header_cells = [r"\textbf{Model}"] + [
+        f"\\small \\textbf{{{BENCHMARK_LABELS.get(b, b)}}}" for b in RUNTIME_BENCHMARKS
+    ]
+    header = " & ".join(header_cells) + r" \\"
+    rows = render_data_rows(table)
+    return (
+        f"\\begin{{tabular}}{{{column_format}}}\n"
+        f"\\toprule\n"
+        f"{header}\n"
+        f"\\midrule\n"
+        f"{rows}\n"
+        f"\\bottomrule\n"
+        f"\\end{{tabular}}"
+    )
 
 
 def build_run_count_table(values: dict[tuple[str, str], dict[str, list[float]]]) -> pd.DataFrame:
@@ -2520,6 +2614,19 @@ def main() -> None:
     ode_vs_lsd_out_path = args.output_dir / "baseline_table_ode_vs_lsd.tex"
     ode_vs_lsd_out_path.write_text(ode_vs_lsd_latex)
     print(f"Saved to {ode_vs_lsd_out_path}")
+
+    runtimes = select_recent_runtimes(records)
+    print(f"\nTimed runs per benchmark/classifier (W&B `{WANDB_RUNTIME_SUMMARY_KEY}`, most recent "
+          f"{DEFAULT_RUN_LIMIT} for every classifier):")
+    print(build_runtime_count_table(runtimes).to_string())
+    runtime_latex = to_runtime_latex(build_runtime_table(runtimes))
+
+    print("\nLaTeX table (runtime in seconds, mean +/- std over runs)")
+    print(runtime_latex)
+
+    runtime_out_path = args.output_dir / "baseline_table_runtime.tex"
+    runtime_out_path.write_text(runtime_latex)
+    print(f"Saved to {runtime_out_path}")
 
     if not args.skip_qad_per_trace:
         run_qad_per_trace(args, values)
