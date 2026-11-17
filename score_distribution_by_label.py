@@ -30,6 +30,8 @@ Figure: one axis per trace. Each axis holds thin horizontal box plots, top to
 bottom: the benign test timepoints of the clean data, the benign timepoints at
 each noise level, and the anomalous timepoints of the clean data, all on one
 score axis (the anomalous scores under noise are still scored and stored).
+The largest noise level is scored and stored but left out of every figure,
+unless ``--no-exclude-max-sigma`` is given.
 Scores of different traces come from different models, so each trace gets its
 own axis range unless ``--sharex`` is given.
 
@@ -156,6 +158,11 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
         "--sharex", action="store_true",
         help="Share the score axis across traces. Off by default: the traces' scores come from "
              "different models and need not share a scale.",
+    )
+    group.add_argument(
+        "--exclude-max-sigma", action=argparse.BooleanOptionalAction, default=True,
+        help="Leave the largest noise level out of all figures (it is still scored and stored). "
+             "On by default; --no-exclude-max-sigma plots every level.",
     )
     group.add_argument("--log-x", action="store_true", help="Log-scale the score axes.")
     group.add_argument(
@@ -746,6 +753,10 @@ def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict
 
 def make_plots(results: dict, traces: list[str], levels: list[float], snaps: dict, windows: dict,
                cli_args, stem: Path) -> None:
+    if cli_args.exclude_max_sigma and max(levels) > CLEAN:
+        logging.info("Not plotting the largest noise level, sigma = %g (--no-exclude-max-sigma keeps it).",
+                     max(levels))
+        levels = [sigma for sigma in levels if sigma != max(levels)]
     plot_per_trace(results, traces, levels, cli_args, stem, draw=draw_trace_boxes,
                    row_height=0.25 * (len(levels) + 1) + 0.45, legend_cols=len(GROUPS))
     density_stem = stem.parent / f"{stem.name}_density"
