@@ -47,7 +47,7 @@ Outputs (in ``--eval-out-dir``):
     normalisation or smoothing. The x axis is the time relative to the onset and
     is shared by every panel; anomalous stretches are shaded. The folder
     ``..._snapshots/`` holds the same panels as single figures, with a legend.
-    The NLL series also go into the .npz (``...__nll``).
+    The snapshot NLL also goes into the .npz (``...__nll`` over ``trace<id>__snapshot_t``).
 
 Examples::
 
@@ -236,26 +236,59 @@ def noisy_loader(dl: DataLoader, noise: torch.Tensor) -> DataLoader:
 # --------------------------------------------------------------------------- #
 # Scoring
 # --------------------------------------------------------------------------- #
-def test_series(dataset: Dataset, length: int) -> np.ndarray:
-    """The clean test series [time, feature] (``evd_obs``, NaN where no window covers a timepoint).
+def test_series(dataset: Dataset, length: int) -> tuple[np.ndarray, np.ndarray]:
+    """The clean test series [time, feature] and the time span of every window.
 
-    Rebuilt from the windows by their global time indices; overlapping windows
-    carry the same values, so the order of writing does not matter.
+    The series (``evd_obs``, NaN where no window covers a timepoint) is rebuilt
+    from the windows by their global time indices; overlapping windows carry
+    the same values, so the order of writing does not matter. ``spans[i]`` is
+    the (first, last) global time index of window ``i``.
     """
     series = np.full((length, int(dataset.input_dim)), np.nan)
+    spans = np.empty((len(dataset), 2), dtype=int)
     for i in range(len(dataset)):
         item = dataset[i]
-        series[np.asarray(item["inp_indcs"]).astype(int)] = np.asarray(item["evd_obs"], dtype=float)
-    return series
+        idx = np.asarray(item["inp_indcs"]).astype(int)
+        series[idx] = np.asarray(item["evd_obs"], dtype=float)
+        spans[i] = idx.min(), idx.max()
+    return series, spans
 
 
-def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float]) -> tuple[dict[float, tuple], dict]:
+class WindowSubset(Dataset):
+    """Some windows of a split; attributes (indcs, input_dim, ...) are the full split's."""
+
+    def __init__(self, base: Dataset, positions: np.ndarray):
+        self.base = base
+        self.positions = [int(p) for p in positions]
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["base"], name)
+
+    def __getitem__(self, idx):
+        return self.base[self.positions[idx]]
+
+
+def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float],
+                window_fn=None) -> tuple[dict[float, tuple], dict]:
     """Score the test split once per noise level.
 
     Returns ``({sigma: (global time index, scalar score, label)}, snapshot data)``.
     The snapshot data holds what the onset plots need: the clean series, the
-    noise pattern, the labels and covered timepoints, and per level the
-    per-timepoint NLL (summed over the variates, NaN where not covered).
+    noise pattern, the labels and covered timepoints, and -- if `window_fn`
+    (snapshot data -> (onset, time slice) or None) finds a snapshot window --
+    that window and, per level, the per-timepoint NLL on it (summed over the
+    variates; NaN outside the window).
+
+    The NLL needs its own pass: compute_eval_scores applies the score
+    normalisation per window *position* (its min/max are [window length,
+    feature]) before averaging the overlapping windows, so the raw NLL cannot
+    be recovered from the normalised scores, nor the other way round. That pass
+    only runs the windows overlapping the snapshot, which still gives every
+    timepoint in it all of its windows -- the same average as a full pass, up
+    to the MC sampling of the decoder.
     """
     device = args.device
     dl_trn, dl_tst, _dl_val, input_dim, num_timepoints = _make_loaders(provider, ds_idx, args)
@@ -277,41 +310,54 @@ def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float]) ->
     rng = np.random.default_rng(abs(int(args.seed)))
     base_noise = torch.from_numpy(
         rng.standard_normal((length, int(dl_tst.dataset.input_dim))).astype(np.float32))
-    snap = {
-        "series": test_series(dl_tst.dataset, length),
-        "noise": base_noise.numpy(),
-        "covered": covered,
-        "feature_names": getattr(getattr(dl_tst.dataset, "base_dataset", None), "feature_names", None),
-        "nll": {},
-    }
+
+    def loader_for(sigma, dl):
+        return dl if sigma == CLEAN else noisy_loader(dl, sigma * base_noise)
 
     out = {}
     for sigma in levels:
-        loader = dl_tst if sigma == CLEAN else noisy_loader(dl_tst, sigma * base_noise)
         # Same random subsample masks / MC samples in every pass.
         torch.manual_seed(abs(int(args.seed)))
-        # The pass runs without score normalisation so the raw NLL is kept for
-        # the snapshots. compute_eval_scores would apply the normalisation per
-        # window before averaging the overlapping windows; it is affine per
-        # variate, so applying it to the averaged scores here gives the same result.
-        _stats, raw_nll, raw_labels = compute_eval_scores(
-            args, loader, modules, elbo_loss, desired_t, device, normalization_stats=None,
+        _stats, raw_scores, raw_labels = compute_eval_scores(
+            args, loader_for(sigma, dl_tst), modules, elbo_loss, desired_t, device,
+            normalization_stats=normalization_stats,
         )
-        per_feature = raw_nll
-        if normalization_stats is not None:
-            lo = normalization_stats["min"].detach().cpu().numpy()
-            span = (normalization_stats["max"] - normalization_stats["min"]).clamp_min(1e-8).detach().cpu().numpy()
-            per_feature = (raw_nll - lo) / span
         index, scores = scalar_scores(
-            per_feature, covered, smoothing_window=args.score_smoothing_window,
+            raw_scores, covered, smoothing_window=args.score_smoothing_window,
             aggregation=args.score_aggregation, feature_weights=feature_weights,
         )
         labels = np.asarray(raw_labels)
         out[sigma] = (index, scores, labels[index])
+
+    if window_fn is None:
+        return out, {}
+
+    series, spans = test_series(dl_tst.dataset, length)
+    snap = {
+        "series": series,
+        "noise": base_noise.numpy(),
+        "covered": covered,
+        "labels": labels[:length],  # labels do not depend on the noise
+        "feature_names": getattr(getattr(dl_tst.dataset, "base_dataset", None), "feature_names", None),
+        "nll": {},
+    }
+    snap["window"] = window_fn(snap)
+    if snap["window"] is None:
+        return out, snap
+
+    _onset, window = snap["window"]
+    positions = np.flatnonzero((spans[:, 1] >= window.start) & (spans[:, 0] < window.stop))
+    dl_snap = DataLoader(WindowSubset(dl_tst.dataset, positions), batch_size=dl_tst.batch_size, shuffle=False,
+                         num_workers=dl_tst.num_workers, pin_memory=dl_tst.pin_memory,
+                         collate_fn=dl_tst.collate_fn)
+    for sigma in levels:
+        torch.manual_seed(abs(int(args.seed)))
+        _stats, raw_nll, _labels = compute_eval_scores(
+            args, loader_for(sigma, dl_snap), modules, elbo_loss, desired_t, device, normalization_stats=None,
+        )
         nll = np.full(length, np.nan)
-        nll[covered] = raw_nll[covered].sum(axis=1)
+        nll[window] = raw_nll[window].sum(axis=1)
         snap["nll"][sigma] = nll
-        snap["labels"] = labels[:length]
     return out, snap
 
 
@@ -563,7 +609,9 @@ def main():
             ds_idx = _resolve_trace_index(provider, cand["trace_id"])
             logging.info("Scoring %s (trace=%s, seed=%d)", path.name, cand["trace_key"], args.seed)
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
-            per_level, snap = score_trace(args, ckpt, provider, ds_idx, levels)
+            window_fn = ((lambda sn, wl=int(args.data_window_length): snapshot_window(sn, cli_args, wl))
+                         if cli_args.snapshots else None)
+            per_level, snap = score_trace(args, ckpt, provider, ds_idx, levels, window_fn=window_fn)
             del ckpt
         finally:
             if hasattr(provider, "cleanup"):
@@ -573,17 +621,16 @@ def main():
         results[trace] = per_level
         if cli_args.snapshots:
             snaps[trace] = snap
-            windows[trace] = snapshot_window(snap, cli_args, int(args.data_window_length))
+            windows[trace] = snap["window"]
             if windows[trace] is None:
                 logging.warning("Trace %s: no benign->anomalous transition in the test split; no snapshot.", trace)
             else:
                 onset, window = windows[trace]
                 logging.info("Trace %s: snapshot at onset t=%d (t=%d..%d)", trace, onset, window.start,
                              window.stop - 1)
+                arrays[f"trace{trace}__snapshot_t"] = np.arange(window.start, window.stop)
                 for sigma in levels:
-                    arrays[f"trace{trace}__sigma{sigma:g}__nll"] = snap["nll"][sigma]
-        else:
-            del snap
+                    arrays[f"trace{trace}__sigma{sigma:g}__nll"] = snap["nll"][sigma][window]
         for sigma, (index, scores, labels) in per_level.items():
             rows += summary_rows(trace, sigma, scores, labels)
             key = f"trace{trace}__sigma{sigma:g}"
