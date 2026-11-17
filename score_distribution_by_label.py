@@ -502,7 +502,7 @@ def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_ar
                    draw, row_height: float, legend_cols: int):
     """One axis per trace, stacked; `draw` puts every label x noise level of that trace on it."""
     n_rows = len(traces)
-    fig, axes = plt.subplots(n_rows//2, 2, figsize=(7.0, row_height * n_rows + 0.6),
+    fig, axes = plt.subplots(n_rows//2, 2, figsize=(14.0, row_height * n_rows//2 + 0.6),
                              sharex=cli_args.sharex, squeeze=False)
     axes = axes.flatten()
     handles = []
