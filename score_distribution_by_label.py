@@ -26,14 +26,20 @@ itself, the score normalisation statistics and the feature weights are always
 those of the clean training data. The torch RNG (random subsample masks, MC
 samples) is reseeded before each pass, so the passes differ only in the noise.
 
-Figure: rows = traces, columns = noise levels (clean first). Each cell shows
-two thin horizontal box plots, benign and anomalous test timepoints, on one
-score axis. ``--sharex`` decides which cells share that axis: ``row`` (the
-default) makes the noise levels of one trace directly comparable. Scores of
-different traces come from different models and need not share a scale.
+Figure: one axis per trace, stacked. Each axis holds, per noise level (clean
+first, top to bottom), a thin horizontal box plot of the benign and one of the
+anomalous test timepoints, so all levels of a trace share one score axis.
+Scores of different traces come from different models, so each trace gets its
+own axis range unless ``--sharex`` is given.
 
 Outputs (in ``--eval-out-dir``):
-  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the grid,
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots,
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>_density.{pdf,png}``: the same
+    layout and data, each trace's axis showing a Gaussian KDE (a smoothed
+    histogram normalised to area 1, so the groups are comparable in shape
+    despite their very different sizes) per label and noise level -- colour
+    for the label, shade for the level (darkest: clean); the density axis is
+    left unlabelled. With ``--log-x`` the KDE is fitted on log scores.
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.npz``: per trace and level, the test
     index, scores and labels (keys ``trace<id>__sigma<level>__{index,scores,labels}``),
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.csv``: count, mean and quantiles per
@@ -56,9 +62,9 @@ Examples::
         --checkpoint-dir checkpoints --checkpoint-pattern 'checkpoint_AD_QAD_*_best.h5' \\
         --select-seed 42
 
-    # explicit checkpoints, other noise levels, one score axis per column
+    # explicit checkpoints, other noise levels, one score axis for all traces
     python score_distribution_by_label.py --dataset QAD --checkpoints ckpt_trace-*_best.h5 \\
-        --noise-levels 0.05 0.2 0.4 --sharex col
+        --noise-levels 0.05 0.2 0.4 --sharex
 """
 
 from __future__ import annotations
@@ -73,6 +79,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.patches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -131,8 +138,9 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
              f"clean column. Default: {' '.join(map(str, DEFAULT_NOISE_LEVELS))}.",
     )
     group.add_argument(
-        "--sharex", choices=["row", "col", "all", "none"], default="row",
-        help="Which cells share the score axis. Default: row (one trace across noise levels).",
+        "--sharex", action="store_true",
+        help="Share the score axis across traces. Off by default: the traces' scores come from "
+             "different models and need not share a scale.",
     )
     group.add_argument("--log-x", action="store_true", help="Log-scale the score axes.")
     group.add_argument(
@@ -368,59 +376,149 @@ def level_title(sigma: float) -> str:
     return "Clean" if sigma == CLEAN else f"Noise $\\sigma$ = {sigma:g}"
 
 
-def draw_cell(ax, scores: np.ndarray, labels: np.ndarray, cli_args, first_col: bool) -> None:
-    """Benign and anomalous scores as two thin horizontal boxes on one axis."""
-    whis = tuple(cli_args.whisker_range) if cli_args.whisker_range else 1.5
-    positions = np.arange(len(GROUPS))[::-1]  # first group on top
-    ticklabels = []
-    for pos, (name, value, color) in zip(positions, GROUPS):
-        group = scores[(labels > 0) == bool(value)]
-        ticklabels.append(f"{name} (n={group.size:,})")
-        if group.size == 0:
-            continue
-        ax.boxplot(
-            group, positions=[pos], vert=False, widths=0.4, whis=whis, showfliers=cli_args.show_fliers,
-            patch_artist=True,
-            boxprops=dict(facecolor=color, alpha=0.35, edgecolor=color, linewidth=0.9),
-            medianprops=dict(color=color, linewidth=1.6),
-            whiskerprops=dict(color=color, linewidth=0.9), capprops=dict(color=color, linewidth=0.9),
-            flierprops=dict(marker="o", markersize=1.2, markerfacecolor=color, markeredgecolor="none",
-                            alpha=0.25),
-        )
-    # boxplot() resets the y ticks to its positions, so label them afterwards.
-    ax.set_yticks(positions, ticklabels if first_col else [""] * len(GROUPS), fontsize=7)
-    ax.set_ylim(-0.6, len(GROUPS) - 0.4)
-    ax.tick_params(axis="y", length=0)
+# Shade per noise level: the clean level gets the darkest tone of its label's
+# colour map, the strongest noise the lightest.
+LABEL_CMAPS = {0: "Blues", 1: "Reds"}
+
+
+def level_shade(value: int, k: int, n_levels: int):
+    frac = 0.0 if n_levels < 2 else k / (n_levels - 1)
+    return plt.get_cmap(LABEL_CMAPS[value])(0.95 - 0.5 * frac)
+
+
+def _split(scores: np.ndarray, labels: np.ndarray, value: int) -> np.ndarray:
+    return scores[(labels > 0) == bool(value)]
+
+
+def _group_counts(per_level: dict, levels: list[float]) -> str:
+    """"benign n=..., anomalous n=..." of a trace (identical for every level)."""
+    _index, scores, labels = per_level[levels[0]]
+    return ", ".join(f"{name.lower()} n={_split(scores, labels, value).size:,}" for name, value, _ in GROUPS)
+
+
+def _style_axis(ax) -> None:
     ax.tick_params(axis="x", labelsize=7)
     ax.grid(axis="x", alpha=0.3)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
 
 
-def plot_grid(results: dict, traces: list[str], levels: list[float], title: str, cli_args, stem: Path):
-    n_rows, n_cols = len(traces), len(levels)
-    sharex = False if cli_args.sharex == "none" else cli_args.sharex
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.9 * n_cols + 1.4, 0.85 * n_rows + 0.8),
-                             sharex=sharex, squeeze=False)
+def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args) -> list:
+    """One trace: per noise level (top to bottom) a benign and an anomalous thin horizontal box.
+
+    Returns legend handles (one per label).
+    """
+    whis = tuple(cli_args.whisker_range) if cli_args.whisker_range else 1.5
+    n = len(levels)
+    centers = np.arange(n)[::-1].astype(float)  # first level on top
+    offset, width = 0.19, 0.3
+    for center, sigma in zip(centers, levels):
+        _index, scores, labels = per_level[sigma]
+        for (name, value, color), pos in zip(GROUPS, (center + offset, center - offset)):
+            group = _split(scores, labels, value)
+            if group.size == 0:
+                continue
+            ax.boxplot(
+                group, positions=[pos], vert=False, widths=width, whis=whis, showfliers=cli_args.show_fliers,
+                patch_artist=True,
+                boxprops=dict(facecolor=color, alpha=0.35, edgecolor=color, linewidth=0.9),
+                medianprops=dict(color=color, linewidth=1.6),
+                whiskerprops=dict(color=color, linewidth=0.9), capprops=dict(color=color, linewidth=0.9),
+                flierprops=dict(marker="o", markersize=1.2, markerfacecolor=color, markeredgecolor="none",
+                                alpha=0.25),
+            )
+    # boxplot() resets the y ticks to its positions, so label them afterwards.
+    ax.set_yticks(centers, [level_title(sigma) for sigma in levels], fontsize=7)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.tick_params(axis="y", length=0)
+    _style_axis(ax)
+    return [matplotlib.patches.Patch(facecolor=color, alpha=0.35, edgecolor=color, label=name)
+            for name, _value, color in GROUPS]
+
+
+def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args) -> list:
+    """One trace: a KDE (area 1) per label and noise level, all on one axis.
+
+    Colour = label, shade = noise level (darkest: clean). Returns legend
+    handles, interleaved benign/anomalous per level so that a legend with one
+    column per level reads benign in its first row and anomalous in its second.
+    """
+    log_x = cli_args.log_x
+    if log_x and min(np.nanmin(per_level[s][1]) for s in levels) <= 0:
+        logging.warning("Scores <= 0 present; drawing the KDE on a linear scale despite --log-x.")
+        log_x = False
+    handles = []
+    for k, sigma in enumerate(levels):
+        _index, scores, labels = per_level[sigma]
+        for name, value, _color in GROUPS:
+            color = level_shade(value, k, len(levels))
+            label = f"{name}, clean" if sigma == CLEAN else f"{name}, $\\sigma$ = {sigma:g}"
+            group = _split(scores, labels, value)
+            curve = _kde_curve(group, log_x)
+            linewidth = 1.5 if sigma == CLEAN else 1.0
+            if curve is None:
+                if group.size:  # degenerate: all values equal
+                    handles.append(ax.axvline(group[0], color=color, linewidth=linewidth, label=label))
+                continue
+            x, density = curve
+            ax.fill_between(x, density, color=color, alpha=0.06, linewidth=0)
+            handles.append(ax.plot(x, density, color=color, linewidth=linewidth, label=label)[0])
+    ax.set_ylim(bottom=0)
+    ax.set_yticks([])
+    _style_axis(ax)
+    return handles
+
+
+KDE_GRID_POINTS = 400
+# Points per group the KDE is fitted on; larger groups are subsampled
+# (deterministically), which leaves the curve unchanged to the eye but keeps
+# many traces x levels x groups of a long test split fast.
+KDE_MAX_POINTS = 20000
+
+
+def _kde_curve(values: np.ndarray, log_x: bool) -> tuple[np.ndarray, np.ndarray] | None:
+    """(x, density) of a Gaussian KDE (Scott's bandwidth) over the data range.
+
+    With `log_x` the KDE is fitted on log(values) and the density is per unit
+    of log score, so it looks smooth on the log axis it is drawn on.
+    """
+    from scipy.stats import gaussian_kde
+
+    values = values[np.isfinite(values)]
+    if log_x:
+        values = np.log(values)
+    if values.size < 2 or np.ptp(values) == 0:
+        return None
+    if values.size > KDE_MAX_POINTS:
+        values = np.random.default_rng(0).choice(values, KDE_MAX_POINTS, replace=False)
+    kde = gaussian_kde(values)
+    pad = 3 * float(np.sqrt(kde.covariance[0, 0]))
+    grid = np.linspace(values.min() - pad, values.max() + pad, KDE_GRID_POINTS)
+    density = kde(grid)
+    return (np.exp(grid) if log_x else grid), density
+
+
+def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_args, stem: Path,
+                   draw, row_height: float, legend_cols: int):
+    """One axis per trace, stacked; `draw` puts every label x noise level of that trace on it."""
+    n_rows = len(traces)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(7.0, row_height * n_rows + 0.6),
+                             sharex=cli_args.sharex, squeeze=False)
+    handles = []
     for r, trace in enumerate(traces):
-        for c, sigma in enumerate(levels):
-            ax = axes[r, c]
-            _index, scores, labels = results[trace][sigma]
-            draw_cell(ax, scores, labels, cli_args, first_col=c == 0)
-            if r == 0:
-                ax.set_title(level_title(sigma), fontsize=9)
-            if c == 0:
-                ax.set_ylabel(f"Trace {trace}", fontsize=8, rotation=0, ha="right", va="center", labelpad=4)
-            if cli_args.log_x:
-                ax.set_xscale("log")
-            # With a shared x axis matplotlib hides the inner tick labels; keep
-            # them where the axis is not shared with the cell below.
-            if sharex in ("row", False) or r == n_rows - 1:
-                ax.tick_params(axis="x", labelbottom=True)
-    for ax in axes[-1]:
-        ax.set_xlabel("Anomaly score", fontsize=8)
-    #fig.suptitle(title, fontsize=10)
+        ax = axes[r, 0]
+        handles = draw(ax, results[trace], levels, cli_args) or handles
+        ax.set_ylabel(f"Trace {trace}", fontsize=8)
+        ax.text(1.0, 1.0, _group_counts(results[trace], levels), transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=6, color="0.35")
+        if cli_args.log_x:
+            ax.set_xscale("log")
+        if not cli_args.sharex:
+            ax.tick_params(axis="x", labelbottom=True)
+    axes[-1, 0].set_xlabel("Anomaly score", fontsize=8)
     fig.tight_layout()
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=legend_cols,
+               frameon=False, fontsize=7)
     for fmt in cli_args.formats:
         fig.savefig(stem.with_suffix(f".{fmt}"), dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -642,11 +740,13 @@ def main():
     stem = out_dir / f"SCOREDIST_{cli_args.dataset}_seed{seed}_{run_id}"
     np.savez_compressed(stem.with_suffix(".npz"), **arrays)
     pd.DataFrame(rows).to_csv(stem.with_suffix(".csv"), index=False)
-    first = selected[0]["args"]
-    title = (f"{cli_args.dataset}, seed {seed}: test scores by label "
-             f"({first.score_aggregation}, smoothing {first.score_smoothing_window})")
-    plot_grid(results, traces, levels, title, cli_args, stem)
-    logging.info("Wrote %s.{%s,npz,csv}", stem, ",".join(cli_args.formats))
+    plot_per_trace(results, traces, levels, cli_args, stem, draw=draw_trace_boxes,
+                   row_height=0.42 * len(levels) + 0.45, legend_cols=len(GROUPS))
+    density_stem = stem.parent / f"{stem.name}_density"
+    plot_per_trace(results, traces, levels, cli_args, density_stem, draw=draw_trace_density,
+                   row_height=1.4, legend_cols=len(levels))
+    logging.info("Wrote %s.{%s,npz,csv} and %s.{%s}", stem, ",".join(cli_args.formats),
+                 density_stem, ",".join(cli_args.formats))
     if cli_args.snapshots:
         plot_snapshots(snaps, windows, traces, levels, cli_args, stem)
         logging.info("Wrote %s_snapshots.{%s} and %s_snapshots/", stem, ",".join(cli_args.formats), stem)

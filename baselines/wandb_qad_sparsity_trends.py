@@ -51,10 +51,13 @@ Figures (into --output-dir, one file per --formats entry):
 Tables (into --output-dir/tables):
 Both .tex files hold a bare ``tabular`` and nothing else -- no float, no
 \centering, no caption, no label, no \resizebox: wrap them at the use site
-(\input inside your own table/table*). They do assume booktabs, multirow,
-graphicx and the ``\std`` macro are loaded, as the other tables do (e.g.
-``\newcommand{\std}[1]{\,{\scriptsize$\pm$#1}}``), and val_status_all is wide
-enough to need a \resizebox or a full-width float of its own.
+(\input inside your own table/table*). They are styled like the tables of
+wandb_results_to_latex.py -- bold headers with a \big arrow for the better
+direction, "AUC"/"AUPRC" as metric names, ``\small\textbf`` column groups,
+``mean \std{std}`` to two decimals -- but no cell is coloured or otherwise
+marked. They need booktabs, multirow, graphicx and the ``\std`` macro in the
+preamble. val_status_all is wide enough to need a \resizebox or a
+full-width float of its own.
   - ``val_status_all.tex``: every mode as row blocks (QAPPD at 100%, 5%, 1%
     training data, then PSM) separated by vertical space and a rule, each block
     labelled by a rotated cell in the leftmost column.
@@ -62,11 +65,13 @@ enough to need a \resizebox or a full-width float of its own.
     are deliberately not shown anywhere here) and shows the state of the
     early-stopping criterion at the selected (lowest val loss) epoch -- the
     selected epoch, ``val/loss`` (the criterion itself), ``val/log_pxz`` (the
-    reconstruction NLL) and the test AUC-ROC and AUPRC (x100) the run reports
-    for that epoch, ``mean \std{std}`` over runs. Each metric is a column
-    group with Rn and Sn side by side; the better value of each pair (val
-    loss, NLL: lower; AUC-ROC, AUPRC: higher) is set in bold.
-  - ``val_status.md``: the same table in Markdown, for a quick look.
+    reconstruction NLL) and the test AUC and AUPRC (x100) the run reports
+    for that epoch, ``mean \std{std}`` over runs. As in the per-trace table
+    of wandb_results_to_latex.py, each geometry is one column group holding
+    every metric. No cell is highlighted.
+  - ``val_status.md``: the same table in Markdown, for a quick look; here the
+    better geometry per metric (val loss, NLL: lower; AUC, AUPRC: higher) is
+    in bold.
   - ``geometry_agreement.tex``: how often model selection by validation loss
     also picks the better-scoring geometry -- one row per mode (the same blocks
     as the big table), one column per score in --agreement-metrics, each score
@@ -108,6 +113,9 @@ from wandb_results_to_latex import (  # noqa: E402
     BENCHMARK_LABELS,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RUN_LIMIT,
+    LSD_RN_LABEL,
+    LSD_SN_LABEL,
+    MISSING_CELL,
     OURS_DEFAULT_ENTITY,
     OURS_DEFAULT_PROJECT,
     PSM_BENCHMARK,
@@ -155,7 +163,7 @@ METRIC_LABEL = {
     VAL_LL: "Val. log-likelihood",
     "val/log_pxz": "Val. NLL",
     TST_AUPRC: "AUPRC (x100)",
-    "tst/auc_roc": "AUC-ROC (x100)",
+    "tst/auc_roc": "AUC (x100)",
     "tst/f1": "F1 (x100)",
     "trn/loss": "Train loss",
 }
@@ -173,32 +181,36 @@ ROBUST_YLIM_CLIP_PCT = 15
 # The KL terms (val/kl0, val/klp) are left out by default; add them back via
 # --table-metrics.
 DEFAULT_TABLE_METRICS = ["epoch", VAL_LOSS, "val/log_pxz", "tst/auc_roc", TST_AUPRC]
+# Header cell (tex, markdown) per table column. Spelled like the tables of
+# wandb_results_to_latex.py: bold name plus a \big arrow for the better
+# direction, "AUC" (not "AUC-ROC") as in its METRIC_LABELS.
 TABLE_HEADER = {
-    "epoch": ("Epoch", "Epoch"),
-    VAL_LOSS: (r"Val.\ loss $\downarrow$", "Val. loss (criterion)"),
-    "val/log_pxz": (r"$-\log p(x|z)$ $\downarrow$", "-log p(x|z)"),
-    "val/kl0": (r"$\mathrm{KL}_0$", "KL0"),
-    "val/klp": (r"$\mathrm{KL}_{\mathrm{path}}$", "KL path"),
-    VAL_LL: ("Val.\\ log-lik.\\ $\\uparrow$", "Val. log-lik."),
-    TST_AUPRC: (r"AUPRC $\uparrow$", "AUPRC (x100)"),
-    "tst/auc_roc": (r"AUC-ROC $\uparrow$", "AUC-ROC (x100)"),
+    "epoch": (r"\textbf{Epoch}", "Epoch"),
+    VAL_LOSS: (r"\textbf{Val.\ loss} \big\downarrow", "Val. loss ↓"),
+    "val/log_pxz": (r"\textbf{NLL} \big\downarrow", "NLL ↓"),
+    "val/kl0": (r"\textbf{KL$_0$}", "KL0"),
+    "val/klp": (r"\textbf{KL$_{\mathrm{path}}$}", "KL path"),
+    VAL_LL: (r"\textbf{Val.\ log-lik.} \big\uparrow", "Val. log-lik. ↑"),
+    TST_AUPRC: (r"\textbf{AUPRC} \big\uparrow", "AUPRC ↑"),
+    "tst/auc_roc": (r"\textbf{AUC} \big\uparrow", "AUC ↑"),
 }
-# Metrics with a "better" direction get the better geometry of each level in
-# bold (+1: higher is better, -1: lower is better). The KL terms and the epoch
+# Metrics with a "better" direction get the better geometry of each level
+# set in bold in the Markdown table (+1: higher is better, -1: lower is better). The KL terms and the epoch
 # have none -- a smaller KL is not per se better -- so they are never highlighted.
 TABLE_BETTER = {VAL_LOSS: -1, "val/log_pxz": -1, "val/elbo": -1, VAL_LL: +1, TST_AUPRC: +1, "tst/auc_roc": +1}
-VARIANT_TEX = {"Rn": r"$\mathbb{R}^n$", "Sn": r"$\mathbb{S}^n$"}
+# Column-group header per geometry, the row labels wandb_results_to_latex.py uses for them.
+VARIANT_TEX = {"Rn": LSD_RN_LABEL, "Sn": LSD_SN_LABEL}
 
 # Test scores the geometry-agreement tables check the validation-loss pick
 # against -- one independent column group each.
 DEFAULT_AGREEMENT_METRICS = ["tst/auc_roc", TST_AUPRC]
 # Short (tex, markdown) group headers for those scores; unlisted ones use their key.
 SCORE_SHORT = {
-    "tst/auc_roc": ("AUC-ROC", "AUC-ROC"),
-    TST_AUPRC: ("AUPRC", "AUPRC"),
-    "tst/f1": ("F1", "F1"),
-    "tst/vus_pr": ("VUS-PR", "VUS-PR"),
-    "tst/vus_roc": ("VUS-ROC", "VUS-ROC"),
+    "tst/auc_roc": (r"\textbf{AUC}", "AUC"),
+    TST_AUPRC: (r"\textbf{AUPRC}", "AUPRC"),
+    "tst/f1": (r"\textbf{F1}", "F1"),
+    "tst/vus_pr": (r"\textbf{VUS-PR}", "VUS-PR"),
+    "tst/vus_roc": (r"\textbf{VUS-ROC}", "VUS-ROC"),
 }
 
 HISTORY_CACHE = "qad_epoch_history.csv.gz"
@@ -657,27 +669,10 @@ def plot_curve_figures(history, selected, traces, metrics, levels, min_runs, out
 # Early-stopping state tables
 # ---------------------------------------------------------------------------
 
-def _decimals(value: float) -> int:
-    """Decimals for ~3 significant digits.
-
-    Chosen per cell, not per column: within one column the geometries can
-    differ by orders of magnitude (KL0 is ~2000 on R^n but ~10 on S^n), and a
-    shared precision would round the small side to nothing.
-    """
-    magnitude = abs(value)
-    if magnitude >= 100:
-        return 0
-    if magnitude >= 10:
-        return 1
-    if magnitude >= 1:
-        return 2
-    return 3
-
-
 def _row_cells(scores: pd.DataFrame, mode: tuple[str, float], trace: str, metrics: list[str]):
-    """``{(metric, variant): (mean, std, bold)}`` for one table row (one trace in one mode).
+    """``{(metric, variant): (mean, std, best)}`` for one table row (one trace in one mode).
 
-    `bold` marks the better geometry of the pair for metrics in TABLE_BETTER.
+    `best` marks the better geometry of the pair for metrics in TABLE_BETTER.
     """
     benchmark, level = mode
     sub = scores[(scores["benchmark"] == benchmark) & (scores["trace"] == trace)
@@ -696,93 +691,104 @@ def _row_cells(scores: pd.DataFrame, mode: tuple[str, float], trace: str, metric
 
 
 def _fmt_cell(mean: float, std: float, metric: str) -> tuple[str, str]:
-    dec = 0 if metric == "epoch" else _decimals(mean)
+    """Two decimals like wandb_results_to_latex.format_cell; the epoch is an integer."""
+    dec = 0 if metric == "epoch" else 2
     return f"{mean:.{dec}f}", f"{std:.{dec}f}"
 
 
-def _value_cells(cells: dict, metrics: list[str], bold_fmt, pm: str, missing: str) -> list[str]:
-    """Rn/Sn value cells of one row, in column order."""
-    row = []
-    for metric in metrics:
-        for variant in VARIANTS:
-            if (metric, variant) not in cells:
-                row.append(missing)
-                continue
-            mean, std, bold = cells[(metric, variant)]
-            m, sd = _fmt_cell(mean, std, metric)
-            row.append(f"{bold_fmt(m) if bold else m}{pm(sd)}")
-    return row
+def _tex_value_cell(cells: dict, metric: str, variant: str) -> str:
+    """``mean \\std{std}``, unmarked -- the better geometry is not highlighted in the tex table."""
+    if (metric, variant) not in cells:
+        return MISSING_CELL
+    mean, std, _best = cells[(metric, variant)]
+    m, sd = _fmt_cell(mean, std, metric)
+    return f"{m} \\std{{{sd}}}"
 
 
-def mode_label(mode: tuple[str, float], levels_per_benchmark: dict[str, int], compact: bool = False) -> str:
-    """Block label of one mode, e.g. "QAPPD, 5% training data" or just "PSM".
+def _md_value_cell(cells: dict, metric: str, variant: str) -> str:
+    if (metric, variant) not in cells:
+        return "–"
+    mean, std, best = cells[(metric, variant)]
+    m, sd = _fmt_cell(mean, std, metric)
+    return f"**{m}** ± {sd}" if best else f"{m} ± {sd}"
 
-    The training-data fraction is named only for benchmarks that have more than
-    one level -- PSM has no sparsity sweep, so "PSM, 100% training data" would
-    suggest a comparison the table does not make. `compact` drops the trailing
-    "training data" for row labels that have to fit a single text column.
+
+def mode_label(mode: tuple[str, float], levels_per_benchmark: dict[str, int], tex: bool = True) -> str:
+    """Block label of one mode, e.g. ``QAPPD (5\\%)`` or just ``PSM``.
+
+    Spelled like wandb_results_to_latex.sparsity_column_label. The
+    training-data fraction is named only for benchmarks that have more than
+    one level -- PSM has no sparsity sweep, so "PSM (100%)" would suggest a
+    comparison the table does not make.
     """
     benchmark, level = mode
     if levels_per_benchmark.get(benchmark, 1) < 2:
         return dataset_label(benchmark)
-    suffix = "" if compact else " training data"
-    return f"{dataset_label(benchmark)}, {level_label(level)}{suffix}"
+    pct = "\\%" if tex else "%"
+    return f"{dataset_label(benchmark)} ({level * 100:g}{pct})"
 
 
 def render_val_status_tex(scores: pd.DataFrame, run_modes: list[tuple[str, float]],
                           traces: dict[str, list[str]], metrics: list[str]) -> str:
-    """All modes in one tabular: one row block per (benchmark, level), separated by space and a rule.
+    """All modes in one tabular: one row block per (benchmark, level).
 
-    The leftmost column names each block (rotated, spanning the block); rows
-    within a block are that benchmark's traces, column groups are metrics, each
-    split into Rn | Sn.
+    Laid out like wandb_results_to_latex's per-trace table: one column group
+    per geometry (``\\multicolumn{..}{c}{\\small \\textbf{LSD on ...}}`` with a
+    ``\\cmidrule`` under it), the metrics inside each group. Every block is
+    labelled by a rotated cell in the leftmost column, and blocks are set off by
+    ``\\addlinespace[2.5ex]`` and a rule.
 
     Just the ``tabular`` -- float, caption, label and any \\resizebox are the
-    caller's, so the same body can go in a table*, a sidewaystable or nothing
-    at all. It does need booktabs, multirow, graphicx and the \\std macro to be
-    loaded, and it is wide (two columns per metric): give it a \\resizebox or a
-    full-width float.
+    caller's. Needs booktabs, multirow, graphicx and, as for the other
+    tables, the ``\\std`` macro in the preamble.
     """
-    n_var = len(VARIANTS)
-    n_cols = 2 + n_var * len(metrics)
+    n_met = len(metrics)
     levels_per_benchmark = Counter(bench for bench, _ in run_modes)
-    group_header = [r"\multirow{2}{*}{Data}", r"\multirow{2}{*}{Trace}"] + [
-        f"\\multicolumn{{{n_var}}}{{c}}{{{TABLE_HEADER.get(m, (m, m))[0]}}}" for m in metrics
-    ]
-    rules = " ".join(
-        f"\\cmidrule(lr){{{3 + i * n_var}-{2 + (i + 1) * n_var}}}" for i in range(len(metrics))
+    group_cells = " & ".join(
+        f"\\multicolumn{{{n_met}}}{{c}}{{\\small \\textbf{{{VARIANT_TEX[v]}}}}}" for v in VARIANTS
     )
-    variant_header = ["", ""] + [VARIANT_TEX[v] for _ in metrics for v in VARIANTS]
+    cmidrules = "".join(
+        f"\\cmidrule(lr){{{3 + i * n_met}-{2 + (i + 1) * n_met}}}" for i in range(len(VARIANTS))
+    )
+    metric_row = " & ".join(
+        [r"\textbf{Data}", r"\textbf{Trace}"]
+        + [TABLE_HEADER.get(m, (m, m))[0] for _ in VARIANTS for m in metrics]
+    ) + r" \\"
+    column_format = "cl " + " ".join(["r" * n_met] * len(VARIANTS))
     lines = [
-        f"\\begin{{tabular}}{{cl{'r' * (n_var * len(metrics))}}}",
+        f"\\begin{{tabular}}{{{column_format}}}",
         r"\toprule",
-        " & ".join(group_header) + r" \\",
-        rules,
-        " & ".join(variant_header) + r" \\",
+        f"&& {group_cells} \\\\",
+        cmidrules,
+        metric_row,
         r"\midrule",
     ]
     for k, mode in enumerate(run_modes):
         if k > 0:
-            lines += [r"\addlinespace[0.8em]", r"\midrule"]
+            lines += [r"\addlinespace[2.5ex]", r"\midrule"]
         block = traces[mode[0]]
-        label_tex = mode_label(mode, levels_per_benchmark).replace("%", r"\%")
+        label_tex = mode_label(mode, levels_per_benchmark)
         for i, trace in enumerate(block):
-            label = (f"\\multirow{{{len(block)}}}{{*}}{{\\rotatebox[origin=c]{{90}}{{{label_tex}}}}}"
-                     if i == 0 else "")
+            # A rotated label needs the height of several rows; a one-row block
+            # (PSM) gets it upright instead, or it would stick out of its row.
+            if i > 0:
+                label = ""
+            elif len(block) == 1:
+                label = f"\\small {label_tex}"
+            else:
+                label = f"\\multirow{{{len(block)}}}{{*}}{{\\rotatebox[origin=c]{{90}}{{\\small {label_tex}}}}}"
             cells = _row_cells(scores, mode, trace, metrics)
-            row = [label, trace] + _value_cells(
-                cells, metrics, bold_fmt=lambda m: "\\textbf{" + m + "}",
-                pm=lambda sd: f" \\std{{{sd}}}", missing="--",
-            )
+            row = [label, trace] + [_tex_value_cell(cells, m, v) for v in VARIANTS for m in metrics]
             lines.append(" & ".join(row) + r" \\")
-    assert n_cols == len(row)
     lines += [r"\bottomrule", r"\end{tabular}", ""]
     return "\n".join(lines)
 
 
 def render_val_status_md(scores: pd.DataFrame, run_modes: list[tuple[str, float]],
                          traces: dict[str, list[str]], metrics: list[str]) -> str:
-    header = ["Data", "Trace"] + [f"{TABLE_HEADER.get(m, (m, m))[1]} {v}" for m in metrics for v in VARIANTS]
+    """The same table in Markdown: columns grouped by geometry, best of each pair in bold."""
+    short = {"Rn": "Rn", "Sn": "Sn"}
+    header = ["Data", "Trace"] + [f"{short[v]}: {TABLE_HEADER.get(m, (m, m))[1]}" for v in VARIANTS for m in metrics]
     levels_per_benchmark = Counter(bench for bench, _ in run_modes)
     lines = ["| " + " | ".join(header) + " |",
              "|" + "|".join(["---"] * 2 + ["---:"] * (len(VARIANTS) * len(metrics))) + "|"]
@@ -791,9 +797,8 @@ def render_val_status_md(scores: pd.DataFrame, run_modes: list[tuple[str, float]
             lines.append("| " + " | ".join([""] * len(header)) + " |")
         for i, trace in enumerate(traces[mode[0]]):
             cells = _row_cells(scores, mode, trace, metrics)
-            row = [f"**{mode_label(mode, levels_per_benchmark)}**" if i == 0 else "", trace] + _value_cells(
-                cells, metrics, bold_fmt=lambda m: f"**{m}**", pm=lambda sd: f" ± {sd}", missing="–",
-            )
+            row = ([f"**{mode_label(mode, levels_per_benchmark, tex=False)}**" if i == 0 else "", trace]
+                   + [_md_value_cell(cells, m, v) for v in VARIANTS for m in metrics])
             lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines + [""])
 
@@ -804,8 +809,8 @@ def write_val_status_tables(scores, traces, run_modes, metrics, out_dir: Path) -
     table_dir.mkdir(exist_ok=True)
     (table_dir / "val_status_all.tex").write_text(render_val_status_tex(scores, run_modes, traces, metrics))
     md = ["# Early-stopping criterion at the selected (lowest val loss) epoch", "",
-          "mean ± std over runs; bold = better geometry (loss/NLL: lower, AUC-ROC/AUPRC: higher); "
-          "AUC-ROC and AUPRC x100.", "", render_val_status_md(scores, run_modes, traces, metrics)]
+          "mean ± std over runs; bold = better geometry (loss/NLL: lower, AUC/AUPRC: higher); "
+          "AUC and AUPRC x100.", "", render_val_status_md(scores, run_modes, traces, metrics)]
     (table_dir / "val_status.md").write_text("\n".join(md))
 
 
@@ -910,8 +915,7 @@ def _agreement_body(rows: pd.DataFrame, run_modes: list[tuple[str, float]], metr
     levels_per_benchmark = Counter(bench for bench, _ in run_modes)
     body = []
     for mode in run_modes:
-        # "%" -> "\%" for LaTeX, a no-op for Markdown.
-        row = [mode_label(mode, levels_per_benchmark, compact=True).replace("%", pct)]
+        row = [mode_label(mode, levels_per_benchmark, tex=pct != "%")]
         for metric in metrics:
             row.append(_share(*_agreement_totals(rows, mode, metric), pct=pct, missing=missing))
         body.append(row)
@@ -924,11 +928,11 @@ def render_agreement_tex(rows: pd.DataFrame, run_modes: list[tuple[str, float]],
     Just the ``tabular`` (needs booktabs); float, caption and label are the
     caller's, as for `render_val_status_tex`.
     """
-    body = _agreement_body(rows, run_modes, metrics, pct=r"\%", missing="--")
+    body = _agreement_body(rows, run_modes, metrics, pct=r"\%", missing=MISSING_CELL)
     lines = [
         f"\\begin{{tabular}}{{l{'c' * len(metrics)}}}",
         r"\toprule",
-        " & ".join(["Data"] + [score_short(m, tex=True) for m in metrics]) + r" \\",
+        " & ".join([r"\textbf{Data}"] + [score_short(m, tex=True) for m in metrics]) + r" \\",
         r"\midrule",
     ]
     lines += [" & ".join(row) + r" \\" for row in body]
@@ -969,11 +973,11 @@ def write_agreement_tables(scores, selected, traces, run_modes, metrics, out_dir
 
     print("\nValidation-loss pick vs. best-scoring geometry (agreeing (trace, seed) pairs / usable pairs):")
     levels_per_benchmark = Counter(bench for bench, _ in run_modes)
-    width = max(len(mode_label(m, levels_per_benchmark)) for m in run_modes)
+    width = max(len(mode_label(m, levels_per_benchmark, tex=False)) for m in run_modes)
     for mode in run_modes:
         parts = [f"{score_short(m, tex=False)} {_share(*_agreement_totals(rows, mode, m), pct='%', missing='n/a')}"
                  for m in metrics]
-        print(f"  {mode_label(mode, levels_per_benchmark):>{width}}: " + " | ".join(parts))
+        print(f"  {mode_label(mode, levels_per_benchmark, tex=False):>{width}}: " + " | ".join(parts))
 
 
 def main() -> None:
