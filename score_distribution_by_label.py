@@ -38,6 +38,16 @@ Outputs (in ``--eval-out-dir``):
     index, scores and labels (keys ``trace<id>__sigma<level>__{index,scores,labels}``),
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.csv``: count, mean and quantiles per
     trace, level and label.
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>_snapshots.{pdf,png}`` (unless
+    ``--no-snapshots``): per trace (rows) and noise level (columns), a window of
+    the test series around a benign->anomalous transition (``--onset``, the
+    first by default). It shows all variates, with that level's noise added
+    (left axis), and the per-timepoint NLL on a twin axis (right). The NLL is
+    the reconstruction ``-log p(x|z)`` summed over the variates, without score
+    normalisation or smoothing. The x axis is the time relative to the onset and
+    is shared by every panel; anomalous stretches are shaded. The folder
+    ``..._snapshots/`` holds the same panels as single figures, with a legend.
+    The NLL series also go into the .npz (``...__nll``).
 
 Examples::
 
@@ -134,6 +144,25 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
         help="Whiskers at these percentiles (e.g. 1 99) instead of 1.5 IQR.",
     )
     group.add_argument("--formats", nargs="+", default=["pdf", "png"], help="Figure file formats.")
+
+    group = parser.add_argument_group("Anomaly-onset snapshots")
+    group.add_argument(
+        "--snapshots", action=argparse.BooleanOptionalAction, default=True,
+        help="Also plot, per trace and noise level, the (noisy) variates and the NLL around an anomaly onset.",
+    )
+    group.add_argument(
+        "--onset", type=int, default=0,
+        help="Which benign->anomalous transition of each trace's test split to show (0 = the first; "
+             "negative counts from the end, -1 = the last). Default: 0.",
+    )
+    group.add_argument(
+        "--snapshot-length", type=int, default=None,
+        help="Timepoints shown per snapshot. Default: twice the model's data_window_length.",
+    )
+    group.add_argument(
+        "--snapshot-before", type=float, default=0.5,
+        help="Share of the snapshot placed before the onset. Default: 0.5.",
+    )
     return parser
 
 
@@ -207,8 +236,27 @@ def noisy_loader(dl: DataLoader, noise: torch.Tensor) -> DataLoader:
 # --------------------------------------------------------------------------- #
 # Scoring
 # --------------------------------------------------------------------------- #
-def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float]) -> dict[float, tuple]:
-    """``{sigma: (global time index, scalar score, label)}`` on the test split, per noise level."""
+def test_series(dataset: Dataset, length: int) -> np.ndarray:
+    """The clean test series [time, feature] (``evd_obs``, NaN where no window covers a timepoint).
+
+    Rebuilt from the windows by their global time indices; overlapping windows
+    carry the same values, so the order of writing does not matter.
+    """
+    series = np.full((length, int(dataset.input_dim)), np.nan)
+    for i in range(len(dataset)):
+        item = dataset[i]
+        series[np.asarray(item["inp_indcs"]).astype(int)] = np.asarray(item["evd_obs"], dtype=float)
+    return series
+
+
+def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float]) -> tuple[dict[float, tuple], dict]:
+    """Score the test split once per noise level.
+
+    Returns ``({sigma: (global time index, scalar score, label)}, snapshot data)``.
+    The snapshot data holds what the onset plots need: the clean series, the
+    noise pattern, the labels and covered timepoints, and per level the
+    per-timepoint NLL (summed over the variates, NaN where not covered).
+    """
     device = args.device
     dl_trn, dl_tst, _dl_val, input_dim, num_timepoints = _make_loaders(provider, ds_idx, args)
     modules, elbo_loss, desired_t = _restore_modules(args, ckpt, input_dim, num_timepoints, device)
@@ -225,24 +273,46 @@ def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float]) ->
             args, dl_trn, modules, desired_t, device, weighting=weighting)["feature_weights"]
 
     covered = covered_timepoints(dl_tst)
+    length = int(covered.max()) + 1
     rng = np.random.default_rng(abs(int(args.seed)))
     base_noise = torch.from_numpy(
-        rng.standard_normal((int(covered.max()) + 1, int(dl_tst.dataset.input_dim))).astype(np.float32))
+        rng.standard_normal((length, int(dl_tst.dataset.input_dim))).astype(np.float32))
+    snap = {
+        "series": test_series(dl_tst.dataset, length),
+        "noise": base_noise.numpy(),
+        "covered": covered,
+        "feature_names": getattr(getattr(dl_tst.dataset, "base_dataset", None), "feature_names", None),
+        "nll": {},
+    }
 
     out = {}
     for sigma in levels:
         loader = dl_tst if sigma == CLEAN else noisy_loader(dl_tst, sigma * base_noise)
         # Same random subsample masks / MC samples in every pass.
         torch.manual_seed(abs(int(args.seed)))
-        _stats, raw_scores, raw_labels = compute_eval_scores(
-            args, loader, modules, elbo_loss, desired_t, device, normalization_stats=normalization_stats,
+        # The pass runs without score normalisation so the raw NLL is kept for
+        # the snapshots. compute_eval_scores would apply the normalisation per
+        # window before averaging the overlapping windows; it is affine per
+        # variate, so applying it to the averaged scores here gives the same result.
+        _stats, raw_nll, raw_labels = compute_eval_scores(
+            args, loader, modules, elbo_loss, desired_t, device, normalization_stats=None,
         )
+        per_feature = raw_nll
+        if normalization_stats is not None:
+            lo = normalization_stats["min"].detach().cpu().numpy()
+            span = (normalization_stats["max"] - normalization_stats["min"]).clamp_min(1e-8).detach().cpu().numpy()
+            per_feature = (raw_nll - lo) / span
         index, scores = scalar_scores(
-            raw_scores, covered, smoothing_window=args.score_smoothing_window,
+            per_feature, covered, smoothing_window=args.score_smoothing_window,
             aggregation=args.score_aggregation, feature_weights=feature_weights,
         )
-        out[sigma] = (index, scores, np.asarray(raw_labels)[index])
-    return out
+        labels = np.asarray(raw_labels)
+        out[sigma] = (index, scores, labels[index])
+        nll = np.full(length, np.nan)
+        nll[covered] = raw_nll[covered].sum(axis=1)
+        snap["nll"][sigma] = nll
+        snap["labels"] = labels[:length]
+    return out, snap
 
 
 # --------------------------------------------------------------------------- #
@@ -303,11 +373,125 @@ def plot_grid(results: dict, traces: list[str], levels: list[float], title: str,
                 ax.tick_params(axis="x", labelbottom=True)
     for ax in axes[-1]:
         ax.set_xlabel("Anomaly score", fontsize=8)
-    fig.suptitle(title, fontsize=10)
+    #fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     for fmt in cli_args.formats:
         fig.savefig(stem.with_suffix(f".{fmt}"), dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+NLL_COLOR = "black"
+ANOMALY_SHADE = "#D62728"
+
+
+def find_onsets(labels: np.ndarray, covered: np.ndarray) -> np.ndarray:
+    """Timepoints where the label switches from benign to anomalous (both sides covered)."""
+    is_covered = np.zeros(labels.size, dtype=bool)
+    is_covered[covered[covered < labels.size]] = True
+    anomalous = labels > 0
+    return np.flatnonzero(anomalous[1:] & ~anomalous[:-1] & is_covered[1:] & is_covered[:-1]) + 1
+
+
+def snapshot_window(snap: dict, cli_args, window_length: int) -> tuple[int, slice] | None:
+    """(onset, time slice) of the snapshot of one trace, or None if its test split has no onset."""
+    onsets = find_onsets(snap["labels"], snap["covered"])
+    if onsets.size == 0:
+        return None
+    k = cli_args.onset if -onsets.size <= cli_args.onset < onsets.size else (0 if cli_args.onset >= 0 else -1)
+    if k != cli_args.onset:
+        logging.warning("Only %d onset(s) in this trace; showing onset %d instead of %d.",
+                        onsets.size, k, cli_args.onset)
+    onset = int(onsets[k])
+    length = cli_args.snapshot_length or 2 * window_length
+    start = max(0, onset - int(round(cli_args.snapshot_before * length)))
+    stop = min(snap["labels"].size, start + length)
+    return onset, slice(start, stop)
+
+
+def draw_snapshot(ax, snap: dict, sigma: float, onset: int, window: slice, legend: bool):
+    """Variates (with the level's noise) on `ax`, the NLL on a twin axis; x relative to the onset.
+
+    Returns the twin axis.
+    """
+    t = np.arange(window.start, window.stop)
+    x = t - onset
+    values = snap["series"][window] + sigma * snap["noise"][window]
+    n_var = values.shape[1]
+    cmap = plt.get_cmap("tab10" if n_var <= 10 else "tab20" if n_var <= 20 else "viridis")
+    names = snap["feature_names"] if snap["feature_names"] is not None and len(snap["feature_names"]) == n_var \
+        else [f"x{j}" for j in range(n_var)]
+    for j in range(n_var):
+        ax.plot(x, values[:, j], color=cmap(j / max(n_var - 1, 1) if n_var > 20 else j), linewidth=0.6,
+                alpha=0.85, label=names[j])
+
+    # Shade every anomalous stretch of the window.
+    anomalous = snap["labels"][window] > 0
+    edges = np.flatnonzero(np.diff(np.r_[0, anomalous.astype(int), 0]))
+    for a, b in zip(edges[::2], edges[1::2]):
+        ax.axvspan(x[a] - 0.5, x[b - 1] + 0.5, color=ANOMALY_SHADE, alpha=0.1, linewidth=0)
+    ax.axvline(0, color=ANOMALY_SHADE, linewidth=0.8, linestyle="--")
+
+    twin = ax.twinx()
+    twin.plot(x, snap["nll"][sigma][window], color=NLL_COLOR, linewidth=1.1, label="NLL")
+    twin.tick_params(axis="y", labelsize=7, colors=NLL_COLOR)
+    ax.tick_params(labelsize=7)
+    ax.set_xlim(x[0], x[-1])
+    if legend:
+        handles, labels = ax.get_legend_handles_labels()
+        h2, l2 = twin.get_legend_handles_labels()
+        if n_var <= 20:
+            ax.legend(handles + h2, labels + l2, fontsize=6, ncol=min(n_var + 1, 6), frameon=False,
+                      loc="lower left", bbox_to_anchor=(0, 1.02))
+    return twin
+
+
+def plot_snapshots(snaps: dict, windows: dict, traces: list[str], levels: list[float], cli_args, stem: Path):
+    """Grid (rows: traces, columns: noise levels) plus one file per (trace, level).
+
+    The x axis is the time relative to the onset, shared by every panel. The
+    variate axis (left) is shared within a row, so the noise levels of a trace
+    are on one scale; the NLL axis (right) is per panel, because the NLL grows
+    by orders of magnitude with the noise.
+    """
+    traces = [t for t in traces if windows.get(t) is not None]
+    if not traces:
+        logging.warning("No trace has a benign->anomalous transition in its test split; no snapshots.")
+        return
+    n_rows, n_cols = len(traces), len(levels)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.6 * n_cols, 1.7 * n_rows + 0.6),
+                             sharex=True, sharey="row", squeeze=False)
+    for r, trace in enumerate(traces):
+        onset, window = windows[trace]
+        for c, sigma in enumerate(levels):
+            ax = axes[r, c]
+            twin = draw_snapshot(ax, snaps[trace], sigma, onset, window, legend=False)
+            if r == 0:
+                ax.set_title(level_title(sigma), fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"Trace {trace}\nvalue", fontsize=8)
+            if c == n_cols - 1:
+                twin.set_ylabel("NLL", fontsize=8, color=NLL_COLOR)
+    for ax in axes[-1]:
+        ax.set_xlabel("Time steps relative to anomaly onset", fontsize=8)
+    fig.tight_layout()
+    for fmt in cli_args.formats:
+        fig.savefig(stem.parent / f"{stem.name}_snapshots.{fmt}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    single_dir = stem.parent / f"{stem.name}_snapshots"
+    single_dir.mkdir(exist_ok=True)
+    for trace in traces:
+        onset, window = windows[trace]
+        for sigma in levels:
+            fig, ax = plt.subplots(figsize=(6.5, 2.6))
+            twin = draw_snapshot(ax, snaps[trace], sigma, onset, window, legend=True)
+            ax.set_ylabel("Value", fontsize=8)
+            twin.set_ylabel("NLL", fontsize=8, color=NLL_COLOR)
+            ax.set_xlabel("Time steps relative to anomaly onset", fontsize=8)
+            fig.tight_layout()
+            for fmt in cli_args.formats:
+                fig.savefig(single_dir / f"trace{trace}_sigma{sigma:g}.{fmt}", dpi=200, bbox_inches="tight")
+            plt.close(fig)
 
 
 def summary_rows(trace: str, sigma: float, scores: np.ndarray, labels: np.ndarray) -> list[dict]:
@@ -366,6 +550,7 @@ def main():
     logging.info("Seed %d: %d trace(s) %s, noise levels %s", seed, len(traces), traces, levels)
 
     results: dict[str, dict] = {}
+    snaps, windows = {}, {}
     rows, arrays = [], {}
     for cand in selected:
         path, args = cand["path"], cand["args"]
@@ -378,7 +563,7 @@ def main():
             ds_idx = _resolve_trace_index(provider, cand["trace_id"])
             logging.info("Scoring %s (trace=%s, seed=%d)", path.name, cand["trace_key"], args.seed)
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
-            per_level = score_trace(args, ckpt, provider, ds_idx, levels)
+            per_level, snap = score_trace(args, ckpt, provider, ds_idx, levels)
             del ckpt
         finally:
             if hasattr(provider, "cleanup"):
@@ -386,6 +571,19 @@ def main():
 
         trace = cand["trace_key"]
         results[trace] = per_level
+        if cli_args.snapshots:
+            snaps[trace] = snap
+            windows[trace] = snapshot_window(snap, cli_args, int(args.data_window_length))
+            if windows[trace] is None:
+                logging.warning("Trace %s: no benign->anomalous transition in the test split; no snapshot.", trace)
+            else:
+                onset, window = windows[trace]
+                logging.info("Trace %s: snapshot at onset t=%d (t=%d..%d)", trace, onset, window.start,
+                             window.stop - 1)
+                for sigma in levels:
+                    arrays[f"trace{trace}__sigma{sigma:g}__nll"] = snap["nll"][sigma]
+        else:
+            del snap
         for sigma, (index, scores, labels) in per_level.items():
             rows += summary_rows(trace, sigma, scores, labels)
             key = f"trace{trace}__sigma{sigma:g}"
@@ -402,6 +600,9 @@ def main():
              f"({first.score_aggregation}, smoothing {first.score_smoothing_window})")
     plot_grid(results, traces, levels, title, cli_args, stem)
     logging.info("Wrote %s.{%s,npz,csv}", stem, ",".join(cli_args.formats))
+    if cli_args.snapshots:
+        plot_snapshots(snaps, windows, traces, levels, cli_args, stem)
+        logging.info("Wrote %s_snapshots.{%s} and %s_snapshots/", stem, ",".join(cli_args.formats), stem)
 
 
 if __name__ == "__main__":
