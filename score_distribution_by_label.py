@@ -40,6 +40,9 @@ Outputs (in ``--eval-out-dir``):
     despite their very different sizes) per label and noise level -- colour
     for the label, shade for the level (darkest: clean); the density axis is
     left unlabelled. With ``--log-x`` the KDE is fitted on log scores.
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>_anomalous_clean{,_density}.{pdf,png}``:
+    the same two figures restricted to the anomalous timepoints of the clean
+    test data (one box / one KDE per trace).
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.npz``: per trace and level, the test
     index, scores and labels (keys ``trace<id>__sigma<level>__{index,scores,labels}``),
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.csv``: count, mean and quantiles per
@@ -409,10 +412,10 @@ def _split(scores: np.ndarray, labels: np.ndarray, value: int) -> np.ndarray:
     return scores[(labels > 0) == bool(value)]
 
 
-def _group_counts(per_level: dict, levels: list[float]) -> str:
+def _group_counts(per_level: dict, levels: list[float], groups=GROUPS) -> str:
     """"benign n=..., anomalous n=..." of a trace (identical for every level)."""
     _index, scores, labels = per_level[levels[0]]
-    return ", ".join(f"{name.lower()} n={_split(scores, labels, value).size:,}" for name, value, _ in GROUPS)
+    return ", ".join(f"{name.lower()} n={_split(scores, labels, value).size:,}" for name, value, _ in groups)
 
 
 def _style_axis(ax) -> None:
@@ -422,18 +425,18 @@ def _style_axis(ax) -> None:
         ax.spines[side].set_visible(False)
 
 
-def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args) -> list:
-    """One trace: per noise level (top to bottom) a benign and an anomalous thin horizontal box.
+def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, groups=GROUPS) -> list:
+    """One trace: per noise level (top to bottom) a thin horizontal box per label in `groups`.
 
     Returns legend handles (one per label).
     """
     whis = tuple(cli_args.whisker_range) if cli_args.whisker_range else 1.5
     n = len(levels)
     centers = np.arange(n)[::-1].astype(float)  # first level on top
-    offset, width = 0.19, 0.3
+    offset, width = (0.19, 0.3) if len(groups) > 1 else (0.0, 0.4)
     for center, sigma in zip(centers, levels):
         _index, scores, labels = per_level[sigma]
-        for (name, value, color), pos in zip(GROUPS, (center + offset, center - offset)):
+        for (name, value, color), pos in zip(groups, (center + offset, center - offset)):
             group = _split(scores, labels, value)
             if group.size == 0:
                 continue
@@ -452,11 +455,11 @@ def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args) -> list
     ax.tick_params(axis="y", length=0)
     _style_axis(ax)
     return [matplotlib.patches.Patch(facecolor=color, alpha=0.35, edgecolor=color, label=name)
-            for name, _value, color in GROUPS]
+            for name, _value, color in groups]
 
 
-def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args) -> list:
-    """One trace: a KDE (area 1) per label and noise level, all on one axis.
+def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args, groups=GROUPS) -> list:
+    """One trace: a KDE (area 1) per label in `groups` and noise level, all on one axis.
 
     Colour = label, shade = noise level (darkest: clean). Returns legend
     handles, interleaved benign/anomalous per level so that a legend with one
@@ -469,7 +472,7 @@ def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args) -> li
     handles = []
     for k, sigma in enumerate(levels):
         _index, scores, labels = per_level[sigma]
-        for name, value, _color in GROUPS:
+        for name, value, _color in groups:
             color = level_shade(value, k, len(levels))
             label = f"{name}, clean" if sigma == CLEAN else f"{name}, $\\sigma$ = {sigma:g}"
             group = _split(scores, labels, value)
@@ -518,8 +521,8 @@ def _kde_curve(values: np.ndarray, log_x: bool) -> tuple[np.ndarray, np.ndarray]
 
 
 def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_args, stem: Path,
-                   draw, row_height: float, legend_cols: int):
-    """One axis per trace, stacked; `draw` puts every label x noise level of that trace on it."""
+                   draw, row_height: float, legend_cols: int, groups=GROUPS):
+    """One axis per trace, stacked; `draw` puts every label in `groups` x noise level of that trace on it."""
     n_rows = len(traces)
     fig, axes = plt.subplots(n_rows//2, 2, figsize=(14.0, row_height * n_rows//2 + 0.6),
                              sharex=cli_args.sharex, squeeze=False)
@@ -527,9 +530,9 @@ def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_ar
     handles = []
     for r, trace in enumerate(traces):
         ax = axes[r]
-        handles = draw(ax, results[trace], levels, cli_args) or handles
+        handles = draw(ax, results[trace], levels, cli_args, groups=groups) or handles
         ax.set_ylabel(f"Trace {trace}", fontsize=8)
-        ax.text(1.0, 1.0, _group_counts(results[trace], levels), transform=ax.transAxes,
+        ax.text(1.0, 1.0, _group_counts(results[trace], levels, groups), transform=ax.transAxes,
                 ha="right", va="bottom", fontsize=6, color="0.35")
         if cli_args.log_x:
             ax.set_xscale("log")
@@ -740,6 +743,18 @@ def make_plots(results: dict, traces: list[str], levels: list[float], snaps: dic
                    row_height=1.4, legend_cols=len(levels))
     logging.info("Wrote %s.{%s} and %s.{%s}", stem, ",".join(cli_args.formats),
                  density_stem, ",".join(cli_args.formats))
+
+    # Anomalous timepoints of the clean test data only.
+    anomalous = tuple(g for g in GROUPS if g[1] == 1)
+    anom_stem = stem.parent / f"{stem.name}_anomalous_clean"
+    plot_per_trace(results, traces, [CLEAN], cli_args, anom_stem, draw=draw_trace_boxes,
+                   row_height=0.42 + 0.45, legend_cols=1, groups=anomalous)
+    anom_density_stem = stem.parent / f"{stem.name}_anomalous_clean_density"
+    plot_per_trace(results, traces, [CLEAN], cli_args, anom_density_stem, draw=draw_trace_density,
+                   row_height=1.4, legend_cols=1, groups=anomalous)
+    logging.info("Wrote %s.{%s} and %s.{%s}", anom_stem, ",".join(cli_args.formats),
+                 anom_density_stem, ",".join(cli_args.formats))
+
     if cli_args.snapshots and windows:
         plot_snapshots(snaps, windows, traces, levels, cli_args, stem)
         logging.info("Wrote %s_snapshots.{%s} and %s_snapshots/", stem, ",".join(cli_args.formats), stem)
