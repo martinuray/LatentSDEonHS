@@ -53,7 +53,16 @@ Outputs (in ``--eval-out-dir``):
     normalisation or smoothing. The x axis is the time relative to the onset and
     is shared by every panel; anomalous stretches are shaded. The folder
     ``..._snapshots/`` holds the same panels as single figures, with a legend.
-    The snapshot NLL also goes into the .npz (``...__nll`` over ``trace<id>__snapshot_t``).
+    The snapshot NLL also goes into the .npz (``...__nll`` over ``trace<id>__snapshot_t``),
+    together with the snapshot's onset, clean series, noise pattern and labels.
+
+Re-plotting: ``--from-npz <file>.npz`` reads the scores (and snapshots) of an
+earlier run and only draws the figures -- no checkpoint is restored, nothing is
+scored, and the .npz/.csv are not rewritten. The figures go next to the .npz,
+under its name (or into ``--eval-out-dir``, if given). The plot options
+(``--sharex``, ``--log-x``, ``--formats``, ...) apply as usual;
+``--noise-levels`` picks a subset of the stored levels. The snapshot windows
+are those of the original run, so ``--onset``/``--snapshot-*`` have no effect.
 
 Examples::
 
@@ -61,6 +70,10 @@ Examples::
     python score_distribution_by_label.py --dataset QAD \\
         --checkpoint-dir checkpoints --checkpoint-pattern 'checkpoint_AD_QAD_*_best.h5' \\
         --select-seed 42
+
+    # re-draw the figures of an earlier run, log score axis, without rescoring
+    python score_distribution_by_label.py --dataset QAD \\
+        --from-npz logs/score_distribution/SCOREDIST_QAD_seed42_<run>.npz --log-x
 
     # explicit checkpoints, other noise levels, one score axis for all traces
     python score_distribution_by_label.py --dataset QAD --checkpoints ckpt_trace-*_best.h5 \\
@@ -72,6 +85,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -152,11 +166,16 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
         help="Whiskers at these percentiles (e.g. 1 99) instead of 1.5 IQR.",
     )
     group.add_argument("--formats", nargs="+", default=["pdf", "png"], help="Figure file formats.")
+    group.add_argument(
+        "--from-npz", type=Path, default=None, metavar="NPZ",
+        help="Only re-plot the scores stored in this .npz of an earlier run; no checkpoint is "
+             "restored and nothing is scored. Figures go next to the .npz unless --eval-out-dir is given.",
+    )
 
     group = parser.add_argument_group("Anomaly-onset snapshots")
     group.add_argument(
         "--snapshots", action=argparse.BooleanOptionalAction, default=True,
-        help="Also plot, per trace and noise level, the (noisy) variates and the NLL around an anomaly onset.",
+        help="npz.",
     )
     group.add_argument(
         "--onset", type=int, default=0,
@@ -652,6 +671,97 @@ def summary_rows(trace: str, sigma: float, scores: np.ndarray, labels: np.ndarra
     return rows
 
 
+def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict, dict]:
+    """Read back what main() stored: (seed, traces, levels, results, snapshots, snapshot windows).
+
+    Files written before the metadata keys (``__seed``, ``__traces``,
+    ``__levels``) and the snapshot data existed still work: traces and levels
+    are taken from the key names and the seed from the file name; their
+    snapshots cannot be redrawn.
+    """
+    score_key = re.compile(r"^trace(?P<trace>.+?)__sigma(?P<sigma>[^_]+)__scores$")
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+
+    found = [(m["trace"], float(m["sigma"])) for m in map(score_key.match, arrays) if m]
+    if not found:
+        raise SystemExit(f"{path} holds no scores (no 'trace<id>__sigma<level>__scores' keys).")
+    traces = ([str(t) for t in arrays["__traces"]] if "__traces" in arrays
+              else sorted({t for t, _ in found}, key=trace_sort_key))
+    levels = ([float(v) for v in arrays["__levels"]] if "__levels" in arrays
+              else sorted({sigma for _, sigma in found}))
+    if "__seed" in arrays:
+        seed = int(arrays["__seed"])
+    else:
+        match = re.search(r"_seed(-?\d+)_", path.name)
+        seed = int(match[1]) if match else None
+
+    results = {}
+    for trace in traces:
+        results[trace] = {}
+        for sigma in levels:
+            key = f"trace{trace}__sigma{sigma:g}"
+            results[trace][sigma] = tuple(arrays[f"{key}__{part}"] for part in ("index", "scores", "labels"))
+
+    snaps, windows = {}, {}
+    names = [str(n) for n in arrays["__feature_names"]] if "__feature_names" in arrays else None
+    for trace in traces:
+        prefix = f"trace{trace}__snapshot"
+        if f"{prefix}_series" not in arrays:
+            if f"{prefix}_t" in arrays:
+                logging.warning("Trace %s: %s predates stored snapshot series; no snapshot.", trace, path.name)
+            continue
+        t = arrays[f"{prefix}_t"]
+        window = slice(int(t[0]), int(t[-1]) + 1)
+
+        def padded(values):
+            # Back on the global time axis, so draw_snapshot can index it with `window`.
+            out = np.full((window.stop,) + values.shape[1:], np.nan)
+            out[window] = values
+            return out
+
+        snaps[trace] = {
+            "series": padded(arrays[f"{prefix}_series"]),
+            "noise": padded(arrays[f"{prefix}_noise"]),
+            "labels": padded(arrays[f"{prefix}_labels"]),
+            "feature_names": names,
+            "nll": {sigma: padded(arrays[f"trace{trace}__sigma{sigma:g}__nll"]) for sigma in levels},
+        }
+        windows[trace] = (int(arrays[f"{prefix}_onset"]), window)
+    return seed, traces, levels, results, snaps, windows
+
+
+def make_plots(results: dict, traces: list[str], levels: list[float], snaps: dict, windows: dict,
+               cli_args, stem: Path) -> None:
+    plot_per_trace(results, traces, levels, cli_args, stem, draw=draw_trace_boxes,
+                   row_height=0.42 * len(levels) + 0.45, legend_cols=len(GROUPS))
+    density_stem = stem.parent / f"{stem.name}_density"
+    plot_per_trace(results, traces, levels, cli_args, density_stem, draw=draw_trace_density,
+                   row_height=1.4, legend_cols=len(levels))
+    logging.info("Wrote %s.{%s} and %s.{%s}", stem, ",".join(cli_args.formats),
+                 density_stem, ",".join(cli_args.formats))
+    if cli_args.snapshots and windows:
+        plot_snapshots(snaps, windows, traces, levels, cli_args, stem)
+        logging.info("Wrote %s_snapshots.{%s} and %s_snapshots/", stem, ",".join(cli_args.formats), stem)
+
+
+def replot_from_npz(cli_args, explicit: set[str]) -> None:
+    path = cli_args.from_npz
+    if not path.is_file():
+        raise SystemExit(f"--from-npz: no such file {path}")
+    seed, traces, levels, results, snaps, windows = load_npz(path)
+    if "noise_levels" in explicit:
+        wanted = [CLEAN] + sorted(dict.fromkeys(cli_args.noise_levels))
+        missing = [sigma for sigma in wanted if sigma not in levels]
+        if missing:
+            raise SystemExit(f"--noise-levels {missing} not in {path.name}; stored levels: {levels}.")
+        levels = wanted
+    logging.info("Re-plotting %s: seed %s, trace(s) %s, noise levels %s", path.name, seed, traces, levels)
+    out_dir = Path(cli_args.eval_out_dir) if "eval_out_dir" in explicit else path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    make_plots(results, traces, levels, snaps, windows, cli_args, out_dir / path.stem)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -662,6 +772,15 @@ def main():
     cli_args = parser.parse_args(argv)
     cli_args.trace_ids = _normalize_trace_ids(cli_args.trace_ids)
     explicit = _explicit_cli_dests(parser, argv)
+
+    if cli_args.from_npz is not None:
+        set_up_logging(
+            console_log_level=cli_args.loglevel, console_log_color=True, logfile_file=None,
+            logfile_log_level=cli_args.loglevel, logfile_log_color=False,
+            log_line_template="%(color_on)s[%(asctime)s] [%(levelname)-8s] %(message)s%(color_off)s",
+        )
+        replot_from_npz(cli_args, explicit)
+        return
 
     if bool(cli_args.checkpoints) == bool(cli_args.checkpoint_dir):
         parser.error("Provide the checkpoints via exactly one of --checkpoints or --checkpoint-dir.")
@@ -729,6 +848,12 @@ def main():
                 logging.info("Trace %s: snapshot at onset t=%d (t=%d..%d)", trace, onset, window.start,
                              window.stop - 1)
                 arrays[f"trace{trace}__snapshot_t"] = np.arange(window.start, window.stop)
+                arrays[f"trace{trace}__snapshot_onset"] = np.asarray(onset)
+                arrays[f"trace{trace}__snapshot_series"] = snap["series"][window]
+                arrays[f"trace{trace}__snapshot_noise"] = snap["noise"][window]
+                arrays[f"trace{trace}__snapshot_labels"] = snap["labels"][window]
+                if snap["feature_names"] is not None and "__feature_names" not in arrays:
+                    arrays["__feature_names"] = np.asarray([str(n) for n in snap["feature_names"]])
                 for sigma in levels:
                     arrays[f"trace{trace}__sigma{sigma:g}__nll"] = snap["nll"][sigma][window]
         for sigma, (index, scores, labels) in per_level.items():
@@ -740,18 +865,11 @@ def main():
 
     run_id = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     stem = out_dir / f"SCOREDIST_{cli_args.dataset}_seed{seed}_{run_id}"
+    arrays.update(__seed=np.asarray(seed), __traces=np.asarray(traces), __levels=np.asarray(levels))
     np.savez_compressed(stem.with_suffix(".npz"), **arrays)
     pd.DataFrame(rows).to_csv(stem.with_suffix(".csv"), index=False)
-    plot_per_trace(results, traces, levels, cli_args, stem, draw=draw_trace_boxes,
-                   row_height=0.42 * len(levels) + 0.45, legend_cols=len(GROUPS))
-    density_stem = stem.parent / f"{stem.name}_density"
-    plot_per_trace(results, traces, levels, cli_args, density_stem, draw=draw_trace_density,
-                   row_height=1.4, legend_cols=len(levels))
-    logging.info("Wrote %s.{%s,npz,csv} and %s.{%s}", stem, ",".join(cli_args.formats),
-                 density_stem, ",".join(cli_args.formats))
-    if cli_args.snapshots:
-        plot_snapshots(snaps, windows, traces, levels, cli_args, stem)
-        logging.info("Wrote %s_snapshots.{%s} and %s_snapshots/", stem, ",".join(cli_args.formats), stem)
+    logging.info("Wrote %s.{npz,csv}", stem)
+    make_plots(results, traces, levels, snaps, windows, cli_args, stem)
 
 
 if __name__ == "__main__":
