@@ -108,7 +108,7 @@ from utils.misc import set_seed  # noqa: E402
 
 # (label, label value, colour), drawn top to bottom in each cell.
 GROUPS = (("Benign", 0, "#1F77B4"), ("Anomalous", 1, "#D62728"))
-DEFAULT_NOISE_LEVELS = [0.1, 0.5, 1.0]
+DEFAULT_NOISE_LEVELS = [0.1, 0.25, 0.4]
 CLEAN = 0.0
 
 
@@ -131,7 +131,7 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
              f"clean column. Default: {' '.join(map(str, DEFAULT_NOISE_LEVELS))}.",
     )
     group.add_argument(
-        "--sharex", choices=["row", "col", "all", "none"], default="row",
+        "--sharex", choices=["row", "col", "all", "none"], default="none",
         help="Which cells share the score axis. Default: row (one trace across noise levels).",
     )
     group.add_argument("--log-x", action="store_true", help="Log-scale the score axes.")
