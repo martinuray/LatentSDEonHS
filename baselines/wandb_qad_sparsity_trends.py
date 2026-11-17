@@ -496,8 +496,14 @@ def report_run_counts(history: pd.DataFrame, run_modes: list[tuple[str, float]],
     short = [(bench, lvl, var) for bench, lvl in run_modes for var in VARIANTS
              if counts.loc[(bench, lvl), var] < run_limit]
     if short:
-        print(f"  note: fewer than {run_limit} runs for: "
-              + ", ".join(f"{bench} {lvl:g}/{var}" for bench, lvl, var in short))
+        # Runs are deduplicated by seed, so a short bucket means W&B holds fewer
+        # distinct usable seeds than --run-limit; name the ones that were found.
+        print(f"  note: fewer than {run_limit} runs (distinct seeds) for:")
+        for bench, lvl, var in short:
+            cell = history[(history["benchmark"] == bench) & (history["level"] == lvl)
+                           & (history["variant"] == var)]
+            seeds = sorted(cell.drop_duplicates("run_id")["seed"].dropna().astype(int).tolist())
+            print(f"    {bench} {lvl:g}/{var}: {len(seeds)} run(s), seeds {seeds}")
 
 
 # ---------------------------------------------------------------------------
