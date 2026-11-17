@@ -115,7 +115,7 @@ from utils.misc import set_seed  # noqa: E402
 
 # (label, label value, colour), drawn top to bottom in each cell.
 GROUPS = (("Benign", 0, "#1F77B4"), ("Anomalous", 1, "#D62728"))
-DEFAULT_NOISE_LEVELS = [0.1, 0.5, 1.0]
+DEFAULT_NOISE_LEVELS = [0.1, 0.25, 0.4]
 CLEAN = 0.0
 
 
@@ -502,11 +502,12 @@ def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_ar
                    draw, row_height: float, legend_cols: int):
     """One axis per trace, stacked; `draw` puts every label x noise level of that trace on it."""
     n_rows = len(traces)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(7.0, row_height * n_rows + 0.6),
+    fig, axes = plt.subplots(n_rows//2, 2, figsize=(7.0, row_height * n_rows + 0.6),
                              sharex=cli_args.sharex, squeeze=False)
+    axes = axes.flatten()
     handles = []
     for r, trace in enumerate(traces):
-        ax = axes[r, 0]
+        ax = axes[r]
         handles = draw(ax, results[trace], levels, cli_args) or handles
         ax.set_ylabel(f"Trace {trace}", fontsize=8)
         ax.text(1.0, 1.0, _group_counts(results[trace], levels), transform=ax.transAxes,
@@ -515,7 +516,8 @@ def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_ar
             ax.set_xscale("log")
         if not cli_args.sharex:
             ax.tick_params(axis="x", labelbottom=True)
-    axes[-1, 0].set_xlabel("Anomaly score", fontsize=8)
+    axes[-2].set_xlabel("Anomaly score", fontsize=8)
+    axes[-1].set_xlabel("Anomaly score", fontsize=8)
     fig.tight_layout()
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=legend_cols,
                frameon=False, fontsize=7)
