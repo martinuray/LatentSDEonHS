@@ -48,7 +48,9 @@ so it lies on the plotted score axis, and only from the clean pass -- the noisy
 rows are compared against the clean data's threshold.
 
 Outputs (in ``--eval-out-dir``):
-  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots,
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots, one
+    colour per label (every noise level of a label looks the same; the rows are
+    told apart by their labels),
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_density.{pdf,png}``: the same
     layout and data, each trace's axis showing a Gaussian KDE (a smoothed
     histogram normalised to area 1, so the groups are comparable in shape
@@ -534,8 +536,17 @@ def row_color(value: int, sigma: float, levels: list[float]):
     return level_shade(value, levels.index(sigma), len(levels))
 
 
+def group_color(value: int):
+    """The label's flat colour, for figures that do not encode the level in the shade."""
+    return next(color for _name, val, color in GROUPS if val == value)
+
+
 def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, threshold: float | None = None) -> list:
     """One trace: a thin horizontal box per row of `plot_rows` (benign per level, anomalous clean).
+
+    Every row of a label is drawn in that label's one colour -- the noise level
+    is given by the row label, not by the shade (unlike the density figure,
+    where the rows share an axis and need to be told apart by colour).
 
     Returns legend handles (one per label, plus the threshold line if drawn).
     """
@@ -547,7 +558,7 @@ def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, thresho
         group = _split(scores, labels, value)
         if group.size == 0:
             continue
-        color = row_color(value, sigma, levels)
+        color = group_color(value)
         ax.boxplot(
             group, positions=[center], vert=False, widths=0.55, whis=whis, showfliers=cli_args.show_fliers,
             patch_artist=True,
@@ -562,9 +573,8 @@ def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, thresho
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.tick_params(axis="y", length=0)
     _style_axis(ax)
-    handles = [matplotlib.patches.Patch(facecolor=row_color(value, CLEAN, levels), alpha=0.35,
-                                        edgecolor=row_color(value, CLEAN, levels), label=name)
-               for name, value, _color in GROUPS]
+    handles = [matplotlib.patches.Patch(facecolor=color, alpha=0.35, edgecolor=color, label=name)
+               for name, _value, color in GROUPS]
     line = draw_threshold(ax, threshold, cli_args)
     return handles + ([line] if line is not None else [])
 
