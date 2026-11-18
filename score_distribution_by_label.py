@@ -35,6 +35,18 @@ unless ``--no-exclude-max-sigma`` is given.
 Scores of different traces come from different models, so each trace gets its
 own axis range unless ``--sharex`` is given.
 
+Threshold: per trace, the clean scores (benign and anomalous together, i.e. the
+full clean test split) are evaluated with the metric suite of
+``anomaly_detection.py`` -- ``utils.scoring_functions.get_ts_eval``, the
+point-wise F1/precision/recall plus the VUS library's range-based and
+volume-under-the-surface metrics. The anomaly classification those metrics
+report comes from thresholding the scores at the point that maximises the
+point-wise F1; that threshold is drawn as a vertical dashed line in every
+trace's axis of both figures (``--no-threshold-line`` skips the evaluation and
+the line). It is derived from the same post-processed scores the figure shows,
+so it lies on the plotted score axis, and only from the clean pass -- the noisy
+rows are compared against the clean data's threshold.
+
 Outputs (in ``--eval-out-dir``):
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots,
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_density.{pdf,png}``: the same
@@ -46,7 +58,10 @@ Outputs (in ``--eval-out-dir``):
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.npz``: per trace and level, the test
     index, scores and labels (keys ``trace<id>__sigma<level>__{index,scores,labels}``),
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.csv``: count, mean and quantiles per
-    trace, level and label.
+    trace, level and label,
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>_metrics.csv``: per trace, the clean
+    data's threshold and the metrics it was derived from (one row per trace).
+    The threshold also goes into the .npz (``trace<id>__threshold``).
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_snapshots.{pdf,png}`` (unless
     ``--no-snapshots``): per trace (rows) and noise level (columns), a window of
     the test series around a benign->anomalous transition (``--onset``, the
@@ -66,6 +81,10 @@ under its name (or into ``--eval-out-dir``, if given). The plot options
 (``--sharex``, ``--log-x``, ``--formats``, ...) apply as usual;
 ``--noise-levels`` picks a subset of the stored levels. The snapshot windows
 are those of the original run, so ``--onset``/``--snapshot-*`` have no effect.
+The thresholds stored with the run are reused; for an .npz written before they
+were stored, each threshold is re-derived from the stored clean scores (the
+same value, as it needs no window length), but the metric suite is not
+recomputed.
 
 Examples::
 
@@ -125,10 +144,12 @@ from evaluate_checkpoints import (  # noqa: E402
     _make_loaders,
     _resolve_trace_index,
     _restore_modules,
+    _to_python,
     discover_checkpoints,
 )
 from utils.logger import set_up_logging  # noqa: E402
 from utils.misc import set_seed  # noqa: E402
+from utils.scoring_functions import Evaluator, get_ts_eval  # noqa: E402
 
 # (label, label value, colour), drawn top to bottom in each cell.
 GROUPS = (("Benign", 0, "#1F77B4"), ("Anomalous", 1, "#D62728"))
@@ -165,6 +186,13 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
              "On by default; --no-exclude-max-sigma plots every level.",
     )
     group.add_argument("--log-x", action="store_true", help="Log-scale the score axes.")
+    group.add_argument(
+        "--threshold-line", action=argparse.BooleanOptionalAction, default=True,
+        help="Evaluate each trace's clean scores with the metric suite of anomaly_detection.py "
+             "(get_ts_eval / VUS) and draw the threshold its anomaly classification uses -- the one "
+             "maximising the point-wise F1 -- as a vertical line in that trace's axis. On by default; "
+             "--no-threshold-line skips both the evaluation (the VUS metrics are slow) and the line.",
+    )
     group.add_argument(
         "--show-fliers", action=argparse.BooleanOptionalAction, default=True,
         help="Draw points beyond the whiskers (a test set has many, so they are tiny and translucent).",
@@ -397,6 +425,50 @@ def score_trace(args, ckpt: dict, provider, ds_idx: int, levels: list[float],
 
 
 # --------------------------------------------------------------------------- #
+# Threshold from the clean data
+# --------------------------------------------------------------------------- #
+def clean_threshold(scores: np.ndarray, labels: np.ndarray,
+                    window_length: int | None = None) -> tuple[float | None, dict]:
+    """``(threshold, metrics)`` of one trace's clean test scores.
+
+    The metrics are the suite ``anomaly_detection.py`` reports:
+    ``get_ts_eval``, i.e. the point-wise F1/precision/recall plus the VUS
+    library's range-based and volume-under-the-surface metrics. The threshold
+    is the one that produced that best point-wise F1 -- the value
+    ``get_ts_eval`` itself drops -- so classifying the scores as anomalous
+    above it is the classification the reported F1/precision/recall belong to.
+
+    `scores` and `labels` are the clean pass of the plot, benign and anomalous
+    together and after the same smoothing and feature aggregation, so the
+    threshold lies on the plotted score axis. With `window_length` None only
+    the threshold is computed, which needs no window length (the VUS metrics
+    do, and they dominate the runtime). Returns ``(None, {})`` if the split
+    holds only one class or no finite score, where no threshold is defined.
+    """
+    scores = np.asarray(scores, dtype=float)
+    labels = (np.asarray(labels) > 0).astype(int)
+    finite = np.isfinite(scores)
+    scores, labels = scores[finite], labels[finite]
+    if scores.size == 0 or labels.min() == labels.max():
+        logging.warning("No threshold from the clean scores: %d finite score(s), label(s) %s.",
+                        scores.size, np.unique(labels).tolist())
+        return None, {}
+
+    pointwise = Evaluator().best_f1_score(labels, scores)
+    metrics = {"n": int(scores.size), "n_anomalous": int(labels.sum()),
+               "threshold": float(pointwise["threshold"])}
+    metrics.update(_to_python(get_ts_eval(scores, labels, window_length=window_length)
+                              if window_length else
+                              {key: pointwise[key] for key in ("f1", "precision", "recall")}))
+    return metrics["threshold"], metrics
+
+
+def format_metrics(metrics: dict) -> str:
+    return ", ".join(f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}"
+                     for key, value in metrics.items())
+
+
+# --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
 def level_title(sigma: float) -> str:
@@ -423,6 +495,22 @@ def _group_counts(per_level: dict, levels: list[float]) -> str:
     return ", ".join(f"{name.lower()} n={_split(scores, labels, value).size:,}" for name, value, _ in GROUPS)
 
 
+# Vertical line at the clean data's anomaly threshold (see clean_threshold).
+THRESHOLD_COLOR = "0.25"
+THRESHOLD_LABEL = "Threshold (clean, best $F_1$)"
+
+
+def draw_threshold(ax, threshold: float | None, cli_args):
+    """Vertical line at `threshold`, or None if there is nothing to draw on this axis."""
+    if threshold is None or not np.isfinite(threshold):
+        return None
+    if cli_args.log_x and threshold <= 0:
+        logging.warning("Threshold %g <= 0 cannot be drawn on the log score axis.", threshold)
+        return None
+    return ax.axvline(float(threshold), color=THRESHOLD_COLOR, linewidth=1.1, linestyle=(0, (4, 2)),
+                      zorder=3, label=THRESHOLD_LABEL)
+
+
 def _style_axis(ax) -> None:
     ax.tick_params(axis="x", labelsize=7)
     ax.grid(axis="x", alpha=0.3)
@@ -446,10 +534,10 @@ def row_color(value: int, sigma: float, levels: list[float]):
     return level_shade(value, levels.index(sigma), len(levels))
 
 
-def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args) -> list:
+def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, threshold: float | None = None) -> list:
     """One trace: a thin horizontal box per row of `plot_rows` (benign per level, anomalous clean).
 
-    Returns legend handles (one per label).
+    Returns legend handles (one per label, plus the threshold line if drawn).
     """
     whis = tuple(cli_args.whisker_range) if cli_args.whisker_range else 1.5
     rows = plot_rows(levels)
@@ -474,15 +562,19 @@ def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args) -> list
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.tick_params(axis="y", length=0)
     _style_axis(ax)
-    return [matplotlib.patches.Patch(facecolor=row_color(value, CLEAN, levels), alpha=0.35,
-                                     edgecolor=row_color(value, CLEAN, levels), label=name)
-            for name, value, _color in GROUPS]
+    handles = [matplotlib.patches.Patch(facecolor=row_color(value, CLEAN, levels), alpha=0.35,
+                                        edgecolor=row_color(value, CLEAN, levels), label=name)
+               for name, value, _color in GROUPS]
+    line = draw_threshold(ax, threshold, cli_args)
+    return handles + ([line] if line is not None else [])
 
 
-def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args) -> list:
+def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args,
+                       threshold: float | None = None) -> list:
     """One trace: a KDE (area 1) per row of `plot_rows` (benign per level, anomalous clean), on one axis.
 
-    Colour = label, shade = noise level (darkest: clean). Returns one legend handle per row.
+    Colour = label, shade = noise level (darkest: clean). Returns one legend
+    handle per row, plus the threshold line if drawn.
     """
     log_x = cli_args.log_x
     if log_x and min(np.nanmin(per_level[s][1]) for s in levels) <= 0:
@@ -502,6 +594,9 @@ def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args) -> li
         x, density = curve
         ax.fill_between(x, density, color=color, alpha=0.06, linewidth=0)
         handles.append(ax.plot(x, density, color=color, linewidth=linewidth, label=label)[0])
+    line = draw_threshold(ax, threshold, cli_args)
+    if line is not None:
+        handles.append(line)
     ax.set_ylim(bottom=0)
     ax.set_yticks([])
     _style_axis(ax)
@@ -537,8 +632,8 @@ def _kde_curve(values: np.ndarray, log_x: bool) -> tuple[np.ndarray, np.ndarray]
     return (np.exp(grid) if log_x else grid), density
 
 
-def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_args, stem: Path,
-                   draw, row_height: float, legend_cols: int):
+def plot_per_trace(results: dict, traces: list[str], levels: list[float], thresholds: dict, cli_args,
+                   stem: Path, draw, row_height: float, legend_cols: int):
     """One axis per trace; `draw` puts the rows of `plot_rows(levels)` of that trace on it."""
     n_rows = len(traces)
     fig, axes = plt.subplots(n_rows//2, 2, figsize=(14.0, row_height * n_rows//2 + 0.6),
@@ -547,9 +642,13 @@ def plot_per_trace(results: dict, traces: list[str], levels: list[float], cli_ar
     handles = []
     for r, trace in enumerate(traces):
         ax = axes[r]
-        handles = draw(ax, results[trace], levels, cli_args) or handles
+        threshold = thresholds.get(trace)
+        handles = draw(ax, results[trace], levels, cli_args, threshold) or handles
         ax.set_ylabel(f"Trace {trace}", fontsize=8)
-        ax.text(1.0, 1.0, _group_counts(results[trace], levels), transform=ax.transAxes,
+        note = _group_counts(results[trace], levels)
+        if threshold is not None and np.isfinite(threshold):
+            note += f", threshold={threshold:.4g}"
+        ax.text(1.0, 1.0, note, transform=ax.transAxes,
                 ha="right", va="bottom", fontsize=6, color="0.35")
         if cli_args.log_x:
             ax.set_xscale("log")
@@ -691,13 +790,15 @@ def summary_rows(trace: str, sigma: float, scores: np.ndarray, labels: np.ndarra
     return rows
 
 
-def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict, dict]:
-    """Read back what main() stored: (seed, traces, levels, results, snapshots, snapshot windows).
+def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict, dict, dict]:
+    """Read back what main() stored.
 
+    ``(seed, traces, levels, results, snapshots, snapshot windows, thresholds)``.
     Files written before the metadata keys (``__seed``, ``__traces``,
-    ``__levels``) and the snapshot data existed still work: traces and levels
-    are taken from the key names and the seed from the file name; their
-    snapshots cannot be redrawn.
+    ``__levels``), the snapshot data and the thresholds existed still work:
+    traces and levels are taken from the key names and the seed from the file
+    name; their snapshots cannot be redrawn and their thresholds are missing
+    (replot_from_npz re-derives those).
     """
     score_key = re.compile(r"^trace(?P<trace>.+?)__sigma(?P<sigma>[^_]+)__scores$")
     with np.load(path, allow_pickle=False) as data:
@@ -748,20 +849,23 @@ def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict
             "nll": {sigma: padded(arrays[f"trace{trace}__sigma{sigma:g}__nll"]) for sigma in levels},
         }
         windows[trace] = (int(arrays[f"{prefix}_onset"]), window)
-    return seed, traces, levels, results, snaps, windows
+
+    thresholds = {trace: float(arrays[f"trace{trace}__threshold"])
+                  for trace in traces if f"trace{trace}__threshold" in arrays}
+    return seed, traces, levels, results, snaps, windows, thresholds
 
 
 def make_plots(results: dict, traces: list[str], levels: list[float], snaps: dict, windows: dict,
-               cli_args, stem: Path) -> None:
+               thresholds: dict, cli_args, stem: Path) -> None:
     if cli_args.exclude_max_sigma and max(levels) > CLEAN:
         logging.info("Not plotting the largest noise level, sigma = %g (--no-exclude-max-sigma keeps it).",
                      max(levels))
         levels = [sigma for sigma in levels if sigma != max(levels)]
-    plot_per_trace(results, traces, levels, cli_args, stem, draw=draw_trace_boxes,
-                   row_height=0.25 * (len(levels) + 1) + 0.45, legend_cols=len(GROUPS))
+    plot_per_trace(results, traces, levels, thresholds, cli_args, stem, draw=draw_trace_boxes,
+                   row_height=0.25 * (len(levels) + 1) + 0.45, legend_cols=len(GROUPS) + 1)
     density_stem = stem.parent / f"{stem.name}_density"
-    plot_per_trace(results, traces, levels, cli_args, density_stem, draw=draw_trace_density,
-                   row_height=1.4, legend_cols=len(levels) + 1)
+    plot_per_trace(results, traces, levels, thresholds, cli_args, density_stem, draw=draw_trace_density,
+                   row_height=1.4, legend_cols=len(levels) + 2)
     logging.info("Wrote %s.{%s} and %s.{%s}", stem, ",".join(cli_args.formats),
                  density_stem, ",".join(cli_args.formats))
 
@@ -774,7 +878,7 @@ def replot_from_npz(cli_args, explicit: set[str]) -> None:
     path = cli_args.from_npz
     if not path.is_file():
         raise SystemExit(f"--from-npz: no such file {path}")
-    seed, traces, levels, results, snaps, windows = load_npz(path)
+    seed, traces, levels, results, snaps, windows, thresholds = load_npz(path)
     if "noise_levels" in explicit:
         wanted = [CLEAN] + sorted(dict.fromkeys(cli_args.noise_levels))
         missing = [sigma for sigma in wanted if sigma not in levels]
@@ -782,9 +886,26 @@ def replot_from_npz(cli_args, explicit: set[str]) -> None:
             raise SystemExit(f"--noise-levels {missing} not in {path.name}; stored levels: {levels}.")
         levels = wanted
     logging.info("Re-plotting %s: seed %s, trace(s) %s, noise levels %s", path.name, seed, traces, levels)
+
+    if not cli_args.threshold_line:
+        thresholds = {}
+    else:
+        # A threshold needs no window length, so re-deriving it from the stored
+        # clean scores gives exactly the value the original run would have
+        # written; only the metric suite around it is not recomputed here.
+        missing = [trace for trace in traces if trace not in thresholds]
+        if missing and CLEAN not in levels:
+            logging.warning("No stored threshold for trace(s) %s and no clean level to re-derive it from.",
+                            missing)
+        elif missing:
+            logging.info("No stored threshold for trace(s) %s; re-deriving it from the clean scores.", missing)
+            for trace in missing:
+                _index, scores, labels = results[trace][CLEAN]
+                thresholds[trace], _metrics = clean_threshold(scores, labels)
+
     out_dir = Path(cli_args.eval_out_dir) if "eval_out_dir" in explicit else path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    make_plots(results, traces, levels, snaps, windows, cli_args, out_dir / path.stem)
+    make_plots(results, traces, levels, snaps, windows, thresholds, cli_args, out_dir / path.stem)
 
 
 # --------------------------------------------------------------------------- #
@@ -840,8 +961,8 @@ def main():
     logging.info("Seed %d: %d trace(s) %s, noise levels %s", seed, len(traces), traces, levels)
 
     results: dict[str, dict] = {}
-    snaps, windows = {}, {}
-    rows, arrays = [], {}
+    snaps, windows, thresholds = {}, {}, {}
+    rows, metric_rows, arrays = [], [], {}
     for cand in selected:
         path, args = cand["path"], cand["args"]
         if args.seed > 0:
@@ -863,6 +984,14 @@ def main():
 
         trace = cand["trace_key"]
         results[trace] = per_level
+        if cli_args.threshold_line:
+            _index, clean_scores, clean_labels = per_level[CLEAN]
+            thresholds[trace], metrics = clean_threshold(
+                clean_scores, clean_labels, window_length=int(args.data_window_length))
+            if metrics:
+                metric_rows.append({"trace": trace, **metrics})
+                logging.info("Trace %s, clean data: %s", trace, format_metrics(metrics))
+                arrays[f"trace{trace}__threshold"] = np.asarray(thresholds[trace])
         if cli_args.snapshots:
             snaps[trace] = snap
             windows[trace] = snap["window"]
@@ -894,7 +1023,11 @@ def main():
     np.savez_compressed(stem.with_suffix(".npz"), **arrays)
     pd.DataFrame(rows).to_csv(stem.with_suffix(".csv"), index=False)
     logging.info("Wrote %s.{npz,csv}", stem)
-    make_plots(results, traces, levels, snaps, windows, cli_args, stem)
+    if metric_rows:
+        metrics_csv = stem.parent / f"{stem.name}_metrics.csv"
+        pd.DataFrame(metric_rows).to_csv(metrics_csv, index=False)
+        logging.info("Wrote %s", metrics_csv)
+    make_plots(results, traces, levels, snaps, windows, thresholds, cli_args, stem)
 
 
 if __name__ == "__main__":
