@@ -171,7 +171,7 @@ from utils.scoring_functions import Evaluator, get_ts_eval  # noqa: E402
 
 # (label, label value, colour), drawn top to bottom in each cell.
 GROUPS = (("Benign", 0, "#1F77B4"), ("Anomalous", 1, "#D62728"))
-DEFAULT_NOISE_LEVELS = [0.1, 0.25, 0.4]
+DEFAULT_NOISE_LEVELS = [0.05, 0.1, 0.2]
 CLEAN = 0.0
 
 
@@ -199,7 +199,7 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
              "different models and need not share a scale.",
     )
     group.add_argument(
-        "--exclude-max-sigma", action=argparse.BooleanOptionalAction, default=True,
+        "--exclude-max-sigma", action=argparse.BooleanOptionalAction, default=False,
         help="Leave the largest noise level out of all figures (it is still scored and stored). "
              "On by default; --no-exclude-max-sigma plots every level.",
     )
