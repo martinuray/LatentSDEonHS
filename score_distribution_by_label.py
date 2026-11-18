@@ -47,6 +47,13 @@ the line). It is derived from the same post-processed scores the figure shows,
 so it lies on the plotted score axis, and only from the clean pass -- the noisy
 rows are compared against the clean data's threshold.
 
+That same threshold is then applied, unchanged, to every noise level: each
+level pairs its own benign timepoints with the *clean* anomalous ones (merged
+by timepoint, not appended, so the series stays in time order), and the
+resulting classification is summarised per trace and level. The anomalous side
+is the same everywhere, so a trace's TPR is constant and the noise shows up in
+its false positive rate.
+
 Outputs (in ``--eval-out-dir``):
   * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots, one
     colour per label (every noise level of a label looks the same; the rows are
@@ -63,7 +70,16 @@ Outputs (in ``--eval-out-dir``):
     trace, level and label,
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_metrics.csv``: per trace, the clean
     data's threshold and the metrics it was derived from (one row per trace).
-    The threshold also goes into the .npz (``trace<id>__threshold``).
+    The threshold also goes into the .npz (``trace<id>__threshold``),
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>_threshold.{csv,tex,md}``: that
+    threshold applied to every noise level -- the full confusion matrix and its
+    rates per trace and level in the .csv, and the FPR/TPR/precision/F1 of it
+    as a table (one row block per trace, one row per level, plus the mean over
+    the traces; all values x100). The .tex is a bare ``tabular`` in the style of
+    ``baselines/wandb_results_to_latex.py`` (booktabs, multirow, graphicx and
+    the ``\\std`` macro in the preamble; wrap it in your own float), the .md the
+    same table for a quick look. Every level is in the table, including the one
+    ``--exclude-max-sigma`` keeps out of the figures,
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_snapshots.{pdf,png}`` (unless
     ``--no-snapshots``): per trace (rows) and noise level (columns), a window of
     the test series around a benign->anomalous transition (``--onset``, the
@@ -85,8 +101,8 @@ under its name (or into ``--eval-out-dir``, if given). The plot options
 are those of the original run, so ``--onset``/``--snapshot-*`` have no effect.
 The thresholds stored with the run are reused; for an .npz written before they
 were stored, each threshold is re-derived from the stored clean scores (the
-same value, as it needs no window length), but the metric suite is not
-recomputed.
+same value, as it needs no window length). The threshold table is rewritten
+from the stored scores; the metric suite behind the threshold is not recomputed.
 
 Examples::
 
@@ -191,9 +207,10 @@ def build_parser(dataset: str, config_file: str | None) -> argparse.ArgumentPars
     group.add_argument(
         "--threshold-line", action=argparse.BooleanOptionalAction, default=True,
         help="Evaluate each trace's clean scores with the metric suite of anomaly_detection.py "
-             "(get_ts_eval / VUS) and draw the threshold its anomaly classification uses -- the one "
-             "maximising the point-wise F1 -- as a vertical line in that trace's axis. On by default; "
-             "--no-threshold-line skips both the evaluation (the VUS metrics are slow) and the line.",
+             "(get_ts_eval / VUS), draw the threshold its anomaly classification uses -- the one "
+             "maximising the point-wise F1 -- as a vertical line in that trace's axis, and write the "
+             "table of that threshold applied to every noise level. On by default; --no-threshold-line "
+             "skips the evaluation (the VUS metrics are slow), the line and the table.",
     )
     group.add_argument(
         "--show-fliers", action=argparse.BooleanOptionalAction, default=True,
@@ -463,6 +480,65 @@ def clean_threshold(scores: np.ndarray, labels: np.ndarray,
                               if window_length else
                               {key: pointwise[key] for key in ("f1", "precision", "recall")}))
     return metrics["threshold"], metrics
+
+
+def mixed_scores(per_level: dict, sigma: float) -> tuple[np.ndarray, np.ndarray]:
+    """One trace's test scores with the benign timepoints taken from level `sigma`.
+
+    The anomalous timepoints always keep their clean score, so every level is
+    the same anomalous data against differently noisy benign data -- what moves
+    between the levels is the benign side, and with it the false positive rate.
+    The two passes share the test index (the covered timepoints do not depend
+    on the noise), so the scores are merged in time order rather than
+    concatenated, which keeps the series intact for anything range-based.
+    """
+    index, scores, labels = per_level[sigma]
+    clean_index, clean_scores, _clean_labels = per_level[CLEAN]
+    if not np.array_equal(index, clean_index):
+        raise ValueError(f"The test index of sigma = {sigma:g} differs from the clean one; "
+                         "the levels cannot be merged by timepoint.")
+    return np.where(labels > 0, clean_scores, scores), labels
+
+
+def threshold_metrics(scores: np.ndarray, labels: np.ndarray, threshold: float) -> dict:
+    """Confusion matrix and its rates for ``score >= threshold`` -> anomalous.
+
+    ``>=`` is the convention of the precision-recall curve the threshold comes
+    from, so at the clean level these numbers are exactly the F1/precision/
+    recall `clean_threshold` reports.
+    """
+    finite = np.isfinite(scores)
+    predicted = np.asarray(scores)[finite] >= threshold
+    actual = np.asarray(labels)[finite] > 0
+    tp = int(np.count_nonzero(predicted & actual))
+    fp = int(np.count_nonzero(predicted & ~actual))
+    fn = int(np.count_nonzero(~predicted & actual))
+    tn = int(np.count_nonzero(~predicted & ~actual))
+
+    def ratio(num, den):
+        return float(num) / den if den else float("nan")
+
+    precision, recall = ratio(tp, tp + fp), ratio(tp, tp + fn)
+    return {
+        "n_benign": fp + tn, "n_anomalous": tp + fn, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "fpr": ratio(fp, fp + tn), "tpr": recall, "precision": precision, "recall": recall,
+        "f1": ratio(2 * tp, 2 * tp + fp + fn), "accuracy": ratio(tp + tn, tp + fp + fn + tn),
+    }
+
+
+def threshold_table(results: dict, traces: list[str], levels: list[float], thresholds: dict) -> pd.DataFrame:
+    """Per trace and level, the clean threshold applied to that level's data (`mixed_scores`)."""
+    rows = []
+    for trace in traces:
+        threshold = thresholds.get(trace)
+        if threshold is None:
+            logging.warning("Trace %s has no threshold; it is left out of the threshold table.", trace)
+            continue
+        for sigma in levels:
+            scores, labels = mixed_scores(results[trace], sigma)
+            rows.append({"trace": trace, "sigma": sigma, "threshold": threshold,
+                         **threshold_metrics(scores, labels, threshold)})
+    return pd.DataFrame(rows)
 
 
 def format_metrics(metrics: dict) -> str:
@@ -800,6 +876,145 @@ def summary_rows(trace: str, sigma: float, scores: np.ndarray, labels: np.ndarra
     return rows
 
 
+# --------------------------------------------------------------------------- #
+# Threshold table (LaTeX / Markdown)
+# --------------------------------------------------------------------------- #
+# Styled like the tables of baselines/wandb_results_to_latex.py and
+# wandb_qad_sparsity_trends.py: a bare ``tabular`` (booktabs, multirow,
+# graphicx and the ``\std`` macro in the preamble; no float, no caption, no
+# \resizebox -- those belong to the use site), bold headers with a \big arrow
+# for the better direction, rates x100, ``mean \std{std}`` to two decimals.
+TABLE_METRICS = ("fpr", "tpr", "precision", "f1")
+TABLE_HEADER = {
+    "fpr": (r"\textbf{FPR} \big\downarrow", "FPR ↓"),
+    "tpr": (r"\textbf{TPR} \big\uparrow", "TPR ↑"),
+    "precision": (r"\textbf{Precision} \big\uparrow", "Precision ↑"),
+    "recall": (r"\textbf{Recall} \big\uparrow", "Recall ↑"),
+    "f1": (r"\textbf{F1} \big\uparrow", "F1 ↑"),
+    "accuracy": (r"\textbf{Accuracy} \big\uparrow", "Accuracy ↑"),
+}
+MISSING_CELL = "--"
+ALL_TRACES_LABEL = "All traces"
+
+
+def level_row_label(sigma: float, tex: bool = True) -> str:
+    """Row label of one noise level: the input the threshold is applied to."""
+    if sigma == CLEAN:
+        return "Clean"
+    return f"$\\sigma$ = {sigma:g}" if tex else f"σ = {sigma:g}"
+
+
+def _cell(value: float, missing: str) -> str:
+    """One rate, x100 and to two decimals."""
+    return missing if value is None or not np.isfinite(value) else f"{100 * value:.2f}"
+
+
+def _mean_cell(values: np.ndarray, missing: str, tex: bool) -> str:
+    """``mean \\std{std}`` (tex) / ``mean ± std`` (markdown) over the traces, x100."""
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return missing
+    mean, std = _cell(values.mean(), missing), _cell(values.std(), missing)
+    return f"{mean} \\std{{{std}}}" if tex else f"{mean} ± {std}"
+
+
+def _table_rows(table: pd.DataFrame, traces: list[str], levels: list[float], metrics: tuple[str, ...],
+                tex: bool) -> list[tuple[str, list[list[str]]]]:
+    """(block label, rows of cells) per trace, plus a final block of the means over the traces."""
+    missing = MISSING_CELL if tex else "–"
+    blocks = []
+    for trace in traces:
+        per_trace = table[table["trace"] == trace]
+        if per_trace.empty:
+            continue
+        rows = []
+        for sigma in levels:
+            level_row = per_trace[per_trace["sigma"] == sigma]
+            cells = [missing if level_row.empty else _cell(float(level_row.iloc[0][metric]), missing)
+                     for metric in metrics]
+            rows.append([level_row_label(sigma, tex)] + cells)
+        blocks.append((f"Trace {trace}", rows))
+
+    if len(blocks) > 1:
+        rows = []
+        for sigma in levels:
+            per_level = table[table["sigma"] == sigma]
+            rows.append([level_row_label(sigma, tex)]
+                        + [_mean_cell(per_level[metric].to_numpy(dtype=float), missing, tex)
+                           for metric in metrics])
+        blocks.append((ALL_TRACES_LABEL, rows))
+    return blocks
+
+
+def render_threshold_tex(table: pd.DataFrame, traces: list[str], levels: list[float],
+                         metrics: tuple[str, ...] = TABLE_METRICS) -> str:
+    """The threshold table as a bare ``tabular``: one row block per trace, one row per noise level."""
+    blocks = _table_rows(table, traces, levels, metrics, tex=True)
+    lines = [
+        f"\\begin{{tabular}}{{cl {'r' * len(metrics)}}}",
+        r"\toprule",
+        " & ".join([r"\textbf{Trace}", r"\textbf{Input}"]
+                   + [TABLE_HEADER.get(m, (m, m))[0] for m in metrics]) + r" \\",
+        r"\midrule",
+    ]
+    for k, (label, rows) in enumerate(blocks):
+        if k > 0:
+            lines += [r"\addlinespace[2.5ex]", r"\midrule"]
+        for i, row in enumerate(rows):
+            # A rotated label needs the height of several rows; a one-row block
+            # gets it upright instead, or it would stick out of its row.
+            if i > 0:
+                cell = ""
+            elif len(rows) == 1:
+                cell = f"\\small {label}"
+            else:
+                cell = f"\\multirow{{{len(rows)}}}{{*}}{{\\rotatebox[origin=c]{{90}}{{\\small {label}}}}}"
+            lines.append(" & ".join([cell] + row) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}", ""]
+    return "\n".join(lines)
+
+
+def render_threshold_md(table: pd.DataFrame, traces: list[str], levels: list[float],
+                        metrics: tuple[str, ...] = TABLE_METRICS) -> str:
+    """The same table in Markdown, for a quick look."""
+    header = ["Trace", "Input"] + [TABLE_HEADER.get(m, (m, m))[1] for m in metrics]
+    lines = ["| " + " | ".join(header) + " |",
+             "|" + "|".join(["---"] * 2 + ["---:"] * len(metrics)) + "|"]
+    for k, (label, rows) in enumerate(_table_rows(table, traces, levels, metrics, tex=False)):
+        if k > 0:  # visual gap between the blocks
+            lines.append("| " + " | ".join([""] * len(header)) + " |")
+        for i, row in enumerate(rows):
+            lines.append("| " + " | ".join([f"**{label}**" if i == 0 else ""] + row) + " |")
+    return "\n".join(lines + [""])
+
+
+def write_threshold_tables(results: dict, traces: list[str], levels: list[float], thresholds: dict,
+                           stem: Path) -> None:
+    """The clean threshold applied to every noise level: .csv, .tex and .md next to the figures."""
+    table = threshold_table(results, traces, levels, thresholds)
+    if table.empty:
+        logging.warning("No trace has a threshold; no threshold table is written.")
+        return
+    table_stem = stem.parent / f"{stem.name}_threshold"
+    table.to_csv(table_stem.with_suffix(".csv"), index=False)
+    table_stem.with_suffix(".tex").write_text(render_threshold_tex(table, traces, levels))
+    table_stem.with_suffix(".md").write_text("\n".join([
+        "# The clean data's threshold applied to the noisy inputs", "",
+        "Per trace, the threshold maximising the point-wise F1 on the clean test data (see the "
+        "`_metrics.csv`) is applied unchanged to every noise level. Each level pairs that level's benign "
+        "timepoints with the *clean* anomalous ones, so the anomalous side is the same everywhere and only "
+        "the benign scores move -- the TPR is therefore constant per trace and the FPR is what the noise "
+        "changes. All values x100; `All traces` is the mean ± std over the traces above.", "",
+        render_threshold_md(table, traces, levels),
+    ]))
+    logging.info("Wrote %s.{csv,tex,md}", table_stem)
+
+    means = table.groupby("sigma")["fpr"].mean()
+    logging.info("FPR at the clean threshold, mean over %d trace(s): %s", table["trace"].nunique(),
+                 ", ".join(f"{level_row_label(sigma, tex=False)}: {100 * fpr:.2f}%"
+                           for sigma, fpr in means.items()))
+
+
 def load_npz(path: Path) -> tuple[int | None, list[str], list[float], dict, dict, dict, dict]:
     """Read back what main() stored.
 
@@ -915,6 +1130,8 @@ def replot_from_npz(cli_args, explicit: set[str]) -> None:
 
     out_dir = Path(cli_args.eval_out_dir) if "eval_out_dir" in explicit else path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    if thresholds:
+        write_threshold_tables(results, traces, levels, thresholds, out_dir / path.stem)
     make_plots(results, traces, levels, snaps, windows, thresholds, cli_args, out_dir / path.stem)
 
 
@@ -1037,6 +1254,8 @@ def main():
         metrics_csv = stem.parent / f"{stem.name}_metrics.csv"
         pd.DataFrame(metric_rows).to_csv(metrics_csv, index=False)
         logging.info("Wrote %s", metrics_csv)
+    if any(threshold is not None for threshold in thresholds.values()):
+        write_threshold_tables(results, traces, levels, thresholds, stem)
     make_plots(results, traces, levels, snaps, windows, thresholds, cli_args, stem)
 
 
