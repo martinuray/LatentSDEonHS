@@ -27,8 +27,8 @@ those of the clean training data. The torch RNG (random subsample masks, MC
 samples) is reseeded before each pass, so the passes differ only in the noise.
 
 Figure: one axis per trace. Each axis holds thin horizontal box plots, top to
-bottom: the benign test timepoints of the clean data, the benign timepoints at
-each noise level, and the anomalous timepoints of the clean data, all on one
+bottom: the anomalous test timepoints of the clean data, the benign timepoints
+of the clean data, and the benign timepoints at each noise level, all on one
 score axis (the anomalous scores under noise are still scored and stored).
 The largest noise level is scored and stored but left out of every figure,
 unless ``--no-exclude-max-sigma`` is given.
@@ -55,9 +55,11 @@ is the same everywhere, so a trace's TPR is constant and the noise shows up in
 its false positive rate.
 
 Outputs (in ``--eval-out-dir``):
-  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots, one
-    colour per label (every noise level of a label looks the same; the rows are
-    told apart by their labels),
+  * ``SCOREDIST_<dataset>_seed<seed>_<run>.{pdf,png}``: the box plots. Colour
+    is the label; the clean rows are drawn in its deep tone and solid, the
+    noisy ones in its flat colour at a weaker alpha, and the legend names both
+    ("Benign, clean" / "Benign, noisy"). The noise levels are deliberately not
+    told apart from each other -- which level a row is, is on its row label,
   * ``SCOREDIST_<dataset>_seed<seed>_<run>_density.{pdf,png}``: the same
     layout and data, each trace's axis showing a Gaussian KDE (a smoothed
     histogram normalised to area 1, so the groups are comparable in shape
@@ -599,12 +601,13 @@ def _style_axis(ax) -> None:
 def plot_rows(levels: list[float]) -> list[tuple[str, int, float, str]]:
     """(name, label value, sigma, row label) per distribution, top to bottom.
 
-    The benign timepoints at every level (clean first), then the anomalous
-    timepoints of the clean data only.
+    The anomalous timepoints of the clean data first -- what the scores are
+    supposed to separate belongs on top -- then the benign timepoints at every
+    level, clean first.
     """
-    rows = [("Benign", 0, sigma, "Benign, clean" if sigma == CLEAN else f"Benign, $\\sigma$ = {sigma:g}")
-            for sigma in levels]
-    return rows + [("Anomalous", 1, CLEAN, "Anomalous, clean")]
+    return [("Anomalous", 1, CLEAN, "Anomalous, clean")] + [
+        ("Benign", 0, sigma, "Benign, clean" if sigma == CLEAN else f"Benign, $\\sigma$ = {sigma:g}")
+        for sigma in levels]
 
 
 def row_color(value: int, sigma: float, levels: list[float]):
@@ -617,14 +620,50 @@ def group_color(value: int):
     return next(color for _name, val, color in GROUPS if val == value)
 
 
+def group_name(value: int) -> str:
+    return next(name for name, val, _color in GROUPS if val == value)
+
+
+# Clean vs. noised in the box plot: the clean rows get the deep tone of their
+# label's colour map and are drawn solid, every noisy row the label's flat
+# colour and one weaker alpha. This separates clean from noised at a glance
+# while still leaving the noise levels indistinguishable from each other --
+# which level a row is, is on its row label.
+CLEAN_BOX_SHADE = 0.95
+BOX_ALPHA = {True: (0.45, 1.0), False: (0.20, 0.55)}  # clean?: (face alpha, line alpha)
+
+
+def box_style(value: int, sigma: float) -> tuple:
+    """(colour, face alpha, line alpha) of one box of `draw_trace_boxes`."""
+    is_clean = sigma == CLEAN
+    color = plt.get_cmap(LABEL_CMAPS[value])(CLEAN_BOX_SHADE) if is_clean else group_color(value)
+    return (color,) + BOX_ALPHA[is_clean]
+
+
+def box_legend_handles(levels: list[float]) -> list:
+    """One patch per box style in use: a label's clean rows and, if any, its noisy ones."""
+    handles, seen = [], []
+    for _name, value, sigma, _label in plot_rows(levels):
+        key = (value, sigma == CLEAN)
+        if key in seen:
+            continue
+        seen.append(key)
+        color, face_alpha, _line_alpha = box_style(value, sigma)
+        handles.append(matplotlib.patches.Patch(
+            facecolor=color, alpha=face_alpha, edgecolor=color,
+            label=f"{group_name(value)}, {'clean' if sigma == CLEAN else 'noisy'}"))
+    return handles
+
+
 def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, threshold: float | None = None) -> list:
     """One trace: a thin horizontal box per row of `plot_rows` (benign per level, anomalous clean).
 
-    Every row of a label is drawn in that label's one colour -- the noise level
-    is given by the row label, not by the shade (unlike the density figure,
-    where the rows share an axis and need to be told apart by colour).
+    A label's clean row is drawn in its deep tone and solid, its noisy rows in
+    its flat colour at a weaker alpha (`box_style`): the figure separates clean
+    from noised, not one noise level from the next -- which level a row is, is
+    on its row label.
 
-    Returns legend handles (one per label, plus the threshold line if drawn).
+    Returns legend handles (one per box style, plus the threshold line if drawn).
     """
     whis = tuple(cli_args.whisker_range) if cli_args.whisker_range else 1.5
     rows = plot_rows(levels)
@@ -634,23 +673,23 @@ def draw_trace_boxes(ax, per_level: dict, levels: list[float], cli_args, thresho
         group = _split(scores, labels, value)
         if group.size == 0:
             continue
-        color = group_color(value)
+        color, face_alpha, line_alpha = box_style(value, sigma)
         ax.boxplot(
             group, positions=[center], vert=False, widths=0.55, whis=whis, showfliers=cli_args.show_fliers,
             patch_artist=True,
-            boxprops=dict(facecolor=color, alpha=0.35, edgecolor=color, linewidth=0.9),
-            medianprops=dict(color=color, linewidth=1.6),
-            whiskerprops=dict(color=color, linewidth=0.9), capprops=dict(color=color, linewidth=0.9),
+            boxprops=dict(facecolor=color, alpha=face_alpha, edgecolor=color, linewidth=0.9),
+            medianprops=dict(color=color, alpha=line_alpha, linewidth=1.6),
+            whiskerprops=dict(color=color, alpha=line_alpha, linewidth=0.9),
+            capprops=dict(color=color, alpha=line_alpha, linewidth=0.9),
             flierprops=dict(marker="o", markersize=1.2, markerfacecolor=color, markeredgecolor="none",
-                            alpha=0.25),
+                            alpha=0.25 * line_alpha),
         )
     # boxplot() resets the y ticks to its positions, so label them afterwards.
     ax.set_yticks(centers, [label for *_, label in rows], fontsize=7)
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.tick_params(axis="y", length=0)
     _style_axis(ax)
-    handles = [matplotlib.patches.Patch(facecolor=color, alpha=0.35, edgecolor=color, label=name)
-               for name, _value, color in GROUPS]
+    handles = box_legend_handles(levels)
     line = draw_threshold(ax, threshold, cli_args)
     return handles + ([line] if line is not None else [])
 
@@ -667,7 +706,9 @@ def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args,
         logging.warning("Scores <= 0 present; drawing the KDE on a linear scale despite --log-x.")
         log_x = False
     handles = []
-    for _name, value, sigma, label in plot_rows(levels):
+    # Drawn bottom row up, so the anomalous curve (the first row) ends up on
+    # top of the benign ones; the handles are put back into row order below.
+    for _name, value, sigma, label in reversed(plot_rows(levels)):
         _index, scores, labels = per_level[sigma]
         color = row_color(value, sigma, levels)
         group = _split(scores, labels, value)
@@ -680,6 +721,7 @@ def draw_trace_density(ax, per_level: dict, levels: list[float], cli_args,
         x, density = curve
         ax.fill_between(x, density, color=color, alpha=0.06, linewidth=0)
         handles.append(ax.plot(x, density, color=color, linewidth=linewidth, label=label)[0])
+    handles.reverse()
     line = draw_threshold(ax, threshold, cli_args)
     if line is not None:
         handles.append(line)
@@ -1087,7 +1129,8 @@ def make_plots(results: dict, traces: list[str], levels: list[float], snaps: dic
                      max(levels))
         levels = [sigma for sigma in levels if sigma != max(levels)]
     plot_per_trace(results, traces, levels, thresholds, cli_args, stem, draw=draw_trace_boxes,
-                   row_height=0.25 * (len(levels) + 1) + 0.45, legend_cols=len(GROUPS) + 1)
+                   row_height=0.25 * (len(levels) + 1) + 0.45,
+                   legend_cols=len(box_legend_handles(levels)) + 1)
     density_stem = stem.parent / f"{stem.name}_density"
     plot_per_trace(results, traces, levels, thresholds, cli_args, density_stem, draw=draw_trace_density,
                    row_height=1.4, legend_cols=len(levels) + 2)
